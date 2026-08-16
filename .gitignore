@@ -1,0 +1,7 @@
+# Local environment values and secrets
+.env
+.env.local
+
+# Local logs and scratch output
+*.log
+.tmp/

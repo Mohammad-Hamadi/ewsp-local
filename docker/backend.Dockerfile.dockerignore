@@ -1,0 +1,10 @@
+.git
+.agents
+.idea
+.vscode
+target
+local-dev
+docs
+*.iml
+*.log
+*.md

@@ -1,0 +1,14 @@
+.git
+.agents
+.idea
+.vscode
+node_modules
+dist
+build
+_local
+Resources
+.env
+.env.*
+*.log
+*.iml
+*.md
