@@ -437,19 +437,12 @@ function Read-EwspEnvironmentFile {
     $values
 }
 
-function Get-EwspRecipeHash {
+function Get-EwspBuildInputHash {
     param(
-        [Parameter(Mandatory = $true)][string]$LocalRoot,
         [Parameter(Mandatory = $true)]$ImageConfiguration,
         [Parameter(Mandatory = $true)][hashtable]$EnvironmentValues
     )
     $components = New-Object System.Collections.Generic.List[string]
-    foreach ($relativePath in @($ImageConfiguration.RecipeFiles | Sort-Object)) {
-        $path = Join-Path $LocalRoot $relativePath
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Image recipe file is missing: $relativePath" }
-        $fileHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-        $components.Add("file:$relativePath=$fileHash")
-    }
     foreach ($name in @($ImageConfiguration.BuildInputs | Sort-Object)) {
         $value = if ($EnvironmentValues.ContainsKey($name)) { [string]$EnvironmentValues[$name] } else { '' }
         $components.Add("input:$name=$value")
@@ -461,28 +454,42 @@ function Get-EwspRecipeHash {
     $hash.Substring(0, 12)
 }
 
+function Assert-EwspApplicationBuildAssets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryPath,
+        [Parameter(Mandatory = $true)]$Repository
+    )
+
+    foreach ($relativePath in @($Repository.Image.RequiredBuildFiles)) {
+        $path = Join-Path $RepositoryPath $relativePath
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$($Repository.Name) is missing required application-owned Docker asset '$relativePath' at '$path'. Run .\ewsp.ps1 update if the checkout is clean and behind, or update the sibling checkout manually. ewsp-local will not fall back to an orchestration-owned Dockerfile."
+        }
+    }
+}
+
 function Get-EwspImageDescriptor {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$LocalRoot,
         [Parameter(Mandatory = $true)]$Repository,
         [Parameter(Mandatory = $true)]$State,
         [Parameter(Mandatory = $true)][hashtable]$EnvironmentValues,
         [Parameter(Mandatory = $true)][string]$SessionId
     )
     $image = $Repository.Image
-    $recipeHash = Get-EwspRecipeHash $LocalRoot $image $EnvironmentValues
+    $buildInputHash = Get-EwspBuildInputHash $image $EnvironmentValues
     if ($State.Dirty) {
         $tag = "{0}:dirty-{1}-{2}" -f $image.RepositoryName, $State.ShortCommit, $SessionId
         $reusable = $false
     } else {
         $sourceHash = $State.Commit.Substring(0, 12)
-        $tag = "{0}:{1}-{2}" -f $image.RepositoryName, $sourceHash, $recipeHash
+        $tag = "{0}:{1}-{2}" -f $image.RepositoryName, $sourceHash, $buildInputHash
         $reusable = $true
     }
     [PSCustomObject]@{
         Service = $image.Service; EnvironmentName = $image.EnvironmentName; Tag = $tag
-        RecipeHash = $recipeHash; Reusable = $reusable; Dirty = $State.Dirty
+        BuildInputHash = $buildInputHash; Reusable = $reusable; Dirty = $State.Dirty
     }
 }
 
@@ -671,10 +678,11 @@ function Invoke-EwspStart {
         $state = Get-EwspRepositoryState $path $repository.ExpectedIdentity $repository.PrimaryBranch
         if ($state.Classification -eq 'MISSING') { throw "$($repository.Name) is missing. Run .\ewsp.ps1 setup first." }
         if ($state.Classification -eq 'IDENTITY_MISMATCH') { throw "$path does not match the expected repository. No files were changed." }
+        Assert-EwspApplicationBuildAssets $path $repository
         if ($state.Dirty) {
             Write-Host "$($repository.Name): dirty working tree; using a non-reusable session image." -ForegroundColor Yellow
         }
-        $imageDescriptors += Get-EwspImageDescriptor $LocalRoot $repository $state $environmentValues $sessionId
+        $imageDescriptors += Get-EwspImageDescriptor $repository $state $environmentValues $sessionId
     }
 
     $tagEnvironment = @{}
@@ -762,6 +770,7 @@ Export-ModuleMember -Function @(
     'Get-EwspRepositoryState',
     'Ensure-EwspRepository',
     'Update-EwspRepository',
+    'Assert-EwspApplicationBuildAssets',
     'Get-EwspImageDescriptor',
     'Resolve-EwspImageAction'
 )

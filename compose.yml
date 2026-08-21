@@ -53,7 +53,7 @@ services:
     image: ${EWSP_BACKEND_IMAGE:-ewsp-backend:local}
     build:
       context: ../ewsp-backend
-      dockerfile: ../ewsp-local/docker/backend.Dockerfile
+      dockerfile: Dockerfile
     environment:
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
@@ -87,9 +87,7 @@ services:
     image: ${EWSP_DASHBOARD_IMAGE:-ewsp-dashboard:local}
     build:
       context: ../ewsp-dashboard
-      dockerfile: ../ewsp-local/docker/dashboard.Dockerfile
-      additional_contexts:
-        orchestration: .
+      dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
     ports:

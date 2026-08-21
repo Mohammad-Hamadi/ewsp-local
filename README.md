@@ -16,7 +16,7 @@ EWSP/
 `-- ewsp-mobile/
 ```
 
-The Docker build contexts are `../ewsp-backend` and `../ewsp-dashboard`. The Dockerfiles remain in this repository. Dockerfile-specific ignore files prevent Git metadata, existing build output, dependencies, logs, and IDE files from entering those build contexts without modifying the source repositories. The dashboard also receives this small repository as a named BuildKit context so its Nginx configuration can be copied into the image; the root `.dockerignore` excludes local Git and environment data from that context.
+The Docker build contexts are `../ewsp-backend` and `../ewsp-dashboard`. Each application repository owns its image construction: `ewsp-backend` owns its `Dockerfile` and `.dockerignore`, while `ewsp-dashboard` owns its `Dockerfile`, `.dockerignore`, and Nginx configuration. This repository owns workspace bootstrap, environment configuration, infrastructure, networking, volumes, runtime configuration, health coordination, and multi-service Docker Compose orchestration.
 
 ## Prerequisites
 
@@ -43,7 +43,7 @@ Start EWSP:
 .\ewsp.ps1 start
 ```
 
-`start` verifies repository identities without updating Git, resolves source-and-recipe-aware application image tags, builds only the images that are required, starts Compose, waits for all five services to become healthy, and prints the configured local URLs. Infrastructure images are not proactively pulled; Docker obtains one only when it is missing.
+`start` verifies repository identities and required application-owned Docker assets without updating Git, resolves source-and-build-input-aware application image tags, builds only the images that are required, starts Compose, waits for all five services to become healthy, and prints the configured local URLs. If an older sibling checkout lacks its Dockerfile, `start` reports how to update it and never falls back to an orchestration-owned recipe. Infrastructure images are not proactively pulled; Docker obtains one only when it is missing.
 
 Inspect repository and Docker state:
 
@@ -77,13 +77,13 @@ If `BACKEND_HOST_PORT` changes, update `VITE_API_BASE_URL` to the browser-reacha
 
 ## Image identity and builds
 
-Clean backend and dashboard images are tagged from the source commit plus a hash of the relevant Docker recipe and build-time inputs. An existing matching clean image is reused. A dirty source repository receives a session-specific `dirty-...` tag and is never falsely represented as its clean commit.
+Clean backend and dashboard images are tagged from the application source commit plus a hash of orchestration-supplied build-time inputs. The application commit already identifies its tracked Dockerfile, `.dockerignore`, and, for the dashboard, Nginx configuration. `VITE_API_BASE_URL` remains part of dashboard image identity because Vite embeds it in generated output. An existing matching clean image is reused. A dirty source repository receives a session-specific `dirty-...` tag and is never falsely represented as its clean commit.
 
 Each `start` with dirty backend or dashboard source intentionally creates a new session tag and rebuilds that application image. These tags are not deleted automatically, so old dirty images can accumulate in the local Docker image store. Review and remove them manually with normal Docker image tooling when disk maintenance is needed; the orchestration script never guesses which developer images are safe to delete.
 
-The backend image uses the repository Maven wrapper and runs `clean package -DskipTests`. Skipping tests keeps routine image builds practical; it does not replace the backend repository's normal automated test workflow.
+The backend repository's Dockerfile uses its Maven wrapper and produces the runtime image. Its image build skips tests to keep routine builds practical; this does not replace the backend repository's normal automated test workflow.
 
-The dashboard image uses `npm ci`, creates the Vite production build, and serves it with Nginx. Nginx returns `index.html` for client-side application routes while retaining strict handling for real assets.
+The dashboard repository's Dockerfile uses `npm ci`, creates the Vite production build, and serves it with its own Nginx configuration. Nginx returns `index.html` for client-side application routes while retaining strict handling for real assets.
 
 ## Local URLs
 

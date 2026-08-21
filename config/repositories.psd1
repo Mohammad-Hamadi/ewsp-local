@@ -10,10 +10,7 @@
                 Service         = 'backend'
                 RepositoryName  = 'ewsp-backend'
                 EnvironmentName = 'EWSP_BACKEND_IMAGE'
-                RecipeFiles     = @(
-                    'docker/backend.Dockerfile'
-                    'docker/backend.Dockerfile.dockerignore'
-                )
+                RequiredBuildFiles = @('Dockerfile', '.dockerignore')
                 BuildInputs     = @()
             }
         }
@@ -27,11 +24,7 @@
                 Service         = 'dashboard'
                 RepositoryName  = 'ewsp-dashboard'
                 EnvironmentName = 'EWSP_DASHBOARD_IMAGE'
-                RecipeFiles     = @(
-                    'docker/dashboard.Dockerfile'
-                    'docker/dashboard.Dockerfile.dockerignore'
-                    'docker/dashboard.nginx.conf'
-                )
+                RequiredBuildFiles = @('Dockerfile', '.dockerignore', 'nginx.conf')
                 BuildInputs     = @('VITE_API_BASE_URL')
             }
         }

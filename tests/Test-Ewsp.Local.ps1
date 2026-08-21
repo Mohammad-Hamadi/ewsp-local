@@ -17,6 +17,12 @@ function Assert-Contains {
     Write-Host "PASS: $Message"
 }
 
+function Assert-NotContains {
+    param([string]$Actual, [string]$Unexpected, [string]$Message)
+    if ($Actual.Contains($Unexpected)) { throw "$Message Expected '$Actual' not to contain '$Unexpected'." }
+    Write-Host "PASS: $Message"
+}
+
 function Invoke-TestGit {
     param([string]$Path, [string[]]$Arguments)
     $previousPreference = $ErrorActionPreference
@@ -217,15 +223,11 @@ try {
     Assert-Equal $skipped.Result 'SKIPPED' 'dirty diverged repository is not updated'
     Assert-Equal $headAfterSkip $headBeforeSkip 'skipped update preserves HEAD'
 
-    $recipeLocal = Join-Path $testRoot 'recipe-local'
-    $recipeDocker = Join-Path $recipeLocal 'docker'
-    New-Item -ItemType Directory -Path $recipeDocker -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $recipeDocker 'test.Dockerfile') -Value 'FROM scratch'
     $imageRepository = @{
         Name = 'image-app'
         Image = @{
             Service = 'image-app'; RepositoryName = 'ewsp-image-test'; EnvironmentName = 'EWSP_TEST_IMAGE'
-            RecipeFiles = @('docker/test.Dockerfile'); BuildInputs = @('VITE_API_BASE_URL')
+            RequiredBuildFiles = @('Dockerfile', '.dockerignore'); BuildInputs = @('VITE_API_BASE_URL')
         }
     }
     $cleanImageState = [PSCustomObject]@{
@@ -235,23 +237,25 @@ try {
         Dirty = $true; Commit = '0123456789abcdef0123456789abcdef01234567'; ShortCommit = '0123456'
     }
     $imageEnvironment = @{ VITE_API_BASE_URL = 'http://localhost:8080' }
-    $cleanImageA = Get-EwspImageDescriptor $recipeLocal $imageRepository $cleanImageState $imageEnvironment 'session-a'
-    $cleanImageARepeat = Get-EwspImageDescriptor $recipeLocal $imageRepository $cleanImageState $imageEnvironment 'session-b'
+    $cleanImageA = Get-EwspImageDescriptor $imageRepository $cleanImageState $imageEnvironment 'session-a'
+    $cleanImageARepeat = Get-EwspImageDescriptor $imageRepository $cleanImageState $imageEnvironment 'session-b'
     Assert-Equal $cleanImageA.Tag $cleanImageARepeat.Tag 'clean image identity is stable across sessions'
     Assert-Equal (Resolve-EwspImageAction $cleanImageA $true) 'REUSE' 'existing clean image is reused'
     Assert-Equal (Resolve-EwspImageAction $cleanImageA $false) 'BUILD' 'missing clean image is built'
 
-    Set-Content -LiteralPath (Join-Path $recipeDocker 'test.Dockerfile') -Value "FROM scratch`nLABEL recipe=changed"
-    $cleanImageRecipeChanged = Get-EwspImageDescriptor $recipeLocal $imageRepository $cleanImageState $imageEnvironment 'session-c'
-    if ($cleanImageRecipeChanged.Tag -eq $cleanImageA.Tag) { throw 'Recipe change did not change clean image identity.' }
-    Write-Host 'PASS: recipe change changes clean image identity'
+    $changedCommitState = [PSCustomObject]@{
+        Dirty = $false; Commit = 'fedcba9876543210fedcba9876543210fedcba98'; ShortCommit = 'fedcba9'
+    }
+    $cleanImageCommitChanged = Get-EwspImageDescriptor $imageRepository $changedCommitState $imageEnvironment 'session-c'
+    if ($cleanImageCommitChanged.Tag -eq $cleanImageA.Tag) { throw 'Application commit change did not change clean image identity.' }
+    Write-Host 'PASS: application commit changes clean image identity'
 
     $changedEnvironment = @{ VITE_API_BASE_URL = 'http://localhost:18080' }
-    $cleanImageInputChanged = Get-EwspImageDescriptor $recipeLocal $imageRepository $cleanImageState $changedEnvironment 'session-d'
-    if ($cleanImageInputChanged.Tag -eq $cleanImageRecipeChanged.Tag) { throw 'Build input change did not change image identity.' }
-    Write-Host 'PASS: build-time input changes image identity'
+    $cleanImageInputChanged = Get-EwspImageDescriptor $imageRepository $cleanImageState $changedEnvironment 'session-d'
+    if ($cleanImageInputChanged.Tag -eq $cleanImageA.Tag) { throw 'Build input change did not change image identity.' }
+    Write-Host 'PASS: dashboard build-time API URL changes image identity'
 
-    $dirtyImage = Get-EwspImageDescriptor $recipeLocal $imageRepository $dirtyImageState $imageEnvironment 'session-dirty'
+    $dirtyImage = Get-EwspImageDescriptor $imageRepository $dirtyImageState $imageEnvironment 'session-dirty'
     Assert-Equal $dirtyImage.Reusable $false 'dirty image is non-reusable'
     Assert-Equal (Resolve-EwspImageAction $dirtyImage $true) 'BUILD' 'dirty image builds even if a same-tag image exists'
     Assert-Contains $dirtyImage.Tag 'dirty-0123456-session-dirty' 'dirty image tag identifies dirty session'
@@ -259,16 +263,26 @@ try {
     $productionConfig = Import-PowerShellDataFile -LiteralPath (Join-Path $localRoot 'config\repositories.psd1')
     $backendImageConfig = @($productionConfig.Repositories | Where-Object Name -eq 'ewsp-backend')[0].Image
     $dashboardImageConfig = @($productionConfig.Repositories | Where-Object Name -eq 'ewsp-dashboard')[0].Image
-    Assert-Contains ($backendImageConfig.RecipeFiles -join '|') 'docker/backend.Dockerfile.dockerignore' 'backend identity includes its Docker ignore recipe'
-    Assert-Contains ($dashboardImageConfig.RecipeFiles -join '|') 'docker/dashboard.nginx.conf' 'dashboard identity includes Nginx configuration'
-    Assert-Contains ($dashboardImageConfig.RecipeFiles -join '|') 'docker/dashboard.Dockerfile.dockerignore' 'dashboard identity includes its Docker ignore recipe'
+    Assert-Contains ($backendImageConfig.RequiredBuildFiles -join '|') 'Dockerfile' 'backend requires its repository Dockerfile'
+    Assert-Contains ($backendImageConfig.RequiredBuildFiles -join '|') '.dockerignore' 'backend requires its repository Docker ignore file'
+    Assert-Contains ($dashboardImageConfig.RequiredBuildFiles -join '|') 'Dockerfile' 'dashboard requires its repository Dockerfile'
+    Assert-Contains ($dashboardImageConfig.RequiredBuildFiles -join '|') '.dockerignore' 'dashboard requires its repository Docker ignore file'
+    Assert-Contains ($dashboardImageConfig.RequiredBuildFiles -join '|') 'nginx.conf' 'dashboard requires its repository Nginx configuration'
     Assert-Contains ($dashboardImageConfig.BuildInputs -join '|') 'VITE_API_BASE_URL' 'dashboard identity includes browser API build input'
 
-    $nginxConfiguration = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'docker\dashboard.nginx.conf')
-    Assert-Contains $nginxConfiguration 'location ~* \.' 'Nginx treats file-like requests as assets'
-    Assert-Contains $nginxConfiguration 'try_files $uri =404;' 'Nginx returns 404 for missing assets'
+    $missingAssetPath = Join-Path $testRoot 'missing-build-assets'
+    New-Item -ItemType Directory -Path $missingAssetPath -Force | Out-Null
+    $missingAssetMessage = $null
+    try { Assert-EwspApplicationBuildAssets $missingAssetPath $imageRepository } catch { $missingAssetMessage = $_.Exception.Message }
+    Assert-Contains $missingAssetMessage "missing required application-owned Docker asset 'Dockerfile'" 'missing Dockerfile identifies the required application-owned asset'
+    Assert-Contains $missingAssetMessage '.\ewsp.ps1 update' 'missing Dockerfile suggests the safe update command'
+    Assert-Contains $missingAssetMessage 'will not fall back' 'missing Dockerfile refuses an orchestration-owned fallback'
 
     $composeConfiguration = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'compose.yml')
+    Assert-Contains $composeConfiguration 'context: ../ewsp-backend' 'backend uses its sibling repository build context'
+    Assert-Contains $composeConfiguration 'context: ../ewsp-dashboard' 'dashboard uses its sibling repository build context'
+    Assert-Equal ([regex]::Matches($composeConfiguration, '(?m)^\s+dockerfile: Dockerfile\s*$').Count) 2 'both applications use their repository Dockerfile'
+    Assert-NotContains $composeConfiguration 'additional_contexts:' 'dashboard has no orchestration additional build context'
     Assert-Contains $composeConfiguration 'command: ["redis-server", "--save", "", "--appendonly", "no"]' 'Redis persistence is explicitly disabled'
     Assert-Contains $composeConfiguration 'type: tmpfs' 'Redis image data path is replaced with tmpfs'
 
