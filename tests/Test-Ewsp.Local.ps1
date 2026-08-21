@@ -4,23 +4,57 @@ param()
 $ErrorActionPreference = 'Stop'
 $localRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $localRoot 'scripts\Ewsp.Local.psm1') -Force -DisableNameChecking
+$script:PassCount = 0
 
 function Assert-Equal {
     param($Actual, $Expected, [string]$Message)
     if ($Actual -ne $Expected) { throw "$Message Expected '$Expected', got '$Actual'." }
+    $script:PassCount++
     Write-Host "PASS: $Message"
 }
 
 function Assert-Contains {
     param([string]$Actual, [string]$Expected, [string]$Message)
     if (-not $Actual.Contains($Expected)) { throw "$Message Expected '$Actual' to contain '$Expected'." }
+    $script:PassCount++
     Write-Host "PASS: $Message"
 }
 
 function Assert-NotContains {
     param([string]$Actual, [string]$Unexpected, [string]$Message)
     if ($Actual.Contains($Unexpected)) { throw "$Message Expected '$Actual' not to contain '$Unexpected'." }
+    $script:PassCount++
     Write-Host "PASS: $Message"
+}
+
+function Assert-ThrowsContains {
+    param([scriptblock]$Action, [string]$Expected, [string]$Message)
+    $actual = $null
+    try { & $Action } catch { $actual = $_.Exception.Message }
+    if (-not $actual) { throw "$Message Expected an exception containing '$Expected', but no exception was thrown." }
+    Assert-Contains $actual $Expected $Message
+}
+
+function New-FakeNativeResult {
+    param([int]$ExitCode, [string[]]$Output = @())
+    [PSCustomObject]@{ ExitCode = $ExitCode; Output = @($Output) }
+}
+
+function Get-FakeEnvironment {
+    param([hashtable]$AvailableCommands, [hashtable]$Results)
+    $resolver = {
+        param($name)
+        if ($AvailableCommands.ContainsKey($name) -and $AvailableCommands[$name]) {
+            [PSCustomObject]@{ Name = $name; Source = $name }
+        }
+    }.GetNewClosure()
+    $runner = {
+        param($filePath, $arguments)
+        $key = "$filePath|$((@($arguments)) -join ' ')"
+        if ($Results.ContainsKey($key)) { return $Results[$key] }
+        New-FakeNativeResult 1 @("unsupported fake command: $key")
+    }.GetNewClosure()
+    Get-EwspRuntimeEnvironment -CommandResolver $resolver -CommandRunner $runner
 }
 
 function Invoke-TestGit {
@@ -71,6 +105,68 @@ try {
     Assert-Equal (ConvertTo-EwspRemoteIdentity 'https://github.com/Owner/Repo.git/') 'github.com/owner/repo' 'HTTPS GitHub normalization'
     Assert-Equal (ConvertTo-EwspRemoteIdentity 'git@github.com:OWNER/REPO.git') 'github.com/owner/repo' 'SSH GitHub normalization'
 
+    $primaryResults = @{
+        'git|--version' = New-FakeNativeResult 0 @('git version 2.52.0.windows.1')
+        'docker|--version' = New-FakeNativeResult 0 @('Docker version 29.5.3, build test')
+        'docker|version --format {{.Server.Version}}' = New-FakeNativeResult 0 @('29.5.3')
+        'docker|compose version --short' = New-FakeNativeResult 0 @('5.1.4')
+    }
+    $primaryEnvironment = Get-FakeEnvironment @{ git = $true; docker = $true; 'docker-compose' = $true } $primaryResults
+    Assert-Equal $primaryEnvironment.Platform.PowerShellEdition $PSVersionTable.PSEdition 'environment detection records PowerShell edition'
+    Assert-Equal $primaryEnvironment.Platform.PowerShellVersion $PSVersionTable.PSVersion.ToString() 'environment detection records PowerShell version'
+    Assert-Equal $primaryEnvironment.Git.Version '2.52.0.windows.1' 'environment detection records Git version'
+    Assert-Equal $primaryEnvironment.Docker.CliVersion '29.5.3' 'environment detection records Docker CLI version'
+    Assert-Equal $primaryEnvironment.Docker.EngineReachable $true 'environment detection records reachable Docker Engine'
+    Assert-Equal $primaryEnvironment.Docker.EngineVersion '29.5.3' 'environment detection records Docker Engine version'
+    Assert-Equal $primaryEnvironment.Compose.DisplayName 'docker compose' 'docker compose capability is selected first'
+    Assert-Equal $primaryEnvironment.Compose.Version '5.1.4' 'docker compose version is recorded'
+
+    $missingGitEnvironment = Get-FakeEnvironment @{ git = $false; docker = $false; 'docker-compose' = $false } @{}
+    Assert-Equal $missingGitEnvironment.Git.Available $false 'missing Git command is detected'
+    Assert-ThrowsContains { Assert-EwspPrerequisites -EnvironmentInfo $missingGitEnvironment | Out-Null } `
+        'Git is not installed' 'missing Git reports a prerequisite failure'
+
+    $fallbackResults = @{
+        'git|--version' = New-FakeNativeResult 0 @('git version 2.52.0')
+        'docker|--version' = New-FakeNativeResult 0 @('Docker version 29.5.3, build test')
+        'docker|version --format {{.Server.Version}}' = New-FakeNativeResult 0 @('29.5.3')
+        'docker|compose version --short' = New-FakeNativeResult 1 @('compose is not a docker command')
+        'docker-compose|version --short' = New-FakeNativeResult 0 @('1.29.2')
+    }
+    $fallbackEnvironment = Get-FakeEnvironment @{ git = $true; docker = $true; 'docker-compose' = $true } $fallbackResults
+    Assert-Equal $fallbackEnvironment.Compose.DisplayName 'docker-compose' 'legacy docker-compose is selected when plugin capability fails'
+    Assert-Equal $fallbackEnvironment.Compose.Version '1.29.2' 'legacy Compose version is recorded'
+
+    $missingDockerEnvironment = Get-FakeEnvironment @{ git = $true; docker = $false; 'docker-compose' = $false } @{
+        'git|--version' = New-FakeNativeResult 0 @('git version 2.52.0')
+    }
+    Assert-Equal $missingDockerEnvironment.Docker.Available $false 'missing Docker CLI is detected'
+    Assert-ThrowsContains { Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $missingDockerEnvironment | Out-Null } `
+        'Docker CLI is not installed' 'missing Docker CLI reports a prerequisite failure'
+
+    $engineDownResults = @{
+        'git|--version' = New-FakeNativeResult 0 @('git version 2.52.0')
+        'docker|--version' = New-FakeNativeResult 0 @('Docker version 29.5.3, build test')
+        'docker|version --format {{.Server.Version}}' = New-FakeNativeResult 1 @('cannot connect')
+        'docker|compose version --short' = New-FakeNativeResult 0 @('5.1.4')
+    }
+    $engineDownEnvironment = Get-FakeEnvironment @{ git = $true; docker = $true; 'docker-compose' = $false } $engineDownResults
+    Assert-Equal $engineDownEnvironment.Docker.EngineReachable $false 'unreachable Docker Engine is detected separately from CLI availability'
+    Assert-ThrowsContains { Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $engineDownEnvironment | Out-Null } `
+        'Docker Engine not running' 'unreachable Docker Engine has precise remediation'
+
+    $noComposeResults = @{
+        'git|--version' = New-FakeNativeResult 0 @('git version 2.52.0')
+        'docker|--version' = New-FakeNativeResult 0 @('Docker version 29.5.3, build test')
+        'docker|version --format {{.Server.Version}}' = New-FakeNativeResult 0 @('29.5.3')
+        'docker|compose version --short' = New-FakeNativeResult 1 @('unsupported')
+        'docker-compose|version --short' = New-FakeNativeResult 1 @('unsupported')
+    }
+    $noComposeEnvironment = Get-FakeEnvironment @{ git = $true; docker = $true; 'docker-compose' = $true } $noComposeResults
+    Assert-Equal $noComposeEnvironment.Compose.Available $false 'absence of both Compose capabilities is detected'
+    Assert-ThrowsContains { Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $noComposeEnvironment | Out-Null } `
+        'neither docker compose nor docker-compose' 'missing Compose implementations report unsupported Compose'
+
     $setupRemote = New-TestRemote $testRoot 'setup-remote'
     $setupWorkspace = Join-Path $testRoot 'setup-workspace'
     $setupLocal = Join-Path $setupWorkspace 'ewsp-local'
@@ -120,6 +216,30 @@ try {
     Set-Content -LiteralPath (Join-Path $envLocal '.env') -Value "TEST_VALUE=preserved`n"
     & $module { param($root) Ensure-EwspEnvironmentFile $root } $envLocal
     Assert-Contains (Get-Content -Raw (Join-Path $envLocal '.env')) 'TEST_VALUE=preserved' 'existing .env is preserved'
+    $preserveOutput = (& $module { param($root) Ensure-EwspEnvironmentFile $root } $envLocal 6>&1 | Out-String)
+    Assert-NotContains $preserveOutput 'TEST_VALUE=preserved' 'environment setup does not print preserved values'
+    Assert-Equal (Protect-EwspDiagnosticText 'JWT_SECRET=do-not-print POSTGRES_PASSWORD=also-private') `
+        'JWT_SECRET=<redacted> POSTGRES_PASSWORD=<redacted>' 'diagnostic redaction hides secret values'
+    Assert-NotContains (Protect-EwspDiagnosticText 'connection failed for opaque-secret-value' `
+        @{ JWT_SECRET = 'opaque-secret-value' }) 'opaque-secret-value' 'diagnostic redaction removes configured secret values from logs'
+
+    $validEnvironment = @{
+        POSTGRES_DB = 'ewsp'; POSTGRES_USER = 'ewsp'; POSTGRES_PASSWORD = 'private-value'
+        MINIO_ROOT_USER = 'minio'; MINIO_ROOT_PASSWORD = 'private-value'; MINIO_BUCKET_NAME = 'evidence'
+        JWT_SECRET = 'private-value'; VITE_API_BASE_URL = 'http://localhost:8080'
+        EWSP_CORS_ALLOWED_ORIGINS = 'http://localhost:3000'
+    }
+    $configuredPorts = @(Assert-EwspEnvironmentConfiguration $validEnvironment)
+    Assert-Equal $configuredPorts.Count 6 'environment validation resolves all six host ports'
+    Assert-Equal (@($configuredPorts | Where-Object Name -eq 'Backend')[0].Port) 8080 'environment validation applies backend port default'
+    Assert-ThrowsContains { Assert-EwspEnvironmentConfiguration @{} | Out-Null } `
+        'required setting names' 'missing environment settings identify names without values'
+
+    Assert-Equal (Assert-EwspPortAvailability $configuredPorts @() @()) $true 'free configured ports pass preflight'
+    Assert-ThrowsContains { Assert-EwspPortAvailability $configuredPorts @(8080) @() | Out-Null } `
+        'Backend requires host port 8080' 'external occupied port is identified before startup'
+    Assert-Equal (Assert-EwspPortAvailability $configuredPorts @(8080) @(8080)) $true `
+        'port held by the current EWSP project is accepted'
 
     $stateRemote = New-TestRemote $testRoot 'state-remote'
     $stateWorkspace = Join-Path $testRoot 'state-workspace'
@@ -286,7 +406,104 @@ try {
     Assert-Contains $composeConfiguration 'command: ["redis-server", "--save", "", "--appendonly", "no"]' 'Redis persistence is explicitly disabled'
     Assert-Contains $composeConfiguration 'type: tmpfs' 'Redis image data path is replaced with tmpfs'
 
-    Write-Host 'All EWSP orchestration tests passed.' -ForegroundColor Green
+    $healthyStates = @(
+        [PSCustomObject]@{ Service = 'postgres'; State = 'running'; Health = 'healthy'; Id = '1' },
+        [PSCustomObject]@{ Service = 'redis'; State = 'running'; Health = 'healthy'; Id = '2' },
+        [PSCustomObject]@{ Service = 'minio'; State = 'running'; Health = 'healthy'; Id = '3' },
+        [PSCustomObject]@{ Service = 'backend'; State = 'running'; Health = 'healthy'; Id = '4' },
+        [PSCustomObject]@{ Service = 'dashboard'; State = 'running'; Health = 'healthy'; Id = '5' }
+    )
+    $healthyProvider = {
+        param($service)
+        @($healthyStates | Where-Object Service -eq $service)[0]
+    }.GetNewClosure()
+    $noSleep = { }
+    $readyStates = @(Wait-EwspServices 'unused' ([PSCustomObject]@{}) -TimeoutSeconds 1 `
+        -StateProvider $healthyProvider -SleepAction $noSleep)
+    Assert-Equal $readyStates.Count 5 'successful readiness waits for all five services'
+
+    $failedStates = @(
+        [PSCustomObject]@{ Service = 'postgres'; State = 'running'; Health = 'healthy'; Id = '1' },
+        [PSCustomObject]@{ Service = 'redis'; State = 'running'; Health = 'healthy'; Id = '2' },
+        [PSCustomObject]@{ Service = 'minio'; State = 'running'; Health = 'healthy'; Id = '3' },
+        [PSCustomObject]@{ Service = 'backend'; State = 'running'; Health = 'unhealthy'; Id = '4' },
+        [PSCustomObject]@{ Service = 'dashboard'; State = 'created'; Health = 'n/a'; Id = '5' }
+    )
+    $failedProvider = {
+        param($service)
+        @($failedStates | Where-Object Service -eq $service)[0]
+    }.GetNewClosure()
+    $failedReadinessMessage = $null
+    try {
+        Wait-EwspServices 'unused' ([PSCustomObject]@{}) -TimeoutSeconds 1 `
+            -StateProvider $failedProvider -SleepAction $noSleep | Out-Null
+    } catch { $failedReadinessMessage = $_.Exception.Message }
+    Assert-Contains $failedReadinessMessage 'Backend        unhealthy' 'service failure identifies the unhealthy backend'
+    Assert-Contains $failedReadinessMessage 'Dashboard      waiting on backend' 'service failure explains dashboard dependency wait'
+
+    $waitingStates = @($failedStates | ForEach-Object {
+        if ($_.Service -eq 'backend') {
+            [PSCustomObject]@{ Service = 'backend'; State = 'starting'; Health = 'starting'; Id = '4' }
+        } else { $_ }
+    })
+    $waitingProvider = {
+        param($service)
+        @($waitingStates | Where-Object Service -eq $service)[0]
+    }.GetNewClosure()
+    Assert-ThrowsContains {
+        Wait-EwspServices 'unused' ([PSCustomObject]@{}) -TimeoutSeconds 0 `
+            -StateProvider $waitingProvider -SleepAction $noSleep | Out-Null
+    } 'Timed out' 'health timeout is classified and reported'
+
+    $urls = [PSCustomObject]@{
+        Dashboard = 'http://localhost:3000'; BackendHealth = 'http://localhost:8080/api/health'
+        Swagger = 'http://localhost:8080/swagger-ui/index.html'; OpenApi = 'http://localhost:8080/v3/api-docs'
+        MinioLive = 'http://localhost:9000/minio/health/live'
+    }
+    $successfulProbe = { param($uri) [PSCustomObject]@{ StatusCode = 200; Error = $null } }
+    Assert-EwspEndpoints $urls -Probe $successfulProbe
+    $script:PassCount++
+    Write-Host 'PASS: endpoint verification accepts all required HTTP 200 responses'
+    $failedProbe = {
+        param($uri)
+        if ($uri -like '*swagger*') { [PSCustomObject]@{ StatusCode = 503; Error = 'unavailable' } }
+        else { [PSCustomObject]@{ StatusCode = 200; Error = $null } }
+    }
+    Assert-ThrowsContains { Assert-EwspEndpoints $urls -Probe $failedProbe } `
+        'Swagger UI' 'endpoint verification names the failed endpoint'
+
+    $buildCause = New-Object System.Exception('command failed with JWT_SECRET=do-not-leak')
+    $buildCause.Data['Category'] = 'IMAGE_BUILD_FAILURE'
+    $buildCause.Data['Component'] = 'backend'
+    $buildCause.Data['ExitCode'] = 17
+    $buildCause.Data['Operation'] = 'docker compose build backend JWT_SECRET=do-not-leak'
+    $completedPhases = New-Object System.Collections.Generic.List[string]
+    $completedPhases.Add('ENVIRONMENT_DETECTION')
+    $phaseFailure = New-EwspUpFailureException 'IMAGE_BUILD' 'Preparing application images' $buildCause `
+        $primaryEnvironment $completedPhases @('SERVICE_START', 'HEALTH_WAIT') 'build backend' 'backend'
+    Assert-Contains $phaseFailure.Message 'Phase: IMAGE_BUILD' 'image build failure reports its phase'
+    Assert-Contains $phaseFailure.Message 'Category: IMAGE_BUILD_FAILURE' 'image build failure reports its category'
+    Assert-Contains $phaseFailure.Message 'Component: backend' 'phase failure reports its component'
+    Assert-Contains $phaseFailure.Message 'Operation: docker compose build backend JWT_SECRET=<redacted>' `
+        'phase failure reports the sanitized attempted command'
+    Assert-Contains $phaseFailure.Message 'Exit code: 17' 'phase failure preserves native exit code'
+    Assert-Contains $phaseFailure.Message 'Detected environment:' 'phase failure includes detected environment'
+    Assert-Contains $phaseFailure.Message 'Not attempted afterward: SERVICE_START, HEALTH_WAIT' 'phase failure lists skipped later work'
+    Assert-NotContains $phaseFailure.Message 'do-not-leak' 'phase diagnostics redact secret values'
+    $finalPhaseResult = & $module {
+        param($environment)
+        $completed = New-Object System.Collections.Generic.List[string]
+        Invoke-EwspUpPhase 9 9 'FINAL_VERIFICATION' 'Verifying local endpoints' { 'final-phase-ok' } `
+            $completed @() $environment 'Verify endpoints' 'EWSP endpoints'
+    } $primaryEnvironment
+    Assert-Contains ($finalPhaseResult -join '|') 'final-phase-ok' 'final up phase accepts an empty remaining-phase list on PowerShell 5.1'
+
+    $moduleText = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
+    foreach ($destructiveGitOperation in @("@('reset'", "@('clean'", "@('stash'", "@('checkout'", "@('rebase'")) {
+        Assert-NotContains $moduleText $destructiveGitOperation "orchestration does not introduce destructive Git operation $destructiveGitOperation"
+    }
+
+    Write-Host "All EWSP orchestration tests passed ($script:PassCount assertions)." -ForegroundColor Green
 } finally {
     $safeBase = [System.IO.Path]::GetFullPath($testBase).TrimEnd('\') + '\'
     $safeTarget = [System.IO.Path]::GetFullPath($testRoot)

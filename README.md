@@ -20,30 +20,50 @@ The Docker build contexts are `../ewsp-backend` and `../ewsp-dashboard`. Each ap
 
 ## Prerequisites
 
-- Windows PowerShell 5.1 or newer
+- Windows PowerShell 5.1 or PowerShell 7+
 - Git
 - Docker Desktop or another Docker engine with Docker Compose support
 - Available host ports 3000, 5432, 6379, 8080, 9000, and 9001, unless overridden in `.env`
 
 Java, Maven, Node, and Nginx do not need to be installed on the host for the container workflow.
 
+Windows with Docker Desktop is the currently tested and guaranteed platform. The PowerShell orchestration detects Windows, Linux, and macOS plus OS, architecture, shell, Git, Docker CLI, Docker Engine, and Compose versions, but Linux and macOS are not yet claimed as tested support. The detector probes actual command capabilities: it selects `docker compose` when that command succeeds, otherwise tries `docker-compose`, and then uses that one selection for the complete command. It does not install major prerequisites automatically.
+
 ## Primary workflow
 
-From `ewsp-local`, prepare the sibling workspace and local configuration:
+For a fresh or normal safely updateable workspace, clone this repository and run:
+
+```powershell
+.\ewsp.ps1 up
+```
+
+`up` performs a phased environment detection, sibling repository setup, safe repository update, local configuration, build and port preflight, application image build/reuse, Compose startup, five-service readiness wait, endpoint verification, and final status summary. On success the sibling repositories remain ordinary editable Git working trees.
+
+Repository safety is unchanged. Missing repositories are cloned. A correct clean `main` checkout that is only behind its verified upstream may be fast-forwarded. Dirty, detached, wrong-branch, ahead, diverged, missing-upstream, fetch-failed, and unexpected-upstream states are preserved. If such a checkout already contains the required Docker assets, `up` reports the skipped update and continues safely; if an old checkout lacks a required application-owned Docker asset, `up` stops with remediation instead of resetting or replacing developer work.
+
+`.env` is created from `.env.example` only when absent and is otherwise preserved. Required setting names, URLs, Compose configuration, application Docker assets, sibling paths, and all configured host ports are checked before image or service startup. Secret values are not printed. Ports already published by this EWSP Compose project are accepted, while an external listener on a required port is reported without stopping it.
+
+Failures identify the phase, category, component, sanitized operation, exit code when available, detected tool versions, completed phases, skipped phases, reason, and a safe next action. Readiness failures show every service state and at most 40 recent log lines for up to three non-ready services.
+
+Docker Desktop or another configured Docker Engine must already be running. If the CLI exists but its server is unreachable, `up` reports that state distinctly.
+
+## Advanced commands
+
+The individual commands remain available when you want explicit control:
 
 ```powershell
 .\ewsp.ps1 setup
-```
-
-`setup` verifies PowerShell, Git, Docker, and Docker Compose. It reuses correctly configured sibling repositories, clones only missing repositories, refuses to overwrite an unexpected directory, and creates `.env` from `.env.example` only when `.env` is absent. It does not update repositories or build images.
-
-Start EWSP:
-
-```powershell
+.\ewsp.ps1 update
 .\ewsp.ps1 start
+.\ewsp.ps1 status
+.\ewsp.ps1 stop
 ```
 
-`start` verifies repository identities and required application-owned Docker assets without updating Git, resolves source-and-build-input-aware application image tags, builds only the images that are required, starts Compose, waits for all five services to become healthy, and prints the configured local URLs. If an older sibling checkout lacks its Dockerfile, `start` reports how to update it and never falls back to an orchestration-owned recipe. Infrastructure images are not proactively pulled; Docker obtains one only when it is missing.
+`setup` verifies prerequisites, reuses correctly configured sibling repositories, clones only missing repositories, refuses unexpected directories, and creates `.env` when absent. It does not update repositories or build images.
+
+`update` applies only the safe fast-forward behavior described above.
+
+`start` verifies repository identities and required application-owned Docker assets without updating Git, resolves source-and-build-input-aware application image tags, builds only required images, starts Compose, waits for all five services, and prints URLs. If an older sibling checkout lacks its Dockerfile, `start` never falls back to an orchestration-owned recipe. Infrastructure images are obtained by Docker only when needed.
 
 Inspect repository and Docker state:
 
@@ -134,12 +154,12 @@ The current mobile repository targets modern Android versions, which may block c
 
 ## Direct Compose troubleshooting
 
-The PowerShell entry point is the normal workflow because it resolves application image tags safely. Direct `docker compose` commands remain useful for logs and troubleshooting, but a direct build/start uses the fallback `ewsp-backend:local` and `ewsp-dashboard:local` tags rather than the source-aware tags selected by `ewsp.ps1`.
+The PowerShell entry point is the normal workflow because it resolves application image tags and the supported Compose invocation safely. `up` prints whether it selected `docker compose` or `docker-compose`. Direct commands remain useful for logs and troubleshooting; pass `-f compose.yml` explicitly for portability between implementations. A direct build/start uses the fallback `ewsp-backend:local` and `ewsp-dashboard:local` tags rather than the source-aware tags selected by `ewsp.ps1`.
 
 Common failures:
 
-- If setup or start says Docker Desktop is unavailable, start the Docker engine and retry.
+- If `up`, `setup`, or `start` reports that the Docker CLI exists but its Engine is unreachable, start Docker Desktop/Engine and retry.
 - If setup refuses an existing sibling directory, inspect its Git remote and move or rename it yourself; setup never overwrites an unexpected directory.
 - Dirty, ahead, diverged, detached, wrong-branch, missing-upstream, fetch-failed, and unexpected-upstream repositories are reported without automatic Git changes. Resolve them explicitly in the source repository, then rerun `update`.
-- A host-port conflict requires changing the corresponding value in `.env`. When changing the backend port, also set the browser-reachable `VITE_API_BASE_URL` and the matching `EWSP_CORS_ALLOWED_ORIGINS` value before starting.
-- Use `docker compose logs <service>` for a failed health check. `docker compose down` preserves data; do not add `-v` unless deleting this project's PostgreSQL and MinIO data is intentional.
+- An external host-port conflict requires stopping/reconfiguring that listener or changing the corresponding value in `.env`. When changing the backend port, also set the browser-reachable `VITE_API_BASE_URL` and matching `EWSP_CORS_ALLOWED_ORIGINS` before starting. The script never kills the listener.
+- Readiness failures automatically show bounded logs. For more detail, use the Compose invocation printed by `up`, add `-f compose.yml`, and run `logs <service>`. Ordinary Compose shutdown preserves data; do not add `-v` unless deleting this project's PostgreSQL and MinIO data is intentional.
