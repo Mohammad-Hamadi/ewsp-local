@@ -226,7 +226,7 @@ try {
     $validEnvironment = @{
         POSTGRES_DB = 'ewsp'; POSTGRES_USER = 'ewsp'; POSTGRES_PASSWORD = 'private-value'
         MINIO_ROOT_USER = 'minio'; MINIO_ROOT_PASSWORD = 'private-value'; MINIO_BUCKET_NAME = 'evidence'
-        JWT_SECRET = 'private-value'; VITE_API_BASE_URL = 'http://localhost:8080'
+        JWT_SECRET = 'private-value'
         EWSP_CORS_ALLOWED_ORIGINS = 'http://localhost:3000'
     }
     $configuredPorts = @(Assert-EwspEnvironmentConfiguration $validEnvironment)
@@ -347,7 +347,7 @@ try {
         Name = 'image-app'
         Image = @{
             Service = 'image-app'; RepositoryName = 'ewsp-image-test'; EnvironmentName = 'EWSP_TEST_IMAGE'
-            RequiredBuildFiles = @('Dockerfile', '.dockerignore'); BuildInputs = @('VITE_API_BASE_URL')
+            RequiredBuildFiles = @('Dockerfile', '.dockerignore'); BuildInputs = @('BUILD_VARIANT')
         }
     }
     $cleanImageState = [PSCustomObject]@{
@@ -356,7 +356,7 @@ try {
     $dirtyImageState = [PSCustomObject]@{
         Dirty = $true; Commit = '0123456789abcdef0123456789abcdef01234567'; ShortCommit = '0123456'
     }
-    $imageEnvironment = @{ VITE_API_BASE_URL = 'http://localhost:8080' }
+    $imageEnvironment = @{ BUILD_VARIANT = 'default' }
     $cleanImageA = Get-EwspImageDescriptor $imageRepository $cleanImageState $imageEnvironment 'session-a'
     $cleanImageARepeat = Get-EwspImageDescriptor $imageRepository $cleanImageState $imageEnvironment 'session-b'
     Assert-Equal $cleanImageA.Tag $cleanImageARepeat.Tag 'clean image identity is stable across sessions'
@@ -370,10 +370,10 @@ try {
     if ($cleanImageCommitChanged.Tag -eq $cleanImageA.Tag) { throw 'Application commit change did not change clean image identity.' }
     Write-Host 'PASS: application commit changes clean image identity'
 
-    $changedEnvironment = @{ VITE_API_BASE_URL = 'http://localhost:18080' }
+    $changedEnvironment = @{ BUILD_VARIANT = 'alternate' }
     $cleanImageInputChanged = Get-EwspImageDescriptor $imageRepository $cleanImageState $changedEnvironment 'session-d'
     if ($cleanImageInputChanged.Tag -eq $cleanImageA.Tag) { throw 'Build input change did not change image identity.' }
-    Write-Host 'PASS: dashboard build-time API URL changes image identity'
+    Write-Host 'PASS: declared build input changes image identity'
 
     $dirtyImage = Get-EwspImageDescriptor $imageRepository $dirtyImageState $imageEnvironment 'session-dirty'
     Assert-Equal $dirtyImage.Reusable $false 'dirty image is non-reusable'
@@ -382,13 +382,19 @@ try {
 
     $productionConfig = Import-PowerShellDataFile -LiteralPath (Join-Path $localRoot 'config\repositories.psd1')
     $backendImageConfig = @($productionConfig.Repositories | Where-Object Name -eq 'ewsp-backend')[0].Image
-    $dashboardImageConfig = @($productionConfig.Repositories | Where-Object Name -eq 'ewsp-dashboard')[0].Image
+    $dashboardRepositoryConfig = @($productionConfig.Repositories | Where-Object Name -eq 'ewsp-dashboard')[0]
+    $dashboardImageConfig = $dashboardRepositoryConfig.Image
     Assert-Contains ($backendImageConfig.RequiredBuildFiles -join '|') 'Dockerfile' 'backend requires its repository Dockerfile'
     Assert-Contains ($backendImageConfig.RequiredBuildFiles -join '|') '.dockerignore' 'backend requires its repository Docker ignore file'
     Assert-Contains ($dashboardImageConfig.RequiredBuildFiles -join '|') 'Dockerfile' 'dashboard requires its repository Dockerfile'
     Assert-Contains ($dashboardImageConfig.RequiredBuildFiles -join '|') '.dockerignore' 'dashboard requires its repository Docker ignore file'
     Assert-Contains ($dashboardImageConfig.RequiredBuildFiles -join '|') 'nginx.conf' 'dashboard requires its repository Nginx configuration'
-    Assert-Contains ($dashboardImageConfig.BuildInputs -join '|') 'VITE_API_BASE_URL' 'dashboard identity includes browser API build input'
+    Assert-Equal @($dashboardImageConfig.BuildInputs).Count 0 'dashboard identity has no orchestration build inputs'
+    $dashboardIdentityA = Get-EwspImageDescriptor $dashboardRepositoryConfig $cleanImageState `
+        @{ VITE_API_BASE_URL = 'http://localhost:8080'; VITE_WS_URL = 'ws://localhost:8080/ws' } 'dashboard-a'
+    $dashboardIdentityB = Get-EwspImageDescriptor $dashboardRepositoryConfig $cleanImageState `
+        @{ VITE_API_BASE_URL = 'http://localhost:18080'; VITE_WS_URL = 'ws://localhost:18080/ws' } 'dashboard-b'
+    Assert-Equal $dashboardIdentityA.Tag $dashboardIdentityB.Tag 'dashboard API and WebSocket URLs do not affect image identity'
 
     $missingAssetPath = Join-Path $testRoot 'missing-build-assets'
     New-Item -ItemType Directory -Path $missingAssetPath -Force | Out-Null
@@ -403,8 +409,22 @@ try {
     Assert-Contains $composeConfiguration 'context: ../ewsp-dashboard' 'dashboard uses its sibling repository build context'
     Assert-Equal ([regex]::Matches($composeConfiguration, '(?m)^\s+dockerfile: Dockerfile\s*$').Count) 2 'both applications use their repository Dockerfile'
     Assert-NotContains $composeConfiguration 'additional_contexts:' 'dashboard has no orchestration additional build context'
+    Assert-NotContains $composeConfiguration 'VITE_API_BASE_URL' 'Compose does not pass the obsolete dashboard API build argument'
+    Assert-NotContains $composeConfiguration 'VITE_WS_URL' 'Compose does not pass the obsolete dashboard WebSocket build argument'
+    Assert-Equal ([regex]::Matches($composeConfiguration, '(?m)^  backend:\s*$').Count) 1 'backend service name remains exact'
+    Assert-Contains $composeConfiguration '"${BACKEND_HOST_PORT:-8080}:8080"' 'backend keeps direct host port publication'
+    Assert-NotContains $composeConfiguration 'network_mode:' 'dashboard and backend remain on the shared Compose default network'
     Assert-Contains $composeConfiguration 'command: ["redis-server", "--save", "", "--appendonly", "no"]' 'Redis persistence is explicitly disabled'
     Assert-Contains $composeConfiguration 'type: tmpfs' 'Redis image data path is replaced with tmpfs'
+    $environmentExample = Get-Content -Raw -LiteralPath (Join-Path $localRoot '.env.example')
+    Assert-NotContains $environmentExample 'VITE_API_BASE_URL' 'environment example removes obsolete dashboard API build configuration'
+    Assert-NotContains $environmentExample 'VITE_WS_URL' 'environment example removes obsolete dashboard WebSocket build configuration'
+    $dashboardDockerfile = Get-Content -Raw -LiteralPath (Join-Path $localRoot '..\ewsp-dashboard\Dockerfile')
+    $dashboardNginx = Get-Content -Raw -LiteralPath (Join-Path $localRoot '..\ewsp-dashboard\nginx.conf')
+    Assert-NotContains $dashboardDockerfile 'VITE_API_BASE_URL' 'dashboard Dockerfile accepts no API build argument'
+    Assert-NotContains $dashboardDockerfile 'VITE_WS_URL' 'dashboard Dockerfile accepts no WebSocket build argument'
+    Assert-Contains $dashboardNginx 'proxy_pass http://backend:8080;' 'dashboard proxies same-origin API requests to backend service'
+    Assert-Contains $dashboardNginx 'proxy_pass http://backend:8080/ws;' 'dashboard proxies same-origin WebSocket requests to backend service'
 
     $healthyStates = @(
         [PSCustomObject]@{ Service = 'postgres'; State = 'running'; Health = 'healthy'; Id = '1' },
@@ -456,17 +476,26 @@ try {
     } 'Timed out' 'health timeout is classified and reported'
 
     $urls = [PSCustomObject]@{
-        Dashboard = 'http://localhost:3000'; BackendHealth = 'http://localhost:8080/api/health'
+        Dashboard = 'http://localhost:3000'
+        DashboardComplaints = 'http://localhost:3000/complaints'
+        DashboardMissingAsset = 'http://localhost:3000/assets/ewsp-missing-verification.js'
+        DashboardBackendHealth = 'http://localhost:3000/api/health'
+        BackendHealth = 'http://localhost:8080/api/health'
         Swagger = 'http://localhost:8080/swagger-ui/index.html'; OpenApi = 'http://localhost:8080/v3/api-docs'
         MinioLive = 'http://localhost:9000/minio/health/live'
     }
-    $successfulProbe = { param($uri) [PSCustomObject]@{ StatusCode = 200; Error = $null } }
+    $successfulProbe = {
+        param($uri)
+        $status = if ($uri -like '*ewsp-missing-verification.js') { 404 } else { 200 }
+        [PSCustomObject]@{ StatusCode = $status; Error = $null }
+    }
     Assert-EwspEndpoints $urls -Probe $successfulProbe
     $script:PassCount++
-    Write-Host 'PASS: endpoint verification accepts all required HTTP 200 responses'
+    Write-Host 'PASS: endpoint verification accepts all required HTTP statuses'
     $failedProbe = {
         param($uri)
-        if ($uri -like '*swagger*') { [PSCustomObject]@{ StatusCode = 503; Error = 'unavailable' } }
+        if ($uri -like '*ewsp-missing-verification.js') { [PSCustomObject]@{ StatusCode = 404; Error = $null } }
+        elseif ($uri -like '*swagger*') { [PSCustomObject]@{ StatusCode = 503; Error = 'unavailable' } }
         else { [PSCustomObject]@{ StatusCode = 200; Error = $null } }
     }
     Assert-ThrowsContains { Assert-EwspEndpoints $urls -Probe $failedProbe } `

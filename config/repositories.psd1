@@ -25,7 +25,7 @@
                 RepositoryName  = 'ewsp-dashboard'
                 EnvironmentName = 'EWSP_DASHBOARD_IMAGE'
                 RequiredBuildFiles = @('Dockerfile', '.dockerignore', 'nginx.conf')
-                BuildInputs     = @('VITE_API_BASE_URL')
+                BuildInputs     = @()
             }
         }
         @{

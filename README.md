@@ -41,7 +41,7 @@ For a fresh or normal safely updateable workspace, clone this repository and run
 
 Repository safety is unchanged. Missing repositories are cloned. A correct clean `main` checkout that is only behind its verified upstream may be fast-forwarded. Dirty, detached, wrong-branch, ahead, diverged, missing-upstream, fetch-failed, and unexpected-upstream states are preserved. If such a checkout already contains the required Docker assets, `up` reports the skipped update and continues safely; if an old checkout lacks a required application-owned Docker asset, `up` stops with remediation instead of resetting or replacing developer work.
 
-`.env` is created from `.env.example` only when absent and is otherwise preserved. Required setting names, URLs, Compose configuration, application Docker assets, sibling paths, and all configured host ports are checked before image or service startup. Secret values are not printed. Ports already published by this EWSP Compose project are accepted, while an external listener on a required port is reported without stopping it.
+`.env` is created from `.env.example` only when absent and is otherwise preserved. Required setting names, Compose configuration, application Docker assets, sibling paths, and all configured host ports are checked before image or service startup. Secret values are not printed. Ports already published by this EWSP Compose project are accepted, while an external listener on a required port is reported without stopping it.
 
 Failures identify the phase, category, component, sanitized operation, exit code when available, detected tool versions, completed phases, skipped phases, reason, and a safe next action. Readiness failures show every service state and at most 40 recent log lines for up to three non-ready services.
 
@@ -93,23 +93,24 @@ Run `.\ewsp.ps1 help` for a compact command summary.
 
 The checked-in `.env.example` contains local-only placeholder credentials. Change them when appropriate, especially on a shared machine. `.env` is ignored and must never be committed. Re-running `setup` preserves an existing `.env`.
 
-If `BACKEND_HOST_PORT` changes, update `VITE_API_BASE_URL` to the browser-reachable backend URL before building the dashboard. `VITE_API_BASE_URL` is a Vite build-time value; changing it requires rebuilding the dashboard image.
+The dashboard uses same-origin API and WebSocket paths. Its image does not accept or embed backend URLs, so changing `BACKEND_HOST_PORT` does not require rebuilding the dashboard. The backend host port remains available for direct development, Swagger, OpenAPI, mobile, and debugging access.
 
 ## Image identity and builds
 
-Clean backend and dashboard images are tagged from the application source commit plus a hash of orchestration-supplied build-time inputs. The application commit already identifies its tracked Dockerfile, `.dockerignore`, and, for the dashboard, Nginx configuration. `VITE_API_BASE_URL` remains part of dashboard image identity because Vite embeds it in generated output. An existing matching clean image is reused. A dirty source repository receives a session-specific `dirty-...` tag and is never falsely represented as its clean commit.
+Clean backend and dashboard images are tagged from the application source commit plus a hash of any orchestration-supplied build-time inputs. Neither application currently has such an input, so API and WebSocket URLs do not affect dashboard image identity. The dashboard application commit identifies its tracked Dockerfile, `.dockerignore`, and Nginx proxy configuration. An existing matching clean image is reused. A dirty source repository receives a session-specific `dirty-...` tag and is never falsely represented as its clean commit.
 
 Each `start` with dirty backend or dashboard source intentionally creates a new session tag and rebuilds that application image. These tags are not deleted automatically, so old dirty images can accumulate in the local Docker image store. Review and remove them manually with normal Docker image tooling when disk maintenance is needed; the orchestration script never guesses which developer images are safe to delete.
 
 The backend repository's Dockerfile uses its Maven wrapper and produces the runtime image. Its image build skips tests to keep routine builds practical; this does not replace the backend repository's normal automated test workflow.
 
-The dashboard repository's Dockerfile uses `npm ci`, creates the Vite production build, and serves it with its own Nginx configuration. Nginx returns `index.html` for client-side application routes while retaining strict handling for real assets.
+The dashboard repository's Dockerfile uses `npm ci`, creates the Vite production build, and serves it with its own Nginx configuration. Nginx returns `index.html` for client-side application routes, retains strict handling for real assets, proxies same-origin `/api` requests to `http://backend:8080`, and upgrades `/ws` connections to the backend WebSocket endpoint.
 
 ## Local URLs
 
 | Service | URL |
 |---|---|
 | Dashboard | http://localhost:3000 |
+| Dashboard-proxied backend health | http://localhost:3000/api/health |
 | Backend health | http://localhost:8080/api/health |
 | Swagger UI | http://localhost:8080/swagger-ui/index.html |
 | OpenAPI | http://localhost:8080/v3/api-docs |
@@ -120,7 +121,7 @@ PostgreSQL and Redis are exposed on ports 5432 and 6379 by default.
 
 ## Networking and readiness
 
-Compose creates one project-scoped default network. The backend connects to `postgres`, `redis`, and `minio` through Compose DNS. Browser dashboard requests use `VITE_API_BASE_URL`, normally `http://localhost:8080`; the Compose-only hostname `backend` is intentionally not embedded in the browser application.
+Compose creates one project-scoped default network shared by dashboard and backend. The backend connects to `postgres`, `redis`, and `minio` through Compose DNS. Browser dashboard requests remain on the dashboard origin; dashboard Nginx resolves the Compose service name `backend` and forwards `/api` and `/ws` internally to port 8080. The host-published backend port is not required for dashboard operation and remains available for direct development and debugging.
 
 PostgreSQL, Redis, and MinIO have health checks. Backend startup waits for all three to become healthy. The backend itself is checked through its public `/api/health` endpoint, and dashboard startup waits for that check.
 
@@ -161,5 +162,5 @@ Common failures:
 - If `up`, `setup`, or `start` reports that the Docker CLI exists but its Engine is unreachable, start Docker Desktop/Engine and retry.
 - If setup refuses an existing sibling directory, inspect its Git remote and move or rename it yourself; setup never overwrites an unexpected directory.
 - Dirty, ahead, diverged, detached, wrong-branch, missing-upstream, fetch-failed, and unexpected-upstream repositories are reported without automatic Git changes. Resolve them explicitly in the source repository, then rerun `update`.
-- An external host-port conflict requires stopping/reconfiguring that listener or changing the corresponding value in `.env`. When changing the backend port, also set the browser-reachable `VITE_API_BASE_URL` and matching `EWSP_CORS_ALLOWED_ORIGINS` before starting. The script never kills the listener.
+- An external host-port conflict requires stopping/reconfiguring that listener or changing the corresponding value in `.env`. Changing `BACKEND_HOST_PORT` affects direct host access but not the dashboard's internal `backend:8080` proxy target. Keep `EWSP_CORS_ALLOWED_ORIGINS` aligned with any browser origins that access the backend directly. The script never kills the listener.
 - Readiness failures automatically show bounded logs. For more detail, use the Compose invocation printed by `up`, add `-f compose.yml`, and run `logs <service>`. Ordinary Compose shutdown preserves data; do not add `-v` unless deleting this project's PostgreSQL and MinIO data is intentional.

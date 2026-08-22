@@ -686,7 +686,7 @@ function Get-EwspEffectiveEnvironmentValues {
             'POSTGRES_HOST_PORT', 'REDIS_HOST_PORT', 'MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD',
             'MINIO_BUCKET_NAME', 'MINIO_API_HOST_PORT', 'MINIO_CONSOLE_HOST_PORT',
             'BACKEND_HOST_PORT', 'SPRING_PROFILES_ACTIVE', 'JWT_SECRET',
-            'EWSP_CORS_ALLOWED_ORIGINS', 'DASHBOARD_HOST_PORT', 'VITE_API_BASE_URL'
+            'EWSP_CORS_ALLOWED_ORIGINS', 'DASHBOARD_HOST_PORT'
         )
     ) | Sort-Object -Unique
     foreach ($name in $knownNames) {
@@ -735,15 +735,9 @@ function Assert-EwspEnvironmentConfiguration {
         throw "Invalid/missing .env configuration: required setting names are missing or empty: $($missing -join ', '). Secret values were not printed."
     }
 
-    foreach ($urlName in @('VITE_API_BASE_URL', 'EWSP_CORS_ALLOWED_ORIGINS')) {
-        if (-not $EnvironmentValues.ContainsKey($urlName) -or [string]::IsNullOrWhiteSpace([string]$EnvironmentValues[$urlName])) {
-            throw "Invalid/missing .env configuration: $urlName is missing or empty."
-        }
-    }
-    $uri = $null
-    if (-not [Uri]::TryCreate([string]$EnvironmentValues['VITE_API_BASE_URL'], [UriKind]::Absolute, [ref]$uri) -or
-        $uri.Scheme -notin @('http', 'https')) {
-        throw 'Invalid .env configuration: VITE_API_BASE_URL must be an absolute HTTP or HTTPS URL.'
+    if (-not $EnvironmentValues.ContainsKey('EWSP_CORS_ALLOWED_ORIGINS') -or
+        [string]::IsNullOrWhiteSpace([string]$EnvironmentValues['EWSP_CORS_ALLOWED_ORIGINS'])) {
+        throw 'Invalid/missing .env configuration: EWSP_CORS_ALLOWED_ORIGINS is missing or empty.'
     }
 
     $ports = @(Get-EwspConfiguredPorts $EnvironmentValues)
@@ -1212,6 +1206,9 @@ function Get-EwspLocalUrls {
     $minioConsolePort = $byService.minio['9001']
     [PSCustomObject]@{
         Dashboard = "http://localhost:$dashboardPort"
+        DashboardComplaints = "http://localhost:$dashboardPort/complaints"
+        DashboardMissingAsset = "http://localhost:$dashboardPort/assets/ewsp-missing-verification.js"
+        DashboardBackendHealth = "http://localhost:$dashboardPort/api/health"
         Backend = "http://localhost:$backendPort"
         BackendHealth = "http://localhost:$backendPort/api/health"
         Swagger = "http://localhost:$backendPort/swagger-ui/index.html"
@@ -1241,23 +1238,26 @@ function Assert-EwspEndpoints {
         }
     }
     $checks = @(
-        @{ Name = 'Dashboard'; Uri = $Urls.Dashboard },
-        @{ Name = 'Backend health'; Uri = $Urls.BackendHealth },
-        @{ Name = 'Swagger UI'; Uri = $Urls.Swagger },
-        @{ Name = 'OpenAPI'; Uri = $Urls.OpenApi },
-        @{ Name = 'MinIO'; Uri = $Urls.MinioLive }
+        @{ Name = 'Dashboard'; Uri = $Urls.Dashboard; ExpectedStatus = 200 },
+        @{ Name = 'Dashboard route'; Uri = $Urls.DashboardComplaints; ExpectedStatus = 200 },
+        @{ Name = 'Dashboard missing asset'; Uri = $Urls.DashboardMissingAsset; ExpectedStatus = 404 },
+        @{ Name = 'Dashboard backend proxy'; Uri = $Urls.DashboardBackendHealth; ExpectedStatus = 200 },
+        @{ Name = 'Backend health'; Uri = $Urls.BackendHealth; ExpectedStatus = 200 },
+        @{ Name = 'Swagger UI'; Uri = $Urls.Swagger; ExpectedStatus = 200 },
+        @{ Name = 'OpenAPI'; Uri = $Urls.OpenApi; ExpectedStatus = 200 },
+        @{ Name = 'MinIO'; Uri = $Urls.MinioLive; ExpectedStatus = 200 }
     )
     foreach ($check in $checks) {
         $result = & $Probe $check.Uri
-        if ($result.StatusCode -ne 200) {
+        if ($result.StatusCode -ne $check.ExpectedStatus) {
             $reason = if ($result.Error) { Protect-EwspDiagnosticText $result.Error } else { "HTTP $($result.StatusCode)" }
-            $exception = New-Object System.Exception("Endpoint verification failure: $($check.Name) at $($check.Uri) did not return HTTP 200. Detected: $reason")
+            $exception = New-Object System.Exception("Endpoint verification failure: $($check.Name) at $($check.Uri) did not return HTTP $($check.ExpectedStatus). Detected: $reason")
             $exception.Data['Category'] = 'ENDPOINT_VERIFICATION_FAILURE'
             $exception.Data['Component'] = $check.Name
             $exception.Data['Operation'] = "HTTP GET $($check.Uri)"
             throw $exception
         }
-        Write-Host ("      {0,-16} HTTP 200" -f $check.Name)
+        Write-Host ("      {0,-24} HTTP {1}" -f $check.Name, $check.ExpectedStatus)
     }
 }
 
