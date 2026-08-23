@@ -1,6 +1,6 @@
 # EWSP Local Environment
 
-`ewsp-local` provides the reproducible Docker Compose environment used for EWSP local and integration testing. It orchestrates the backend, dashboard, PostgreSQL, Redis, and MinIO while leaving the application source repositories independent.
+`ewsp-local` provides the reproducible Docker Compose environment used for EWSP local and integration testing, together with the published Kubernetes deployment baseline under `k8s/`. It orchestrates the backend, dashboard, PostgreSQL, Redis, and MinIO while leaving the application source repositories independent.
 
 This topology is for local development and integration testing. It is not the EWSP production deployment design.
 
@@ -16,7 +16,7 @@ EWSP/
 `-- ewsp-mobile/
 ```
 
-The Docker build contexts are `../ewsp-backend` and `../ewsp-dashboard`. Each application repository owns its image construction: `ewsp-backend` owns its `Dockerfile` and `.dockerignore`, while `ewsp-dashboard` owns its `Dockerfile`, `.dockerignore`, and Nginx configuration. This repository owns workspace bootstrap, environment configuration, infrastructure, networking, volumes, runtime configuration, health coordination, and multi-service Docker Compose orchestration.
+The Docker build contexts are `../ewsp-backend` and `../ewsp-dashboard`. Each application repository owns its image construction: `ewsp-backend` owns its `Dockerfile` and `.dockerignore`, while `ewsp-dashboard` owns its `Dockerfile`, `.dockerignore`, and Nginx configuration. This repository does not own application Dockerfiles. It owns sibling-workspace bootstrap and safe repository setup/update, environment configuration, infrastructure, networking, volumes, runtime configuration, application image identity/reuse coordination, health/status diagnostics, multi-service Docker Compose orchestration, and the Kubernetes manifests under `k8s/`.
 
 ## Prerequisites
 
@@ -24,6 +24,7 @@ The Docker build contexts are `../ewsp-backend` and `../ewsp-dashboard`. Each ap
 - Git
 - Docker Desktop or another Docker engine with Docker Compose support
 - Available host ports 3000, 5432, 6379, 8080, 9000, and 9001, unless overridden in `.env`
+- For the Kubernetes baseline, `kubectl` and Docker Desktop Kubernetes; the verified target is Docker Desktop kind Kubernetes
 
 Java, Maven, Node, and Nginx do not need to be installed on the host for the container workflow.
 
@@ -97,6 +98,8 @@ The dashboard uses same-origin API and WebSocket paths. Its image does not accep
 
 ## Image identity and builds
 
+The ownership flow is application source repository to repository-owned Dockerfile to Docker image to `ewsp-local` Compose or Kubernetes orchestration.
+
 Clean backend and dashboard images are tagged from the application source commit plus a hash of any orchestration-supplied build-time inputs. Neither application currently has such an input, so API and WebSocket URLs do not affect dashboard image identity. The dashboard application commit identifies its tracked Dockerfile, `.dockerignore`, and Nginx proxy configuration. An existing matching clean image is reused. A dirty source repository receives a session-specific `dirty-...` tag and is never falsely represented as its clean commit.
 
 Each `start` with dirty backend or dashboard source intentionally creates a new session tag and rebuilds that application image. These tags are not deleted automatically, so old dirty images can accumulate in the local Docker image store. Review and remove them manually with normal Docker image tooling when disk maintenance is needed; the orchestration script never guesses which developer images are safe to delete.
@@ -124,6 +127,27 @@ PostgreSQL and Redis are exposed on ports 5432 and 6379 by default.
 Compose creates one project-scoped default network shared by dashboard and backend. The backend connects to `postgres`, `redis`, and `minio` through Compose DNS. Browser dashboard requests remain on the dashboard origin; dashboard Nginx resolves the Compose service name `backend` and forwards `/api` and `/ws` internally to port 8080. The host-published backend port is not required for dashboard operation and remains available for direct development and debugging.
 
 PostgreSQL, Redis, and MinIO have health checks. Backend startup waits for all three to become healthy. The backend itself is checked through its public `/api/health` endpoint, and dashboard startup waits for that check.
+
+## Kubernetes deployment baseline
+
+Docker Compose remains the convenient local development and full-stack path driven by `.\ewsp.ps1 up` and the advanced commands above. The published plain Kubernetes manifests live under `k8s/`, use the `ewsp` namespace, and currently require manual deployment and integration steps; there is not yet a one-command Kubernetes lifecycle workflow equivalent to the Compose orchestration.
+
+The baseline contains:
+
+- PostgreSQL as a one-replica StatefulSet with a 5 Gi PVC.
+- Redis as a one-replica Deployment with ephemeral memory-backed storage and no PVC.
+- MinIO as a one-replica StatefulSet with a 10 Gi PVC.
+- The backend and dashboard as one-replica Deployments with no PVCs.
+
+All five Services are internal `ClusterIP` Services. The backend and dashboard manifests retain obvious non-latest image placeholders that must be resolved to the intended source-aware image tags at deployment time. Real Kubernetes secrets are never committed: `k8s/config/secrets.example.yaml` contains placeholders only, and a real `ewsp-infrastructure-secrets` Secret must be created locally.
+
+The baseline was verified on Docker Desktop kind Kubernetes v1.36.1. Initial host access uses dashboard-only port forwarding, which preserves the same-origin `/api` and `/ws` path:
+
+```powershell
+kubectl port-forward -n ewsp service/dashboard 3000:80
+```
+
+Kubernetes PostgreSQL and MinIO PVCs are separate from the Docker Compose named volumes and do not migrate or reuse their data. Deleting the Kubernetes PVCs or resetting the cluster can destroy Kubernetes data; neither action affects the preserved Compose volumes unless those volumes are separately removed.
 
 ## Stop and persistence
 
