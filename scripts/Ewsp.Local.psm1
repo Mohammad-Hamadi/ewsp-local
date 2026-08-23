@@ -1802,7 +1802,532 @@ function Get-EwspKubernetesPaths {
         PortForwardState = Join-Path $temporaryRoot 'port-forward.json'
         PortForwardOutput = Join-Path $temporaryRoot 'port-forward.out.log'
         PortForwardError = Join-Path $temporaryRoot 'port-forward.err.log'
+        QuickTunnelState = Join-Path $temporaryRoot 'quick-tunnel.json'
+        QuickTunnelOutput = Join-Path $temporaryRoot 'quick-tunnel.out.log'
+        QuickTunnelError = Join-Path $temporaryRoot 'quick-tunnel.err.log'
     }
+}
+
+function New-EwspQuickTunnelException {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][string]$Category,
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [string]$Component = 'Quick Tunnel',
+        [string]$NextAction = 'Run .\ewsp.ps1 tunnel-status, correct the reported condition, and retry.'
+    )
+    $text = "$Message`nCategory: $Category`nPhase: $Phase`nComponent: $Component`nNext action: $NextAction"
+    $exception = New-Object System.Exception($text)
+    $exception.Data['Category'] = $Category
+    $exception.Data['Phase'] = $Phase
+    $exception.Data['Component'] = $Component
+    $exception.Data['NextAction'] = $NextAction
+    $exception
+}
+
+function Get-EwspCloudflaredInfo {
+    param(
+        [scriptblock]$CommandResolver,
+        [scriptblock]$CommandRunner
+    )
+    $customResolver = $null -ne $CommandResolver
+    if (-not $CommandResolver) { $CommandResolver = { param($name) Get-Command $name -ErrorAction SilentlyContinue } }
+    $command = & $CommandResolver 'cloudflared'
+    if (-not $command -and -not $customResolver -and (Get-EwspHostPlatform).Name -eq 'Windows') {
+        $candidates = @(
+            $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'cloudflared\cloudflared.exe' }),
+            $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'cloudflared\cloudflared.exe' })
+        )
+        $installedPath = @($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1)
+        if ($installedPath.Count) { $command = [PSCustomObject]@{ Source = [string]$installedPath[0] } }
+    }
+    if (-not $command) {
+        return [PSCustomObject]@{ Available = $false; Version = $null; Path = $null; ProbeExitCode = $null }
+    }
+    $path = if ($command.PSObject.Properties['Source'] -and $command.Source) { [string]$command.Source } else { 'cloudflared' }
+    $result = if ($CommandRunner) { & $CommandRunner $path @('--version') } else { Invoke-EwspNative $path @('--version') }
+    $version = if ($result.ExitCode -eq 0) { ($result.Output -join ' ').Trim() } else { $null }
+    [PSCustomObject]@{ Available = [bool]$version; Version = $version; Path = $path; ProbeExitCode = $result.ExitCode }
+}
+
+function Assert-EwspCloudflaredAvailable {
+    param([Parameter(Mandatory = $true)]$Info)
+    if (-not $Info.Available) {
+        throw (New-EwspQuickTunnelException `
+            'cloudflared is not installed, is not on PATH, or could not run. It was not installed automatically.' `
+            'CLOUDFLARED_MISSING' 'PREREQUISITE' 'cloudflared' `
+            'Install Cloudflare cloudflared (Windows: winget install --id Cloudflare.cloudflared), open a new PowerShell, verify cloudflared --version, then retry. Quick Tunnels require no Cloudflare account or domain.')
+    }
+    $Info
+}
+
+function ConvertTo-EwspLiteralIpv4Regex {
+    param([Parameter(Mandatory = $true)][string]$Address)
+    $parsed = $null
+    if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed) -or
+        $parsed.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
+        $parsed.ToString() -ne $Address) {
+        throw (New-EwspQuickTunnelException "Dashboard Pod IP '$Address' is not a canonical IPv4 address." 'DASHBOARD_POD_RESOLUTION_FAILED' 'POD_RESOLUTION' 'dashboard Pod' 'Restore one Ready dashboard Pod with an IPv4 podIP, then retry.')
+    }
+    [regex]::Escape($Address)
+}
+
+function New-EwspQuickTunnelTrustRegex {
+    param([Parameter(Mandatory = $true)][string]$DashboardPodIp)
+    '^(?:' + (ConvertTo-EwspLiteralIpv4Regex $DashboardPodIp) + '|127\.0\.0\.1)$'
+}
+
+function Get-EwspReadyDashboardPod {
+    param([scriptblock]$CommandRunner)
+    $result = Invoke-EwspKubectl @('get', 'pods', '-n', $script:EwspKubernetesNamespace, '-l', 'app.kubernetes.io/name=dashboard,app.kubernetes.io/part-of=ewsp', '-o', 'json') $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        throw (New-EwspQuickTunnelException 'Unable to list dashboard Pods by stable labels.' 'DASHBOARD_POD_RESOLUTION_FAILED' 'POD_RESOLUTION' 'dashboard Pod' 'Run .\ewsp.ps1 k8s-status, restore dashboard readiness, then retry.')
+    }
+    try { $list = ($result.Output -join "`n") | ConvertFrom-Json } catch {
+        throw (New-EwspQuickTunnelException 'kubectl returned invalid dashboard Pod JSON.' 'DASHBOARD_POD_RESOLUTION_FAILED' 'POD_RESOLUTION' 'dashboard Pod')
+    }
+    $ready = @($list.items | Where-Object {
+        $notDeleting = -not $_.metadata.PSObject.Properties['deletionTimestamp'] -or -not $_.metadata.deletionTimestamp
+        $notDeleting -and $_.status.phase -eq 'Running' -and
+        @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -eq 1 -and
+        @($_.status.containerStatuses).Count -gt 0 -and
+        @($_.status.containerStatuses | Where-Object { $_.ready }).Count -eq @($_.status.containerStatuses).Count
+    })
+    if ($ready.Count -ne 1) {
+        throw (New-EwspQuickTunnelException "Expected exactly one Ready dashboard Pod; found $($ready.Count)." 'DASHBOARD_POD_RESOLUTION_FAILED' 'POD_RESOLUTION' 'dashboard Pod' 'Wait for exactly one Ready dashboard replica, then retry.')
+    }
+    $ip = [string]$ready[0].status.podIP
+    ConvertTo-EwspLiteralIpv4Regex $ip | Out-Null
+    [PSCustomObject]@{ Name = [string]$ready[0].metadata.name; Ip = $ip }
+}
+
+function Get-EwspDeploymentEnvironmentSetting {
+    param(
+        [Parameter(Mandatory = $true)]$Deployment,
+        [Parameter(Mandatory = $true)]$ConfigMap,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $entry = @($Deployment.spec.template.spec.containers[0].env | Where-Object name -eq $Name)
+    if ($entry.Count -eq 1 -and $entry[0].PSObject.Properties['value']) {
+        return [PSCustomObject]@{ Present = $true; Value = [string]$entry[0].value; Source = 'Deployment' }
+    }
+    if ($ConfigMap.data.PSObject.Properties[$Name]) {
+        return [PSCustomObject]@{ Present = $false; Value = [string]$ConfigMap.data.$Name; Source = 'ConfigMap' }
+    }
+    [PSCustomObject]@{ Present = $false; Value = $null; Source = 'Default' }
+}
+
+function Get-EwspBackendProxyRuntime {
+    param([scriptblock]$CommandRunner)
+    $deploymentResult = Invoke-EwspKubectl @('get', 'deployment', 'backend', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $configResult = Invoke-EwspKubectl @('get', 'configmap', 'backend-config', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    if ($deploymentResult.ExitCode -ne 0 -or $configResult.ExitCode -ne 0) {
+        throw (New-EwspQuickTunnelException 'Unable to read backend Deployment and ConfigMap.' 'BACKEND_PROXY_CONFIG_FAILED' 'BACKEND_CONFIGURATION' 'backend')
+    }
+    try {
+        $deployment = ($deploymentResult.Output -join "`n") | ConvertFrom-Json
+        $configMap = ($configResult.Output -join "`n") | ConvertFrom-Json
+    } catch {
+        throw (New-EwspQuickTunnelException 'Backend runtime configuration JSON was invalid.' 'BACKEND_PROXY_CONFIG_FAILED' 'BACKEND_CONFIGURATION' 'backend')
+    }
+    $names = @('SERVER_FORWARD_HEADERS_STRATEGY', 'SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES', 'EWSP_CORS_ALLOWED_ORIGINS')
+    $settings = [ordered]@{}
+    foreach ($name in $names) { $settings[$name] = Get-EwspDeploymentEnvironmentSetting $deployment $configMap $name }
+    [PSCustomObject]@{ Deployment = $deployment; ConfigMap = $configMap; Settings = $settings }
+}
+
+function Set-EwspBackendEnvironmentOverrides {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Values,
+        [scriptblock]$CommandRunner
+    )
+    $arguments = @('set', 'env', 'deployment/backend', '-n', $script:EwspKubernetesNamespace)
+    foreach ($name in @($Values.Keys | Sort-Object)) { $arguments += "$name=$($Values[$name])" }
+    $result = Invoke-EwspKubectl $arguments $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        $reason = Protect-EwspDiagnosticText (($result.Output | Select-Object -Last 20) -join ' ')
+        throw (New-EwspQuickTunnelException "Backend environment reconciliation failed: $reason" 'BACKEND_PROXY_CONFIG_FAILED' 'BACKEND_CONFIGURATION' 'backend')
+    }
+}
+
+function Restore-EwspBackendEnvironmentOverrides {
+    param(
+        [Parameter(Mandatory = $true)]$PreviousSettings,
+        [scriptblock]$CommandRunner
+    )
+    $arguments = @('set', 'env', 'deployment/backend', '-n', $script:EwspKubernetesNamespace)
+    foreach ($name in @($PreviousSettings.PSObject.Properties.Name | Sort-Object)) {
+        $setting = $PreviousSettings.$name
+        $arguments += if ($setting.Present) { "$name=$($setting.Value)" } else { "$name-" }
+    }
+    $result = Invoke-EwspKubectl $arguments $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        throw (New-EwspQuickTunnelException 'Backend normal configuration could not be restored.' 'BACKEND_PROXY_CONFIG_FAILED' 'RESTORE' 'backend' 'Inspect deployment/backend, then rerun .\ewsp.ps1 tunnel-stop.')
+    }
+}
+
+function Get-EwspBackendServiceReadinessState {
+    param([scriptblock]$CommandRunner)
+    $deploymentResult = Invoke-EwspKubectl @('get', 'deployment', 'backend', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $podsResult = Invoke-EwspKubectl @('get', 'pods', '-n', $script:EwspKubernetesNamespace, '-l', 'app.kubernetes.io/name=backend,app.kubernetes.io/part-of=ewsp', '-o', 'json') $CommandRunner
+    $endpointResult = Invoke-EwspKubectl @('get', 'endpointslice', '-n', $script:EwspKubernetesNamespace, '-l', 'kubernetes.io/service-name=backend', '-o', 'json') $CommandRunner
+    if ($deploymentResult.ExitCode -ne 0 -or $podsResult.ExitCode -ne 0 -or $endpointResult.ExitCode -ne 0) {
+        return [PSCustomObject]@{ DeploymentReady = $false; PodReady = $false; EndpointReady = $false; PodName = $null; PodPhase = 'Unknown'; Restarts = 0; Detail = 'Kubernetes readiness objects unavailable' }
+    }
+    try {
+        $deployment = ($deploymentResult.Output -join "`n") | ConvertFrom-Json
+        $podList = ($podsResult.Output -join "`n") | ConvertFrom-Json
+        $endpointList = ($endpointResult.Output -join "`n") | ConvertFrom-Json
+        $desired = [int]$deployment.spec.replicas
+        $readyReplicas = if ($deployment.status.PSObject.Properties['readyReplicas']) { [int]$deployment.status.readyReplicas } else { 0 }
+        $availableReplicas = if ($deployment.status.PSObject.Properties['availableReplicas']) { [int]$deployment.status.availableReplicas } else { 0 }
+        $observedGeneration = if ($deployment.status.PSObject.Properties['observedGeneration']) { [long]$deployment.status.observedGeneration } else { 0 }
+        $deploymentReady = $desired -eq 1 -and $readyReplicas -eq 1 -and $availableReplicas -eq 1 -and $observedGeneration -ge [long]$deployment.metadata.generation
+        $readyPods = @($podList.items | Where-Object {
+            $notDeleting = -not $_.metadata.PSObject.Properties['deletionTimestamp'] -or -not $_.metadata.deletionTimestamp
+            $statuses = @()
+            if ($_.status.PSObject.Properties['containerStatuses']) { $statuses = @($_.status.containerStatuses) }
+            $notDeleting -and $_.status.phase -eq 'Running' -and
+                @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -eq 1 -and
+                $statuses.Count -gt 0 -and @($statuses | Where-Object { $_.ready }).Count -eq $statuses.Count
+        })
+        $pod = if ($readyPods.Count -eq 1) { $readyPods[0] } else { $null }
+        $readyEndpointNames = @($endpointList.items | ForEach-Object { @($_.endpoints) } | Where-Object {
+            $_.conditions.ready -eq $true -and
+                (-not $_.conditions.PSObject.Properties['terminating'] -or $_.conditions.terminating -ne $true) -and
+                $_.targetRef -and $_.targetRef.kind -eq 'Pod'
+        } | ForEach-Object { [string]$_.targetRef.name })
+        $endpointReady = [bool]($pod -and $readyEndpointNames -contains [string]$pod.metadata.name)
+        $allPods = @($podList.items | Sort-Object { $_.metadata.creationTimestamp } -Descending)
+        $newest = if ($allPods.Count) { $allPods[0] } else { $null }
+        $newestStatuses = @()
+        if ($newest -and $newest.status.PSObject.Properties['containerStatuses']) { $newestStatuses = @($newest.status.containerStatuses) }
+        [PSCustomObject]@{
+            DeploymentReady = $deploymentReady
+            PodReady = $null -ne $pod
+            EndpointReady = $endpointReady
+            PodName = if ($pod) { [string]$pod.metadata.name } elseif ($newest) { [string]$newest.metadata.name } else { $null }
+            PodPhase = if ($newest) { [string]$newest.status.phase } else { 'Missing' }
+            Restarts = if ($newestStatuses.Count) { [int]$newestStatuses[0].restartCount } else { 0 }
+            Detail = "generation=$($deployment.metadata.generation)/$observedGeneration ready=$readyReplicas/$desired available=$availableReplicas readyPods=$($readyPods.Count) readyEndpoints=$($readyEndpointNames.Count)"
+        }
+    } catch {
+        [PSCustomObject]@{ DeploymentReady = $false; PodReady = $false; EndpointReady = $false; PodName = $null; PodPhase = 'Unknown'; Restarts = 0; Detail = "Kubernetes readiness JSON invalid at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)" }
+    }
+}
+
+function Wait-EwspBackendServiceReadiness {
+    param(
+        [int]$TimeoutSeconds = 60,
+        [scriptblock]$StateProvider,
+        [scriptblock]$SleepAction
+    )
+    if (-not $StateProvider) { $StateProvider = { Get-EwspBackendServiceReadinessState } }
+    if (-not $SleepAction) { $SleepAction = { Start-Sleep -Milliseconds 250 } }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $last = $null
+    do {
+        $last = & $StateProvider
+        if ($last.DeploymentReady -and $last.PodReady -and $last.EndpointReady) { return $last }
+        & $SleepAction
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $detail = if ($last) { $last.Detail } else { 'no readiness state returned' }
+    throw (New-EwspQuickTunnelException "Backend Pod or EndpointSlice readiness timed out: $detail" 'BACKEND_PROXY_CONFIG_FAILED' 'BACKEND_ENDPOINT_READINESS' 'backend Service' 'Inspect backend Pod readiness, EndpointSlice state, and bounded diagnostics, then retry.')
+}
+
+function Test-EwspBackendDirectHealth {
+    param([scriptblock]$CommandRunner)
+    $result = Invoke-EwspKubectl @('get', '--raw', '/api/v1/namespaces/ewsp/services/http:backend:8080/proxy/api/health') $CommandRunner
+    [PSCustomObject]@{ Success = $result.ExitCode -eq 0 -and ($result.Output -join "`n") -match 'UP'; StatusCode = if ($result.ExitCode -eq 0) { 200 } else { 0 }; Content = ($result.Output -join "`n") }
+}
+
+function Wait-EwspBackendHealth {
+    param(
+        [int]$TimeoutSeconds = 45,
+        [scriptblock]$DirectProbe,
+        [scriptblock]$DashboardProbe,
+        [scriptblock]$SleepAction
+    )
+    if (-not $DirectProbe) { $DirectProbe = { Test-EwspBackendDirectHealth } }
+    if (-not $DashboardProbe) { $DashboardProbe = { Test-EwspKubernetesDashboardEndpoint 3000 '/api/health' } }
+    if (-not $SleepAction) { $SleepAction = { Start-Sleep -Milliseconds 250 } }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $direct = $null
+    $dashboard = $null
+    do {
+        $direct = & $DirectProbe
+        $dashboard = & $DashboardProbe
+        if ($direct.Success -and $direct.Content -match 'UP' -and $dashboard.Success -and $dashboard.Content -match 'UP') {
+            return [PSCustomObject]@{ Direct = $direct; Dashboard = $dashboard }
+        }
+        & $SleepAction
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $directStatus = if ($direct) { $direct.StatusCode } else { 0 }
+    $dashboardStatus = if ($dashboard) { $dashboard.StatusCode } else { 0 }
+    throw (New-EwspQuickTunnelException "Backend health timed out: direct Service HTTP=$directStatus, dashboard-proxied HTTP=$dashboardStatus." 'BACKEND_PROXY_CONFIG_FAILED' 'BACKEND_HEALTH' 'backend health' 'Inspect backend logs, Service endpoints, and dashboard proxy logs, then retry.')
+}
+
+function Show-EwspBackendQuickTunnelDiagnostics {
+    param([scriptblock]$CommandRunner)
+    Write-Host ''
+    Write-Host 'Backend Quick Tunnel diagnostics (bounded)' -ForegroundColor Yellow
+    $snapshot = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner | Where-Object Name -eq 'backend')
+    if ($snapshot.Count) {
+        $item = $snapshot[0]
+        Write-Host "  pod=$($item.PodName) phase=$($item.PodPhase) ready=$($item.ReadyReplicas)/$($item.Desired) restarts=$($item.Restarts) reason=$($item.Reason)"
+        if ($item.PodName) {
+            $logs = Invoke-EwspKubectl @('logs', '-n', $script:EwspKubernetesNamespace, $item.PodName, '--tail=40') $CommandRunner
+            @($logs.Output | Select-Object -Last 40) | ForEach-Object { Write-Host "    $(Protect-EwspDiagnosticText ([string]$_))" }
+            $events = Invoke-EwspKubectl @('get', 'events', '-n', $script:EwspKubernetesNamespace, '--field-selector', "involvedObject.name=$($item.PodName)", '--sort-by=.lastTimestamp', '-o', 'custom-columns=TYPE:.type,REASON:.reason,MESSAGE:.message', '--no-headers') $CommandRunner
+            @($events.Output | Select-Object -Last 12) | ForEach-Object { Write-Host "    event: $(Protect-EwspDiagnosticText ([string]$_))" }
+        }
+    }
+    $endpoint = Invoke-EwspKubectl @('get', 'endpointslice', '-n', $script:EwspKubernetesNamespace, '-l', 'kubernetes.io/service-name=backend', '-o', 'wide') $CommandRunner
+    @($endpoint.Output | Select-Object -Last 10) | ForEach-Object { Write-Host "    endpoint: $(Protect-EwspDiagnosticText ([string]$_))" }
+}
+
+function Wait-EwspBackendReady {
+    param([scriptblock]$CommandRunner)
+    $result = Invoke-EwspKubectl @('rollout', 'status', 'deployment/backend', '-n', $script:EwspKubernetesNamespace, '--timeout=240s') $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        Show-EwspBackendQuickTunnelDiagnostics $CommandRunner
+        $reason = Protect-EwspDiagnosticText (($result.Output | Select-Object -Last 20) -join ' ')
+        throw (New-EwspQuickTunnelException "Backend Deployment rollout timed out: $reason" 'BACKEND_PROXY_CONFIG_FAILED' 'BACKEND_ROLLOUT_WAIT' 'backend Deployment')
+    }
+    try {
+        $state = Wait-EwspBackendServiceReadiness -StateProvider { Get-EwspBackendServiceReadinessState $CommandRunner }
+        $health = Wait-EwspBackendHealth -DirectProbe { Test-EwspBackendDirectHealth $CommandRunner }
+        [PSCustomObject]@{ State = $state; Health = $health }
+    } catch {
+        Show-EwspBackendQuickTunnelDiagnostics $CommandRunner
+        throw
+    }
+}
+
+function ConvertFrom-EwspQuickTunnelUrl {
+    param([AllowNull()][string]$Text)
+    if (-not $Text) { return $null }
+    $match = [regex]::Match($Text, 'https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.trycloudflare\.com(?=\s|/|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($match.Success) { $match.Value.ToLowerInvariant() } else { $null }
+}
+
+function Assert-EwspKubernetesSeedContext {
+    param([AllowNull()][string]$Context)
+    if ($Context -ne $script:EwspKubernetesContext) {
+        $actual = if ($Context) { $Context } else { '<none>' }
+        throw (New-EwspKubernetesException "Refusing local seed: current context is '$actual'; required context is '$script:EwspKubernetesContext'. No bypass is available." 'UNSAFE_KUBERNETES_CONTEXT' 'Kubernetes context' 'kubectl config current-context')
+    }
+    $true
+}
+
+function Resolve-EwspKubernetesSeedFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [string]$BackendRepositoryPath,
+        [scriptblock]$GitRunner
+    )
+    if (-not $BackendRepositoryPath) {
+        $configuration = Get-EwspConfiguration $LocalRoot
+        $repository = @($configuration.Repositories | Where-Object Name -eq 'ewsp-backend')
+        if ($repository.Count -ne 1) {
+            throw (New-EwspKubernetesException 'The configured ewsp-backend sibling repository could not be resolved.' 'SEED_FILE_MISSING' 'dashboard user seed' 'Resolve ewsp-backend repository')
+        }
+        $BackendRepositoryPath = Resolve-EwspRepositoryPath $LocalRoot $repository[0]
+        $identity = Test-EwspRepositoryIdentity $BackendRepositoryPath $repository[0].ExpectedIdentity
+        if (-not $identity.IdentityMatches) {
+            throw (New-EwspKubernetesException 'The ewsp-backend sibling repository is missing or has an unexpected Git identity.' 'SEED_FILE_MISSING' 'dashboard user seed' 'Verify ewsp-backend repository identity')
+        }
+    }
+    $relativePath = 'local-dev/seed-dashboard-users.sql'
+    $seedPath = [IO.Path]::GetFullPath((Join-Path $BackendRepositoryPath 'local-dev\seed-dashboard-users.sql'))
+    $expectedRoot = [IO.Path]::GetFullPath($BackendRepositoryPath).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $seedPath.StartsWith($expectedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
+        throw (New-EwspKubernetesException 'Required local dashboard user seed is missing: ewsp-backend/local-dev/seed-dashboard-users.sql.' 'SEED_FILE_MISSING' 'dashboard user seed' 'Create or restore the ignored local seed file, then retry')
+    }
+    $invokeGit = {
+        param([string[]]$Arguments)
+        if ($GitRunner) { & $GitRunner $BackendRepositoryPath $Arguments } else { Invoke-EwspGit $BackendRepositoryPath $Arguments }
+    }
+    $tracked = & $invokeGit @('ls-files', '--error-unmatch', '--', $relativePath)
+    if ($tracked.ExitCode -eq 0) {
+        throw (New-EwspKubernetesException 'Refusing seed file because local-dev/seed-dashboard-users.sql is tracked by Git.' 'SEED_FILE_TRACKED' 'dashboard user seed' 'Remove the local credential seed from Git tracking before retrying')
+    }
+    $ignored = & $invokeGit @('check-ignore', '--quiet', '--', $relativePath)
+    if ($ignored.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Refusing seed file because local-dev/seed-dashboard-users.sql is not ignored or locally excluded by Git.' 'SEED_FILE_NOT_IGNORED' 'dashboard user seed' 'Add local-dev/ to the backend repository local exclude without committing credentials')
+    }
+    [PSCustomObject]@{ Path = $seedPath; BackendRepositoryPath = $BackendRepositoryPath; RelativePath = $relativePath }
+}
+
+function Get-EwspKubernetesSeedEmailContract {
+    param([Parameter(Mandatory = $true)][string]$SeedPath)
+    $text = Get-Content -Raw -LiteralPath $SeedPath
+    $emails = @([regex]::Matches($text, '(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}') |
+        ForEach-Object { $_.Value.ToLowerInvariant() } | Sort-Object -Unique)
+    if ($emails.Count -eq 0 -or $emails -notcontains 'admin@ewsp.local') {
+        throw (New-EwspKubernetesException 'The local seed does not contain the expected dashboard admin identity.' 'SEED_VERIFICATION_FAILED' 'dashboard user seed contract' 'Inspect the ignored local seed without displaying credentials')
+    }
+    $emails
+}
+
+function Get-EwspKubernetesPostgresSeedTarget {
+    param([scriptblock]$CommandRunner)
+    $statefulSetResult = Invoke-EwspKubectl @('get', 'statefulset', 'postgres', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $podResult = Invoke-EwspKubectl @('get', 'pod', 'postgres-0', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $pvcResult = Invoke-EwspKubectl @('get', 'pvc', 'postgres-data-postgres-0', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    if ($statefulSetResult.ExitCode -ne 0 -or $podResult.ExitCode -ne 0 -or $pvcResult.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'PostgreSQL StatefulSet, postgres-0 Pod, or PostgreSQL PVC is unavailable.' 'POSTGRES_NOT_READY' 'Kubernetes PostgreSQL' 'kubectl get statefulset,pod,pvc -n ewsp')
+    }
+    try {
+        $statefulSet = ($statefulSetResult.Output -join "`n") | ConvertFrom-Json
+        $pod = ($podResult.Output -join "`n") | ConvertFrom-Json
+        $pvc = ($pvcResult.Output -join "`n") | ConvertFrom-Json
+        $readyReplicas = if ($statefulSet.status.PSObject.Properties['readyReplicas']) { [int]$statefulSet.status.readyReplicas } else { 0 }
+        $containerStatuses = @()
+        if ($pod.status.PSObject.Properties['containerStatuses']) { $containerStatuses = @($pod.status.containerStatuses) }
+        $podReady = $pod.status.phase -eq 'Running' -and
+            @($pod.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -eq 1 -and
+            $containerStatuses.Count -gt 0 -and @($containerStatuses | Where-Object { $_.ready }).Count -eq $containerStatuses.Count
+        if ([int]$statefulSet.spec.replicas -ne 1 -or $readyReplicas -ne 1 -or -not $podReady -or $pvc.status.phase -ne 'Bound') {
+            throw "statefulsetReady=$readyReplicas/$($statefulSet.spec.replicas), podPhase=$($pod.status.phase), podReady=$podReady, pvc=$($pvc.status.phase)"
+        }
+        [PSCustomObject]@{ PodName = 'postgres-0'; PvcName = [string]$pvc.metadata.name; PvcUid = [string]$pvc.metadata.uid; PvcStatus = [string]$pvc.status.phase }
+    } catch {
+        throw (New-EwspKubernetesException "PostgreSQL is not Ready for local seeding: $($_.Exception.Message)" 'POSTGRES_NOT_READY' 'Kubernetes PostgreSQL' 'Wait for StatefulSet/postgres, postgres-0, and its PVC')
+    }
+}
+
+function Invoke-EwspKubernetesSeedSql {
+    param(
+        [Parameter(Mandatory = $true)][string]$SeedPath,
+        [scriptblock]$SeedExecutor
+    )
+    if ($SeedExecutor) {
+        $result = & $SeedExecutor $SeedPath
+    } else {
+        $kubectl = Get-Command kubectl -ErrorAction Stop
+        $command = 'exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+        $arguments = @('exec', '-i', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'sh', '-c', $command)
+        $quotedArguments = @($arguments | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ([string]$_).Replace('"', '\"') + '"' } else { [string]$_ }
+        })
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $kubectl.Source
+        $startInfo.Arguments = $quotedArguments -join ' '
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        try {
+            if (-not $process.Start()) { throw 'kubectl process did not start' }
+            $process.StandardInput.Write((Get-Content -Raw -LiteralPath $SeedPath))
+            $process.StandardInput.Close()
+            $standardOutput = $process.StandardOutput.ReadToEnd()
+            $standardError = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            $result = [PSCustomObject]@{ ExitCode = $process.ExitCode; Output = @($standardOutput, $standardError) }
+        } finally { $process.Dispose() }
+    }
+    if ($result.ExitCode -ne 0) {
+        $exception = New-EwspKubernetesException "Local seed SQL failed in psql (exit code $($result.ExitCode)); SQL and database output were withheld to protect local credentials." 'SEED_EXECUTION_FAILED' 'Kubernetes PostgreSQL' 'kubectl exec -i postgres-0 -- psql ON_ERROR_STOP=1'
+        $exception.Data['ExitCode'] = $result.ExitCode
+        throw $exception
+    }
+    $true
+}
+
+function Get-EwspKubernetesSeedVerification {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ExpectedEmails,
+        [scriptblock]$CommandRunner
+    )
+    $userResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'printenv', 'POSTGRES_USER') $CommandRunner
+    $databaseResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'printenv', 'POSTGRES_DB') $CommandRunner
+    if ($userResult.ExitCode -ne 0 -or $databaseResult.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Unable to resolve PostgreSQL connection names from postgres-0.' 'SEED_VERIFICATION_FAILED' 'Kubernetes PostgreSQL' 'Read postgres-0 environment names')
+    }
+    $databaseUser = ($userResult.Output -join '').Trim()
+    $databaseName = ($databaseResult.Output -join '').Trim()
+    $quotedEmails = @($ExpectedEmails | ForEach-Object { "'$(($_).Replace("'", "''"))'" }) -join ','
+    $countsSql = "select (select count(*) from users),(select count(*) from users where account_type='EMPLOYEE'),(select count(*) from users u join roles r on r.id=u.role_id where u.account_type='EMPLOYEE' and r.name='ADMIN');"
+    $accountsSql = "select lower(u.email),u.account_type,r.name,u.status,u.verified,(u.password_hash is not null and length(u.password_hash)>0) from users u join roles r on r.id=u.role_id where lower(u.email) in ($quotedEmails) order by lower(u.email);"
+    $countsResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', $databaseUser, '-d', $databaseName, '-AtF', '|', '-c', $countsSql) $CommandRunner
+    $accountsResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', $databaseUser, '-d', $databaseName, '-AtF', '|', '-c', $accountsSql) $CommandRunner
+    if ($countsResult.ExitCode -ne 0 -or $accountsResult.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Safe post-seed verification queries failed; database output was withheld.' 'SEED_VERIFICATION_FAILED' 'seeded dashboard users' 'Run non-sensitive PostgreSQL verification queries')
+    }
+    try {
+        $counts = @(($countsResult.Output -join '').Trim() -split '\|')
+        if ($counts.Count -ne 3) { throw 'unexpected count result' }
+        $accounts = @($accountsResult.Output | Where-Object { $_ } | ForEach-Object {
+            $parts = @(([string]$_).Trim() -split '\|')
+            if ($parts.Count -ne 6) { throw 'unexpected account result' }
+            [PSCustomObject]@{ Email = $parts[0]; AccountType = $parts[1]; Role = $parts[2]; Status = $parts[3]; Verified = $parts[4] -eq 't'; PasswordHashPresent = $parts[5] -eq 't' }
+        })
+        [PSCustomObject]@{ TotalUsers = [int]$counts[0]; EmployeeUsers = [int]$counts[1]; AdminEmployees = [int]$counts[2]; Accounts = $accounts }
+    } catch {
+        throw (New-EwspKubernetesException 'Safe post-seed verification returned an unexpected result shape.' 'SEED_VERIFICATION_FAILED' 'seeded dashboard users' 'Inspect schema compatibility without selecting password hashes')
+    }
+}
+
+function Assert-EwspKubernetesSeedVerification {
+    param(
+        [Parameter(Mandatory = $true)]$Verification,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedEmails
+    )
+    $actualEmails = @($Verification.Accounts | ForEach-Object { $_.Email })
+    $missing = @($ExpectedEmails | Where-Object { $actualEmails -notcontains $_ })
+    $admin = @($Verification.Accounts | Where-Object Email -eq 'admin@ewsp.local')
+    if ($missing.Count -or $admin.Count -ne 1 -or $admin[0].AccountType -ne 'EMPLOYEE' -or
+        $admin[0].Role -ne 'ADMIN' -or $admin[0].Status -ne 'ACTIVE' -or
+        -not $admin[0].Verified -or -not $admin[0].PasswordHashPresent) {
+        throw (New-EwspKubernetesException 'Seed verification failed: expected local identities or the active verified ADMIN employee contract is missing.' 'SEED_VERIFICATION_FAILED' 'seeded dashboard users' 'Inspect the ignored seed and Kubernetes database state without displaying credentials')
+    }
+    $true
+}
+
+function Invoke-EwspKubernetesSeed {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $phases = @('K8S_ENVIRONMENT', 'SEED_FILE_SAFETY', 'POSTGRES_PREFLIGHT', 'SEED_EXECUTION', 'SEED_VERIFICATION')
+    $completed = New-Object Collections.Generic.List[string]
+    $context = @{ Environment = $null; Seed = $null; Emails = @(); Target = $null; Verification = $null }
+    Invoke-EwspUpPhase 1 5 $phases[0] 'Verifying local Kubernetes safety boundary' {
+        $context.Environment = Get-EwspKubernetesEnvironment
+        Assert-EwspKubernetesSeedContext $context.Environment.Kubernetes.Context | Out-Null
+        Assert-EwspKubernetesEnvironment $context.Environment | Out-Null
+        if (-not $context.Environment.Kubernetes.NamespaceExists) {
+            throw (New-EwspKubernetesException "Required namespace '$script:EwspKubernetesNamespace' does not exist." 'K8S_NOT_READY' 'Kubernetes namespace' 'kubectl get namespace ewsp')
+        }
+        Write-Host "      context $($context.Environment.Kubernetes.Context); namespace $script:EwspKubernetesNamespace"
+    } $completed @($phases[1..4]) $context.Environment 'Verify docker-desktop Kubernetes and namespace ewsp' 'Kubernetes environment' -WorkflowName 'k8s-seed' | Out-Null
+    Invoke-EwspUpPhase 2 5 $phases[1] 'Validating ignored local seed file' {
+        $context.Seed = Resolve-EwspKubernetesSeedFile $LocalRoot
+        $context.Emails = @(Get-EwspKubernetesSeedEmailContract $context.Seed.Path)
+        Write-Host "      ignored local seed contract: $($context.Emails.Count) employee identities; SQL hidden"
+    } $completed @($phases[2..4]) $context.Environment 'Validate untracked ignored ewsp-backend local seed' 'dashboard user seed' -WorkflowName 'k8s-seed' | Out-Null
+    Invoke-EwspUpPhase 3 5 $phases[2] 'Checking Kubernetes PostgreSQL readiness' {
+        $context.Target = Get-EwspKubernetesPostgresSeedTarget
+        Write-Host "      postgres-0 Ready; $($context.Target.PvcName) $($context.Target.PvcStatus)"
+    } $completed @($phases[3..4]) $context.Environment 'Verify StatefulSet, postgres-0, and bound PVC' 'Kubernetes PostgreSQL' -WorkflowName 'k8s-seed' | Out-Null
+    Invoke-EwspUpPhase 4 5 $phases[3] 'Applying local dashboard user seed' {
+        Invoke-EwspKubernetesSeedSql $context.Seed.Path | Out-Null
+        Write-Host '      psql completed with ON_ERROR_STOP; SQL output hidden'
+    } $completed @($phases[4]) $context.Environment 'Stream ignored seed into postgres-0 psql' 'Kubernetes PostgreSQL' -WorkflowName 'k8s-seed' | Out-Null
+    Invoke-EwspUpPhase 5 5 $phases[4] 'Verifying seeded dashboard users' {
+        $context.Verification = Get-EwspKubernetesSeedVerification $context.Emails
+        Assert-EwspKubernetesSeedVerification $context.Verification $context.Emails | Out-Null
+    } $completed @() $context.Environment 'Verify safe user counts and admin contract' 'seeded dashboard users' -WorkflowName 'k8s-seed' | Out-Null
+    Write-Host ''
+    Write-Host 'EWSP Kubernetes local dashboard users are ready.' -ForegroundColor Green
+    Write-Host "Users: total=$($context.Verification.TotalUsers), employees=$($context.Verification.EmployeeUsers), admins=$($context.Verification.AdminEmployees)"
+    foreach ($account in $context.Verification.Accounts) {
+        Write-Host ("  {0,-32} role={1,-10} status={2,-8} verified={3}" -f $account.Email, $account.Role, $account.Status, $account.Verified)
+    }
+    Write-Host "PostgreSQL PVC: $($context.Target.PvcName) Bound (UID $($context.Target.PvcUid))"
 }
 
 function Assert-EwspSafeTemporaryPath {
@@ -2291,10 +2816,10 @@ function Test-EwspKubernetesWebSocketUpgrade {
     $cancellation = New-Object System.Threading.CancellationTokenSource
     $cancellation.CancelAfter([TimeSpan]::FromSeconds(5))
     try {
-        $socket.ConnectAsync([Uri]"ws://localhost:$Port/ws", $cancellation.Token).GetAwaiter().GetResult()
+        $socket.ConnectAsync([Uri]"ws://localhost:$Port/ws", $cancellation.Token).GetAwaiter().GetResult() | Out-Null
         $connected = $socket.State -eq [System.Net.WebSockets.WebSocketState]::Open
         if ($connected) {
-            $socket.CloseOutputAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'EWSP verification', [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+            $socket.CloseOutputAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'EWSP verification', [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
         }
         $connected
     } catch { $false } finally {
@@ -2428,6 +2953,356 @@ function Start-EwspKubernetesPortForward {
     [IO.File]::WriteAllText($paths.PortForwardState, ($state | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
     Write-Host "      started managed dashboard port-forward (PID $($process.Id))"
     Get-EwspManagedKubernetesPortForward $LocalRoot
+}
+
+function Get-EwspManagedQuickTunnel {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [scriptblock]$ProcessProvider
+    )
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    if (-not (Test-Path -LiteralPath $paths.QuickTunnelState -PathType Leaf)) {
+        return [PSCustomObject]@{ Active = $false; Process = $null; State = $null; PublicUrl = $null }
+    }
+    try { $state = Get-Content -Raw -LiteralPath $paths.QuickTunnelState | ConvertFrom-Json } catch {
+        return [PSCustomObject]@{ Active = $false; Process = $null; State = $null; PublicUrl = $null }
+    }
+    if (-not $ProcessProvider) { $ProcessProvider = { param($id) Get-Process -Id $id -ErrorAction SilentlyContinue } }
+    $process = & $ProcessProvider ([int]$state.ProcessId)
+    $active = $false
+    if ($process) {
+        try {
+            $active = $process.ProcessName -eq 'cloudflared' -and
+                [string]$process.StartTime.ToUniversalTime().Ticks -eq [string]$state.StartTimeUtcTicks -and
+                $state.ManagedBy -eq 'ewsp-local-quick-tunnel'
+        } catch { $active = $false }
+    }
+    [PSCustomObject]@{
+        Active = $active; Process = if ($active) { $process } else { $null }; State = $state
+        PublicUrl = if ($active -and $state.PublicUrl) { [string]$state.PublicUrl } else { $null }
+    }
+}
+
+function Write-EwspQuickTunnelState {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)]$State
+    )
+    $path = Assert-EwspSafeTemporaryPath $LocalRoot (Get-EwspKubernetesPaths $LocalRoot).QuickTunnelState
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    [IO.File]::WriteAllText($path, ($State | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+}
+
+function Start-EwspManagedQuickTunnelProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)]$CloudflaredInfo,
+        [Parameter(Mandatory = $true)]$PreviousSettings,
+        [Parameter(Mandatory = $true)][string]$DashboardPodIp,
+        [Parameter(Mandatory = $true)][string]$TrustRegex
+    )
+    $existing = Get-EwspManagedQuickTunnel $LocalRoot
+    if ($existing.Active -and $existing.PublicUrl) { return $existing }
+    if ($existing.Active) {
+        throw (New-EwspQuickTunnelException 'An EWSP-managed cloudflared process is active but has no captured public URL.' 'TUNNEL_URL_NOT_FOUND' 'TUNNEL_START' 'cloudflared' 'Run .\ewsp.ps1 tunnel-stop, then retry.')
+    }
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    New-Item -ItemType Directory -Path $paths.TemporaryRoot -Force | Out-Null
+    foreach ($log in @($paths.QuickTunnelOutput, $paths.QuickTunnelError)) {
+        $safeLog = Assert-EwspSafeTemporaryPath $LocalRoot $log
+        if (Test-Path -LiteralPath $safeLog) { Remove-Item -LiteralPath $safeLog -Force }
+    }
+    $cloudflaredArguments = @('tunnel', '--url', 'http://localhost:3000', '--no-autoupdate')
+    try {
+        if ((Get-EwspHostPlatform).Name -eq 'Windows') {
+            # Windows PowerShell Start-Process can fail before launch when its inherited environment
+            # contains both Path and PATH. Launch the exact executable directly and let cloudflared
+            # write its own info-level logfile; no shell or token-bearing command line is involved.
+            $cloudflaredArguments += @('--loglevel', 'info', '--logfile', $paths.QuickTunnelError)
+            $quotedArguments = @($cloudflaredArguments | ForEach-Object {
+                if ($_ -match '[\s"]') { '"' + ([string]$_).Replace('"', '\"') + '"' } else { [string]$_ }
+            })
+            $startInfo = New-Object Diagnostics.ProcessStartInfo
+            $startInfo.FileName = $CloudflaredInfo.Path
+            $startInfo.Arguments = $quotedArguments -join ' '
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+            $process = New-Object Diagnostics.Process
+            $process.StartInfo = $startInfo
+            if (-not $process.Start()) { throw 'System.Diagnostics.Process.Start returned false.' }
+        } else {
+            $process = Start-Process -FilePath $CloudflaredInfo.Path -ArgumentList $cloudflaredArguments -PassThru `
+                -RedirectStandardOutput $paths.QuickTunnelOutput -RedirectStandardError $paths.QuickTunnelError
+        }
+    } catch {
+        foreach ($log in @($paths.QuickTunnelOutput, $paths.QuickTunnelError)) {
+            if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue }
+        }
+        throw (New-EwspQuickTunnelException "cloudflared could not start: $($_.Exception.Message)" 'TUNNEL_START_FAILED' 'TUNNEL_START' 'cloudflared')
+    }
+    $state = [ordered]@{
+        ManagedBy = 'ewsp-local-quick-tunnel'
+        ProcessId = $process.Id
+        StartTimeUtcTicks = [string]$process.StartTime.ToUniversalTime().Ticks
+        StartedAtUtc = [DateTime]::UtcNow.ToString('o')
+        ExecutablePath = $CloudflaredInfo.Path
+        Version = $CloudflaredInfo.Version
+        PublicUrl = $null
+        DashboardPodIp = $DashboardPodIp
+        TrustRegex = $TrustRegex
+        PreviousSettings = $PreviousSettings
+    }
+    Write-EwspQuickTunnelState $LocalRoot $state
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    $url = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($process.HasExited) { break }
+        $bounded = @()
+        foreach ($log in @($paths.QuickTunnelOutput, $paths.QuickTunnelError)) {
+            if (Test-Path -LiteralPath $log) { $bounded += Get-Content -LiteralPath $log -Tail 60 }
+        }
+        $url = ConvertFrom-EwspQuickTunnelUrl ($bounded -join "`n")
+        if ($url) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $url) {
+        $reason = @()
+        foreach ($log in @($paths.QuickTunnelOutput, $paths.QuickTunnelError)) {
+            if (Test-Path -LiteralPath $log) { $reason += Get-Content -LiteralPath $log -Tail 20 }
+        }
+        $safeReason = Protect-EwspDiagnosticText (($reason | Select-Object -Last 20) -join ' ')
+        if ($safeReason.Length -gt 2000) { $safeReason = $safeReason.Substring(0, 2000) }
+        $category = if ($process.HasExited) { 'TUNNEL_START_FAILED' } else { 'TUNNEL_URL_NOT_FOUND' }
+        throw (New-EwspQuickTunnelException "Quick Tunnel URL was not captured. Bounded logs: $safeReason" $category 'TUNNEL_START' 'cloudflared' 'Run .\ewsp.ps1 tunnel-stop, inspect the bounded .tmp/k8s quick-tunnel logs, and retry.')
+    }
+    $state.PublicUrl = $url
+    Write-EwspQuickTunnelState $LocalRoot $state
+    Get-EwspManagedQuickTunnel $LocalRoot
+}
+
+function Test-EwspPublicEndpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [int]$TimeoutSeconds = 60
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $Uri -TimeoutSec 10
+            if ([int]$response.StatusCode -eq 200) {
+                return [PSCustomObject]@{ Success = $true; StatusCode = 200; Content = [string]$response.Content }
+            }
+        } catch {
+            $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        }
+        # Some non-interactive Windows sessions cannot acquire Schannel credentials. The
+        # existing dashboard Pod still provides a real outbound Cloudflare path without
+        # creating a test workload or bypassing the public hostname.
+        $podProbe = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'deployment/dashboard', '--', 'wget', '-qO-', '-T', '15', $Uri)
+        if ($podProbe.ExitCode -eq 0) {
+            return [PSCustomObject]@{ Success = $true; StatusCode = 200; Content = ($podProbe.Output -join "`n"); ProbeOrigin = 'dashboard Pod' }
+        }
+        Start-Sleep -Seconds 1
+    } while ([DateTime]::UtcNow -lt $deadline)
+    [PSCustomObject]@{ Success = $false; StatusCode = $status; Content = '' }
+}
+
+function Test-EwspPublicWebSocket {
+    param([Parameter(Mandatory = $true)][string]$PublicUrl)
+    $uri = [Uri](($PublicUrl -replace '^https:', 'wss:') + '/ws')
+    $socket = New-Object Net.WebSockets.ClientWebSocket
+    $cancellation = New-Object Threading.CancellationTokenSource
+    $cancellation.CancelAfter([TimeSpan]::FromSeconds(15))
+    try {
+        $socket.ConnectAsync($uri, $cancellation.Token).GetAwaiter().GetResult() | Out-Null
+        $socket.State -eq [Net.WebSockets.WebSocketState]::Open
+    } catch {
+        $key = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('ewspquicktunnel1'))
+        $result = Invoke-EwspKubectl @(
+            'exec', '-n', $script:EwspKubernetesNamespace, 'deployment/dashboard', '--',
+            'curl', '-sS', '-i', '--http1.1', '--max-time', '8', '-w', "`nEWSP_HTTP_CODE=%{http_code}`n",
+            '-H', 'Connection: Upgrade', '-H', 'Upgrade: websocket',
+            '-H', 'Sec-WebSocket-Version: 13', '-H', "Sec-WebSocket-Key: $key", $uri.AbsoluteUri
+        )
+        ($result.Output -join "`n") -match '(?im)(?:^HTTP/\S+\s+101\s|^EWSP_HTTP_CODE=101\s*$)'
+    } finally {
+        $socket.Dispose(); $cancellation.Dispose()
+    }
+}
+
+function Test-EwspPublicRequestSizePath {
+    param([Parameter(Mandatory = $true)][string]$PublicUrl)
+    $body = New-Object byte[] (1152 * 1024)
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri "$PublicUrl/api/health" -Method Post `
+            -Body $body -ContentType 'application/octet-stream' -TimeoutSec 30
+        $status = [int]$response.StatusCode
+    } catch {
+        $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+    }
+    if ($status -eq 0) {
+        if ($PublicUrl -notmatch '^https://[a-z0-9-]+\.trycloudflare\.com$') { return [PSCustomObject]@{ Success = $false; StatusCode = 0 } }
+        $command = "head -c 1179648 /dev/zero | curl -sS --http1.1 --max-time 30 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/octet-stream' --data-binary @- '$PublicUrl/api/health'"
+        $podResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'deployment/dashboard', '--', 'sh', '-c', $command)
+        $code = [regex]::Match(($podResult.Output -join ''), '(?<code>\d{3})\s*$')
+        if ($code.Success) { $status = [int]$code.Groups['code'].Value }
+    }
+    [PSCustomObject]@{ Success = $status -gt 0 -and $status -ne 413; StatusCode = $status }
+}
+
+function Assert-EwspQuickTunnelPublicSmoke {
+    param([Parameter(Mandatory = $true)][string]$PublicUrl)
+    $root = Test-EwspPublicEndpoint "$PublicUrl/"
+    $route = Test-EwspPublicEndpoint "$PublicUrl/complaints"
+    $health = Test-EwspPublicEndpoint "$PublicUrl/api/health"
+    if (-not $root.Success -or -not $route.Success -or $root.Content -cne $route.Content -or
+        -not $health.Success -or $health.Content -notmatch 'UP') {
+        throw (New-EwspQuickTunnelException "Public HTTP verification failed: root=$($root.StatusCode), complaints=$($route.StatusCode), health=$($health.StatusCode)." 'PUBLIC_HTTP_FAILED' 'PUBLIC_VERIFICATION' 'Quick Tunnel')
+    }
+    if (-not (Test-EwspPublicWebSocket $PublicUrl)) {
+        throw (New-EwspQuickTunnelException 'Public WebSocket upgrade failed.' 'PUBLIC_WEBSOCKET_FAILED' 'PUBLIC_VERIFICATION' 'Quick Tunnel')
+    }
+    $large = Test-EwspPublicRequestSizePath $PublicUrl
+    if (-not $large.Success) {
+        throw (New-EwspQuickTunnelException "The >1 MiB request path failed or returned HTTP $($large.StatusCode)." 'PUBLIC_HTTP_FAILED' 'REQUEST_SIZE_VERIFICATION' 'dashboard nginx')
+    }
+    [PSCustomObject]@{ Root = $root.StatusCode; Complaints = $route.StatusCode; Health = $health.StatusCode; WebSocket = $true; LargeRequestStatus = $large.StatusCode }
+}
+
+function Assert-EwspQuickTunnelKubernetesPreflight {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $environment = Get-EwspKubernetesEnvironment
+    try { Assert-EwspKubernetesEnvironment $environment | Out-Null } catch {
+        throw (New-EwspQuickTunnelException $_.Exception.Message 'K8S_NOT_READY' 'KUBERNETES_PREFLIGHT' 'Kubernetes' 'Run .\ewsp.ps1 k8s-status and restore the verified Docker Desktop Kubernetes baseline.')
+    }
+    if (-not $environment.Kubernetes.NamespaceExists) {
+        throw (New-EwspQuickTunnelException "Namespace '$script:EwspKubernetesNamespace' is missing." 'K8S_NOT_READY' 'KUBERNETES_PREFLIGHT' 'Kubernetes namespace')
+    }
+    $snapshots = @(Get-EwspKubernetesWorkloadSnapshot)
+    foreach ($name in @('backend', 'dashboard')) {
+        $item = @($snapshots | Where-Object Name -eq $name)
+        if ($item.Count -ne 1 -or -not $item[0].Ready) {
+            throw (New-EwspQuickTunnelException "$name Deployment is not Ready 1/1." 'K8S_NOT_READY' 'KUBERNETES_PREFLIGHT' $name 'Run .\ewsp.ps1 k8s-status and restore backend/dashboard readiness.')
+        }
+    }
+    try { $forward = Start-EwspKubernetesPortForward $LocalRoot 3000 } catch {
+        throw (New-EwspQuickTunnelException $_.Exception.Message 'DASHBOARD_FORWARD_UNAVAILABLE' 'KUBERNETES_PREFLIGHT' 'dashboard port-forward' 'Free localhost:3000 if externally owned, or rerun .\ewsp.ps1 k8s-up.')
+    }
+    if (-not $forward.Active -or -not $forward.Healthy) {
+        throw (New-EwspQuickTunnelException 'The EWSP-managed dashboard port-forward is not healthy on localhost:3000.' 'DASHBOARD_FORWARD_UNAVAILABLE' 'KUBERNETES_PREFLIGHT' 'dashboard port-forward')
+    }
+    [PSCustomObject]@{ Environment = $environment; Snapshots = $snapshots; PortForward = $forward }
+}
+
+function Invoke-EwspQuickTunnelStop {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [switch]$Quiet
+    )
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $managed = Get-EwspManagedQuickTunnel $LocalRoot
+    $state = $managed.State
+    if ($managed.Active) {
+        Stop-Process -Id $managed.Process.Id -ErrorAction Stop
+        $managed.Process.WaitForExit(5000) | Out-Null
+        if (-not $Quiet) { Write-Host "Stopped EWSP-managed Quick Tunnel (PID $($managed.Process.Id))." }
+    } elseif (-not $Quiet) { Write-Host 'No active EWSP-managed Quick Tunnel process.' }
+    if ($state -and $state.PreviousSettings) {
+        Restore-EwspBackendEnvironmentOverrides $state.PreviousSettings
+        Wait-EwspBackendReady | Out-Null
+    }
+    foreach ($path in @($paths.QuickTunnelState, $paths.QuickTunnelOutput, $paths.QuickTunnelError)) {
+        $safe = Assert-EwspSafeTemporaryPath $LocalRoot $path
+        if (Test-Path -LiteralPath $safe) { Remove-Item -LiteralPath $safe -Force }
+    }
+    if (-not $Quiet) { Write-Host 'Quick Tunnel state removed; backend configuration restored; Kubernetes workloads and dashboard forward remain running.' -ForegroundColor Green }
+}
+
+function Invoke-EwspQuickTunnelStart {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $cloudflared = Assert-EwspCloudflaredAvailable (Get-EwspCloudflaredInfo)
+    $existing = Get-EwspManagedQuickTunnel $LocalRoot
+    $preflight = Assert-EwspQuickTunnelKubernetesPreflight $LocalRoot
+    $pod = Get-EwspReadyDashboardPod
+    $trustRegex = New-EwspQuickTunnelTrustRegex $pod.Ip
+    $runtime = Get-EwspBackendProxyRuntime
+    if ($existing.Active -and $existing.PublicUrl) {
+        $expectedOrigins = "http://localhost:3000,$($existing.PublicUrl)"
+        $publicProbe = Test-EwspPublicEndpoint "$($existing.PublicUrl)/" 10
+        $safeReuse = $existing.State.DashboardPodIp -eq $pod.Ip -and
+            $existing.State.TrustRegex -eq $trustRegex -and
+            $runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value -eq 'NATIVE' -and
+            $runtime.Settings.SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES.Value -eq $trustRegex -and
+            $runtime.Settings.EWSP_CORS_ALLOWED_ORIGINS.Value -eq $expectedOrigins -and $publicProbe.Success
+        if (-not $safeReuse) {
+            throw (New-EwspQuickTunnelException 'An EWSP-managed Quick Tunnel is alive, but its Pod boundary, backend runtime configuration, or public endpoint is stale.' 'TUNNEL_START_FAILED' 'DUPLICATE_CHECK' 'Quick Tunnel' 'Run .\ewsp.ps1 tunnel-stop, then start a new Quick Tunnel for the current dashboard Pod.')
+        }
+        Write-Host "Reused healthy EWSP Quick Tunnel: $($existing.PublicUrl)" -ForegroundColor Green
+        return
+    }
+    $previous = [ordered]@{}
+    foreach ($name in $runtime.Settings.Keys) { $previous[$name] = $runtime.Settings[$name] }
+    $stateCreated = $false
+    try {
+        Set-EwspBackendEnvironmentOverrides @{
+            SERVER_FORWARD_HEADERS_STRATEGY = 'NATIVE'
+            SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES = $trustRegex
+        }
+        Wait-EwspBackendReady | Out-Null
+        $managed = Start-EwspManagedQuickTunnelProcess $LocalRoot $cloudflared $previous $pod.Ip $trustRegex
+        $stateCreated = $true
+        $publicUrl = $managed.PublicUrl
+        Set-EwspBackendEnvironmentOverrides @{
+            SERVER_FORWARD_HEADERS_STRATEGY = 'NATIVE'
+            SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES = $trustRegex
+            EWSP_CORS_ALLOWED_ORIGINS = "http://localhost:3000,$publicUrl"
+        }
+        Wait-EwspBackendReady | Out-Null
+        $smoke = Assert-EwspQuickTunnelPublicSmoke $publicUrl
+        Write-Host ''
+        Write-Host 'EWSP temporary Quick Tunnel is ready.' -ForegroundColor Green
+        Write-Host "cloudflared: $($cloudflared.Version) [$($cloudflared.Path)]"
+        Write-Host "Public URL:  $publicUrl"
+        Write-Host "Dashboard Pod: $($pod.Name) ($($pod.Ip))"
+        Write-Host "Trusted proxy regex: $trustRegex"
+        Write-Host "Public checks: /=HTTP $($smoke.Root), /complaints=HTTP $($smoke.Complaints), /api/health=HTTP $($smoke.Health), /ws=upgraded, >1 MiB=HTTP $($smoke.LargeRequestStatus) (not 413)"
+        Write-Warning 'Exact backend getRemoteAddr/scheme/isSecure and forged-XFF normalization cannot be observed with the current application/logging without adding temporary application instrumentation. No public diagnostic endpoint was added.'
+        Write-Host 'Stop with: .\ewsp.ps1 tunnel-stop'
+    } catch {
+        if ($stateCreated -or (Get-EwspManagedQuickTunnel $LocalRoot).State) {
+            try { Invoke-EwspQuickTunnelStop $LocalRoot -Quiet } catch { Write-Warning "Quick Tunnel rollback needs attention: $($_.Exception.Message)" }
+        } else {
+            try { Restore-EwspBackendEnvironmentOverrides ([PSCustomObject]$previous); Wait-EwspBackendReady | Out-Null } catch { Write-Warning "Backend rollback needs attention: $($_.Exception.Message)" }
+        }
+        throw
+    }
+}
+
+function Invoke-EwspQuickTunnelStatus {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $cloudflared = Get-EwspCloudflaredInfo
+    $managed = Get-EwspManagedQuickTunnel $LocalRoot
+    $forward = Get-EwspManagedKubernetesPortForward $LocalRoot
+    $snapshots = @()
+    $runtime = $null
+    try { $snapshots = @(Get-EwspKubernetesWorkloadSnapshot); $runtime = Get-EwspBackendProxyRuntime } catch { }
+    Write-Host 'EWSP Quick Tunnel status'
+    Write-Host "cloudflared: $(if ($cloudflared.Available) { "$($cloudflared.Version) [$($cloudflared.Path)]" } else { 'unavailable' })"
+    Write-Host "Quick Tunnel: $(if ($managed.Active) { 'active' } else { 'inactive' })"
+    Write-Host "Public URL: $(if ($managed.PublicUrl) { $managed.PublicUrl } else { '<none>' })"
+    Write-Host "Dashboard forward: $(if ($forward.Active -and $forward.Healthy) { 'active http://localhost:3000' } elseif ($forward.Active) { 'active but unhealthy' } else { 'inactive' })"
+    if ($runtime) {
+        Write-Host "Forwarded headers: $(if ($runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value) { $runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value } else { 'NONE (application default)' })"
+        Write-Host "Trusted proxy boundary: $(if ($runtime.Settings.SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES.Value) { $runtime.Settings.SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES.Value } else { '<none>' })"
+    } else {
+        Write-Host 'Forwarded headers: unavailable'
+        Write-Host 'Trusted proxy boundary: unavailable'
+    }
+    foreach ($name in @('dashboard', 'backend')) {
+        $item = @($snapshots | Where-Object Name -eq $name)
+        Write-Host "$name Ready: $(if ($item.Count -eq 1 -and $item[0].Ready) { '1/1' } else { 'no' })"
+    }
 }
 
 function Assert-EwspKubernetesDashboardAccess {
@@ -2701,6 +3576,10 @@ Usage:
   .\ewsp.ps1 status  Show concise Git and Docker state.
   .\ewsp.ps1 k8s-status  Show Kubernetes workloads, storage, services, images, and dashboard access.
   .\ewsp.ps1 k8s-stop    Stop Kubernetes workloads and managed access while preserving PVC data.
+  .\ewsp.ps1 k8s-seed    Explicitly seed local dashboard users into Docker Desktop Kubernetes PostgreSQL.
+  .\ewsp.ps1 tunnel-quick  Start/reuse a temporary Cloudflare Quick Tunnel proof.
+  .\ewsp.ps1 tunnel-status Show Quick Tunnel, proxy boundary, readiness, and managed access state.
+  .\ewsp.ps1 tunnel-stop   Stop only the managed Quick Tunnel and restore backend configuration.
   .\ewsp.ps1 help    Show this help.
 '@
 }
@@ -2721,6 +3600,10 @@ function Invoke-EwspCommand {
         'status' { Invoke-EwspStatus $LocalRoot }
         'k8s-status' { Invoke-EwspKubernetesStatus $LocalRoot }
         'k8s-stop' { Invoke-EwspKubernetesStop $LocalRoot }
+        'k8s-seed' { Invoke-EwspKubernetesSeed $LocalRoot }
+        'tunnel-quick' { Invoke-EwspQuickTunnelStart $LocalRoot }
+        'tunnel-status' { Invoke-EwspQuickTunnelStatus $LocalRoot }
+        'tunnel-stop' { Invoke-EwspQuickTunnelStop $LocalRoot }
         'help'   { Show-EwspHelp }
         default  { throw "Unknown command '$Command'. Run .\ewsp.ps1 help for usage." }
     }
@@ -2764,5 +3647,27 @@ Export-ModuleMember -Function @(
     'Wait-EwspKubernetesPodsStopped',
     'Invoke-EwspKubernetesUp',
     'Invoke-EwspKubernetesStatus',
-    'Invoke-EwspKubernetesStop'
+    'Invoke-EwspKubernetesStop',
+    'Assert-EwspKubernetesSeedContext',
+    'Resolve-EwspKubernetesSeedFile',
+    'Get-EwspKubernetesPostgresSeedTarget',
+    'Invoke-EwspKubernetesSeedSql',
+    'Get-EwspKubernetesSeedVerification',
+    'Assert-EwspKubernetesSeedVerification',
+    'Invoke-EwspKubernetesSeed',
+    'Get-EwspCloudflaredInfo',
+    'Assert-EwspCloudflaredAvailable',
+    'ConvertTo-EwspLiteralIpv4Regex',
+    'New-EwspQuickTunnelTrustRegex',
+    'Get-EwspReadyDashboardPod',
+    'ConvertFrom-EwspQuickTunnelUrl',
+    'Get-EwspManagedQuickTunnel',
+    'Get-EwspBackendProxyRuntime',
+    'Get-EwspBackendServiceReadinessState',
+    'Wait-EwspBackendServiceReadiness',
+    'Wait-EwspBackendHealth',
+    'Restore-EwspBackendEnvironmentOverrides',
+    'Invoke-EwspQuickTunnelStart',
+    'Invoke-EwspQuickTunnelStatus',
+    'Invoke-EwspQuickTunnelStop'
 )

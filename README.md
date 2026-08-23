@@ -153,9 +153,41 @@ The baseline contains:
 
 All five Services are internal `ClusterIP` Services. Only the managed dashboard port-forward occupies a Windows port; backend, PostgreSQL, Redis, and MinIO are not exposed by the Kubernetes workflow.
 
+### Explicit local Kubernetes user seed
+
+Kubernetes PostgreSQL starts with its own PVC. Flyway applies the database schema and required lookup rows automatically, but no demo or local dashboard users are created automatically. Local user seeding is always an explicit operation:
+
+```powershell
+.\ewsp.ps1 k8s-seed
+```
+
+`k8s-seed` is local-development/demo tooling restricted permanently to the exact `docker-desktop` context and `ewsp` namespace. It requires the existing sibling `ewsp-backend/local-dev/seed-dashboard-users.sql` file to be present, untracked, and ignored through the backend repository's local Git exclusions. The command streams that file directly to `psql` in the Ready `postgres-0` Pod with SQL error stopping enabled; it does not copy SQL into a Pod, ConfigMap, Secret, image, or tracked manifest. Output contains only safe user counts and identity/role/status/verification fields.
+
+The existing seed is idempotent, so rerunning the command reconciles the same local identities without duplicates. It is not invoked by `k8s-up` or `tunnel-quick`, has no context override, and must never be converted into a production Flyway migration. Production deployments must provision real employee accounts through an explicitly controlled operational process and must not receive local/demo users or credentials.
+
 `k8s-status` reports the guarded environment, controllers, Pods, readiness, restarts, images, expected Services, PVCs, and dashboard access without exposing secrets. `k8s-stop` stops only the managed dashboard port-forward and scales EWSP Deployments and StatefulSets to zero. It preserves the namespace, Services, ConfigMaps, Secret, PVCs, PVs, Docker images, and all Compose resources; the next `k8s-up` restores every workload to one replica.
 
 The guaranteed target is the PC-dependent, single-node Docker Desktop kind cluster (verified with Kubernetes v1.36.1). Do not run Compose and Kubernetes simultaneously when both would need dashboard host port 3000; neither workflow automatically stops the other.
+
+### Temporary Cloudflare Quick Tunnel proof
+
+The Quick Tunnel workflow is an explicit, temporary external proof only. It starts the locally installed `cloudflared` against the existing EWSP-managed `localhost:3000` dashboard port-forward and receives a random `https://<random>.trycloudflare.com` hostname. It needs neither a Cloudflare account nor a domain, and it is not the permanent deployment design. The workflow does not install `cloudflared`, create Kubernetes tunnel resources, or store Cloudflare credentials or tokens.
+
+```powershell
+.\ewsp.ps1 tunnel-quick
+.\ewsp.ps1 tunnel-status
+.\ewsp.ps1 tunnel-stop
+```
+
+`tunnel-quick` requires the verified `docker-desktop` context, namespace `ewsp`, one Ready backend replica, exactly one Ready dashboard Pod, and the managed dashboard forward on `localhost:3000` (which it safely starts or reuses). It derives a literal trusted-proxy regex from the current dashboard Pod IPv4 address, temporarily sets backend forwarded-header handling to `NATIVE`, and allows only `http://localhost:3000` plus the exact generated Quick Tunnel origin. The random hostname and pre-run backend settings are recorded only under ignored `.tmp/` runtime state; no Pod IP or public hostname is written to tracked manifests.
+
+Startup verifies public `/`, `/complaints`, `/api/health`, WebSocket `/ws`, and a safe unauthenticated request larger than 1 MiB that must not receive the former Nginx `413` response. `tunnel-status` reports the installed `cloudflared` version/path, managed process and URL, dashboard forward, backend proxy mode/boundary, and backend/dashboard readiness without printing secrets.
+
+The current production application exposes no safe request diagnostic for backend `getRemoteAddr`, resolved scheme, or `isSecure`, and its ordinary logs do not contain those fields. The workflow therefore reports that empirical limitation instead of adding a public diagnostic endpoint or claiming forged `X-Forwarded-For` normalization was observed. Dashboard access logs can establish the local cloudflared-to-Nginx TCP peer (`127.0.0.1`); exact Cloudflare header and visitor IPv4/IPv6 observations require bounded test instrumentation in the application repository and are deliberately not implemented here.
+
+`tunnel-stop` validates the recorded process identity before stopping it, so unrelated `cloudflared` processes are never killed. It restores the exact pre-run backend environment overrides (therefore returning to the normal ConfigMap/application defaults such as forwarded-header strategy `NONE` and local CORS origin), waits for backend readiness, removes Quick Tunnel runtime files, and leaves all Kubernetes workloads, PVCs, Services, and the dashboard port-forward running.
+
+If `cloudflared` is unavailable, install it explicitly (on Windows, `winget install --id Cloudflare.cloudflared`), open a new PowerShell, and verify `cloudflared --version`; the orchestration never installs it silently. Quick Tunnel process logs are bounded in diagnostics and remain under ignored `.tmp/k8s/` only while needed for the managed lifecycle.
 
 Kubernetes PostgreSQL and MinIO PVCs are separate from the Docker Compose named volumes and do not migrate or reuse their data. Deleting the Kubernetes PVCs or resetting the cluster can destroy Kubernetes data; neither action affects the preserved Compose volumes unless those volumes are separately removed.
 

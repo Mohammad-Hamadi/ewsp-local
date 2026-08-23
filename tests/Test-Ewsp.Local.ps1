@@ -35,6 +35,14 @@ function Assert-ThrowsContains {
     Assert-Contains $actual $Expected $Message
 }
 
+function Assert-ThrowsCategory {
+    param([scriptblock]$Action, [string]$Expected, [string]$Message)
+    $actual = $null
+    try { & $Action } catch { if ($_.Exception.Data.Contains('Category')) { $actual = [string]$_.Exception.Data['Category'] } }
+    if (-not $actual) { throw "$Message Expected exception category '$Expected', but none was returned." }
+    Assert-Equal $actual $Expected $Message
+}
+
 function New-FakeNativeResult {
     param([int]$ExitCode, [string[]]$Output = @())
     [PSCustomObject]@{ ExitCode = $ExitCode; Output = @($Output) }
@@ -723,6 +731,174 @@ try {
     Assert-Equal (Resolve-EwspKubernetesPortForwardAction $false $false $false) 'START' 'free dashboard port starts managed forward'
     Assert-Equal (Resolve-EwspKubernetesPortForwardAction $true $false $true) 'START' 'unhealthy managed forward is safely replaced'
 
+    $missingCloudflared = Get-EwspCloudflaredInfo -CommandResolver { param($name) $null }
+    Assert-Equal $missingCloudflared.Available $false 'Quick Tunnel detects unavailable cloudflared'
+    Assert-ThrowsContains { Assert-EwspCloudflaredAvailable $missingCloudflared | Out-Null } 'CLOUDFLARED_MISSING' 'missing cloudflared uses precise diagnostic category'
+    $cloudflaredRunner = { param($filePath, $arguments) New-FakeNativeResult 0 @('cloudflared version 2026.8.0') }
+    $cloudflaredInfo = Get-EwspCloudflaredInfo -CommandResolver { param($name) [PSCustomObject]@{ Source = 'C:\tools\cloudflared.exe' } } -CommandRunner $cloudflaredRunner
+    Assert-Equal $cloudflaredInfo.Available $true 'Quick Tunnel accepts runnable cloudflared'
+    Assert-Contains $cloudflaredInfo.Version '2026.8.0' 'Quick Tunnel reports cloudflared version'
+
+    Assert-Equal (ConvertTo-EwspLiteralIpv4Regex '10.244.0.24') '10\.244\.0\.24' 'dashboard Pod IPv4 is escaped as a literal regex'
+    Assert-Equal (New-EwspQuickTunnelTrustRegex '10.244.0.24') '^(?:10\.244\.0\.24|127\.0\.0\.1)$' 'temporary trust boundary contains only dashboard Pod and loopback'
+    Assert-ThrowsContains { ConvertTo-EwspLiteralIpv4Regex '10.244.0.0/24' | Out-Null } 'DASHBOARD_POD_RESOLUTION_FAILED' 'non-IPv4 dashboard Pod value is rejected'
+
+    $readyDashboardPod = @{
+        metadata = @{ name = 'dashboard-test' }
+        status = @{
+            phase = 'Running'; podIP = '10.244.0.77'
+            conditions = @(@{ type = 'Ready'; status = 'True' })
+            containerStatuses = @(@{ ready = $true })
+        }
+    }
+    $podRunner = {
+        param($filePath, $arguments)
+        [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($readyDashboardPod) } | ConvertTo-Json -Depth 8 -Compress)) }
+    }.GetNewClosure()
+    $resolvedPod = Get-EwspReadyDashboardPod $podRunner
+    Assert-Equal $resolvedPod.Ip '10.244.0.77' 'current Ready dashboard Pod IP is derived by stable labels'
+    $twoPodRunner = {
+        param($filePath, $arguments)
+        [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($readyDashboardPod, $readyDashboardPod) } | ConvertTo-Json -Depth 8 -Compress)) }
+    }.GetNewClosure()
+    Assert-ThrowsContains { Get-EwspReadyDashboardPod $twoPodRunner | Out-Null } 'found 2' 'Quick Tunnel requires exactly one Ready dashboard Pod'
+
+    Assert-Equal (ConvertFrom-EwspQuickTunnelUrl 'INF Requesting new quick Tunnel on https://Calm-Fog-123.trycloudflare.com') 'https://calm-fog-123.trycloudflare.com' 'Quick Tunnel URL is parsed robustly from log text'
+    Assert-Equal (ConvertFrom-EwspQuickTunnelUrl 'https://*.trycloudflare.com') $null 'wildcard trycloudflare origin is never accepted as a generated URL'
+
+    $managedRoot = Join-Path $testRoot 'managed-tunnel'
+    New-Item -ItemType Directory -Path (Join-Path $managedRoot '.tmp\k8s') -Force | Out-Null
+    $managedStatePath = Join-Path $managedRoot '.tmp\k8s\quick-tunnel.json'
+    @{ ProcessId = 42; StartTimeUtcTicks = '123'; ManagedBy = 'ewsp-local-quick-tunnel'; PublicUrl = 'https://safe.trycloudflare.com' } |
+        ConvertTo-Json | Set-Content -LiteralPath $managedStatePath
+    $externalProcess = [PSCustomObject]@{ Id = 42; ProcessName = 'cloudflared'; StartTime = [DateTime]::new(2020, 1, 1, 0, 0, 0, [DateTimeKind]::Utc) }
+    $externalProvider = { param($id) $externalProcess }.GetNewClosure()
+    $managedResult = Get-EwspManagedQuickTunnel $managedRoot -ProcessProvider $externalProvider
+    Assert-Equal $managedResult.Active $false 'stale state cannot claim an external cloudflared process'
+    $ownedTicks = [string]$externalProcess.StartTime.ToUniversalTime().Ticks
+    @{ ProcessId = 42; StartTimeUtcTicks = $ownedTicks; ManagedBy = 'ewsp-local-quick-tunnel'; PublicUrl = 'https://safe.trycloudflare.com' } |
+        ConvertTo-Json | Set-Content -LiteralPath $managedStatePath
+    $ownedResult = Get-EwspManagedQuickTunnel $managedRoot -ProcessProvider $externalProvider
+    Assert-Equal $ownedResult.Active $true 'duplicate EWSP-managed tunnel is recognized by PID and start time'
+    Assert-Equal $ownedResult.PublicUrl 'https://safe.trycloudflare.com' 'duplicate EWSP-managed tunnel reuses its captured exact URL'
+
+    $restoreCalls = New-Object System.Collections.Generic.List[string]
+    $restoreRunner = {
+        param($filePath, $arguments)
+        $restoreCalls.Add((@($arguments) -join ' ')) | Out-Null
+        [PSCustomObject]@{ ExitCode = 0; Output = @('deployment.apps/backend env updated') }
+    }.GetNewClosure()
+    $previousSettings = [PSCustomObject]@{
+        SERVER_FORWARD_HEADERS_STRATEGY = [PSCustomObject]@{ Present = $false; Value = 'NONE' }
+        SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES = [PSCustomObject]@{ Present = $false; Value = $null }
+        EWSP_CORS_ALLOWED_ORIGINS = [PSCustomObject]@{ Present = $true; Value = 'http://localhost:3000' }
+    }
+    Restore-EwspBackendEnvironmentOverrides $previousSettings $restoreRunner
+    Assert-Contains $restoreCalls[0] 'SERVER_FORWARD_HEADERS_STRATEGY-' 'tunnel stop restoration removes temporary forwarded-header override'
+    Assert-Contains $restoreCalls[0] 'EWSP_CORS_ALLOWED_ORIGINS=http://localhost:3000' 'tunnel stop restoration restores pre-run origin exactly'
+
+    $backendReadinessStates = @(
+        [PSCustomObject]@{ DeploymentReady = $false; PodReady = $false; EndpointReady = $false; Detail = 'zero Ready Pods under Recreate' },
+        [PSCustomObject]@{ DeploymentReady = $false; PodReady = $false; EndpointReady = $false; Detail = 'Pod Running but not Ready' },
+        [PSCustomObject]@{ DeploymentReady = $true; PodReady = $true; EndpointReady = $false; Detail = 'EndpointSlice not propagated' },
+        [PSCustomObject]@{ DeploymentReady = $true; PodReady = $true; EndpointReady = $true; Detail = 'ready' }
+    )
+    $readinessQueue = New-Object Collections.Queue
+    foreach ($state in $backendReadinessStates) { $readinessQueue.Enqueue($state) }
+    $readinessCounter = @{ Value = 0 }
+    $readinessProvider = {
+        $readinessCounter.Value++
+        if ($readinessQueue.Count -gt 1) { $readinessQueue.Dequeue() } else { $readinessQueue.Peek() }
+    }.GetNewClosure()
+    $readyState = Wait-EwspBackendServiceReadiness -TimeoutSeconds 2 -StateProvider $readinessProvider -SleepAction { }
+    Assert-Equal $readyState.EndpointReady $true 'backend readiness tolerates Recreate zero-Pod and Running-not-Ready transitions'
+    Assert-Equal $readinessCounter.Value 4 'backend readiness waits for EndpointSlice propagation after Deployment readiness'
+
+    $healthAttempts = @{ Direct = 0; Dashboard = 0 }
+    $directProbe = {
+        $healthAttempts.Direct++
+        [PSCustomObject]@{ Success = $healthAttempts.Direct -ge 2; StatusCode = if ($healthAttempts.Direct -ge 2) { 200 } else { 0 }; Content = if ($healthAttempts.Direct -ge 2) { '{"status":"UP"}' } else { '' } }
+    }.GetNewClosure()
+    $dashboardProbe = {
+        $healthAttempts.Dashboard++
+        [PSCustomObject]@{ Success = $healthAttempts.Dashboard -ge 3; StatusCode = if ($healthAttempts.Dashboard -ge 3) { 200 } else { 502 }; Content = if ($healthAttempts.Dashboard -ge 3) { '{"status":"UP"}' } else { '' } }
+    }.GetNewClosure()
+    $healthyResult = Wait-EwspBackendHealth -TimeoutSeconds 2 -DirectProbe $directProbe -DashboardProbe $dashboardProbe -SleepAction { }
+    Assert-Equal $healthyResult.Dashboard.StatusCode 200 'backend health retries transient direct and dashboard failures until success'
+    Assert-Equal $healthAttempts.Dashboard 3 'backend health does not classify the first transient proxy failure as invalid configuration'
+
+    $neverReady = { [PSCustomObject]@{ DeploymentReady = $true; PodReady = $true; EndpointReady = $false; Detail = 'endpoint pending' } }
+    Assert-ThrowsContains { Wait-EwspBackendServiceReadiness -TimeoutSeconds 0 -StateProvider $neverReady -SleepAction { } | Out-Null } 'BACKEND_ENDPOINT_READINESS' 'genuine EndpointSlice timeout has a precise readiness phase'
+    $failedHealth = { [PSCustomObject]@{ Success = $false; StatusCode = 502; Content = '' } }
+    Assert-ThrowsContains { Wait-EwspBackendHealth -TimeoutSeconds 0 -DirectProbe $failedHealth -DashboardProbe $failedHealth -SleepAction { } | Out-Null } 'BACKEND_HEALTH' 'genuine backend health timeout has a precise health phase'
+    $restoreCountBeforeTimeout = $restoreCalls.Count
+    try { Wait-EwspBackendHealth -TimeoutSeconds 0 -DirectProbe $failedHealth -DashboardProbe $failedHealth -SleepAction { } | Out-Null } catch {
+        Restore-EwspBackendEnvironmentOverrides $previousSettings $restoreRunner
+    }
+    Assert-Equal $restoreCalls.Count ($restoreCountBeforeTimeout + 1) 'genuine backend health timeout executes rollback restoration'
+
+    Assert-Equal (Assert-EwspKubernetesSeedContext 'docker-desktop') $true 'Kubernetes local seed allows only the exact Docker Desktop context'
+    Assert-ThrowsCategory { Assert-EwspKubernetesSeedContext 'production-cluster' | Out-Null } 'UNSAFE_KUBERNETES_CONTEXT' 'Kubernetes local seed rejects non-docker-desktop context'
+
+    $seedTestBackend = Join-Path $testRoot 'seed-backend'
+    New-Item -ItemType Directory -Path (Join-Path $seedTestBackend 'local-dev') -Force | Out-Null
+    Assert-ThrowsCategory { Resolve-EwspKubernetesSeedFile $localRoot -BackendRepositoryPath $seedTestBackend -GitRunner { } | Out-Null } 'SEED_FILE_MISSING' 'Kubernetes local seed rejects a missing seed file'
+    $seedTestPath = Join-Path $seedTestBackend 'local-dev\seed-dashboard-users.sql'
+    Set-Content -LiteralPath $seedTestPath -Value "-- local test only`nselect 1;"
+    $trackedSeedGit = {
+        param($repositoryPath, $arguments)
+        if ($arguments[0] -eq 'ls-files') { [PSCustomObject]@{ ExitCode = 0; Output = @('local-dev/seed-dashboard-users.sql') } }
+        else { [PSCustomObject]@{ ExitCode = 0; Output = @() } }
+    }
+    Assert-ThrowsCategory { Resolve-EwspKubernetesSeedFile $localRoot -BackendRepositoryPath $seedTestBackend -GitRunner $trackedSeedGit | Out-Null } 'SEED_FILE_TRACKED' 'Kubernetes local seed rejects a tracked seed file'
+    $ignoredSeedGit = {
+        param($repositoryPath, $arguments)
+        if ($arguments[0] -eq 'ls-files') { [PSCustomObject]@{ ExitCode = 1; Output = @() } }
+        else { [PSCustomObject]@{ ExitCode = 0; Output = @() } }
+    }
+    $safeSeed = Resolve-EwspKubernetesSeedFile $localRoot -BackendRepositoryPath $seedTestBackend -GitRunner $ignoredSeedGit
+    Assert-Equal $safeSeed.Path $seedTestPath 'Kubernetes local seed accepts the exact untracked ignored seed path'
+
+    $seedStatefulSet = @{ spec = @{ replicas = 1 }; status = @{ readyReplicas = 1 } }
+    $seedPod = @{ status = @{ phase = 'Running'; conditions = @(@{ type = 'Ready'; status = 'True' }); containerStatuses = @(@{ ready = $true }) } }
+    $seedPvc = @{ metadata = @{ name = 'postgres-data-postgres-0'; uid = 'test-pvc-uid' }; status = @{ phase = 'Bound' } }
+    $postgresReadyRunner = {
+        param($filePath, $arguments)
+        $resource = $arguments[1]
+        $object = if ($resource -eq 'statefulset') { $seedStatefulSet } elseif ($resource -eq 'pod') { $seedPod } else { $seedPvc }
+        [PSCustomObject]@{ ExitCode = 0; Output = @(($object | ConvertTo-Json -Depth 8 -Compress)) }
+    }.GetNewClosure()
+    $postgresTarget = Get-EwspKubernetesPostgresSeedTarget $postgresReadyRunner
+    Assert-Equal $postgresTarget.PvcUid 'test-pvc-uid' 'Kubernetes local seed accepts Ready PostgreSQL and Bound PVC'
+    $postgresMissingRunner = { param($filePath, $arguments) [PSCustomObject]@{ ExitCode = 1; Output = @('not found') } }
+    Assert-ThrowsCategory { Get-EwspKubernetesPostgresSeedTarget $postgresMissingRunner | Out-Null } 'POSTGRES_NOT_READY' 'Kubernetes local seed rejects unavailable PostgreSQL'
+
+    $seedExecutions = @{ Count = 0; Users = New-Object Collections.Generic.HashSet[string] }
+    $idempotentSeedExecutor = {
+        param($path)
+        $seedExecutions.Count++
+        foreach ($email in @('admin@ewsp.local', 'viewer@ewsp.local')) { $seedExecutions.Users.Add($email) | Out-Null }
+        [PSCustomObject]@{ ExitCode = 0; Output = @() }
+    }.GetNewClosure()
+    Assert-Equal (Invoke-EwspKubernetesSeedSql $seedTestPath $idempotentSeedExecutor) $true 'Kubernetes local seed executes successfully'
+    $usersAfterFirstSeed = $seedExecutions.Users.Count
+    Invoke-EwspKubernetesSeedSql $seedTestPath $idempotentSeedExecutor | Out-Null
+    Assert-Equal $seedExecutions.Users.Count $usersAfterFirstSeed 'second Kubernetes local seed run remains idempotent'
+    Assert-Equal $seedExecutions.Count 2 'Kubernetes local seed explicitly executes on each command invocation'
+    $failedSeedExecutor = { param($path) [PSCustomObject]@{ ExitCode = 3; Output = @('sensitive SQL withheld') } }
+    Assert-ThrowsCategory { Invoke-EwspKubernetesSeedSql $seedTestPath $failedSeedExecutor | Out-Null } 'SEED_EXECUTION_FAILED' 'Kubernetes local seed classifies SQL execution failure'
+
+    $validSeedVerification = [PSCustomObject]@{
+        TotalUsers = 2; EmployeeUsers = 2; AdminEmployees = 1
+        Accounts = @(
+            [PSCustomObject]@{ Email = 'admin@ewsp.local'; AccountType = 'EMPLOYEE'; Role = 'ADMIN'; Status = 'ACTIVE'; Verified = $true; PasswordHashPresent = $true },
+            [PSCustomObject]@{ Email = 'viewer@ewsp.local'; AccountType = 'EMPLOYEE'; Role = 'VIEWER'; Status = 'ACTIVE'; Verified = $true; PasswordHashPresent = $true }
+        )
+    }
+    Assert-Equal (Assert-EwspKubernetesSeedVerification $validSeedVerification @('admin@ewsp.local', 'viewer@ewsp.local')) $true 'Kubernetes local seed verifies expected admin contract'
+    $invalidSeedVerification = [PSCustomObject]@{ TotalUsers = 1; EmployeeUsers = 1; AdminEmployees = 0; Accounts = @([PSCustomObject]@{ Email = 'admin@ewsp.local'; AccountType = 'EMPLOYEE'; Role = 'VIEWER'; Status = 'ACTIVE'; Verified = $true; PasswordHashPresent = $true }) }
+    Assert-ThrowsCategory { Assert-EwspKubernetesSeedVerification $invalidSeedVerification @('admin@ewsp.local') | Out-Null } 'SEED_VERIFICATION_FAILED' 'Kubernetes local seed rejects invalid admin verification state'
+
     $stoppedRunner = {
         param($filePath, $arguments)
         [PSCustomObject]@{ ExitCode = 0; Output = @('{"items":[]}') }
@@ -749,6 +925,22 @@ try {
     Assert-Contains $moduleText "'k8s-up' { Invoke-EwspKubernetesUp" 'command router exposes k8s-up'
     Assert-Contains $moduleText "'k8s-status' { Invoke-EwspKubernetesStatus" 'command router exposes k8s-status'
     Assert-Contains $moduleText "'k8s-stop' { Invoke-EwspKubernetesStop" 'command router exposes k8s-stop'
+    Assert-Contains $moduleText "'k8s-seed' { Invoke-EwspKubernetesSeed" 'command router exposes explicit k8s-seed'
+    Assert-Contains $moduleText "'tunnel-quick' { Invoke-EwspQuickTunnelStart" 'command router exposes tunnel-quick'
+    Assert-Contains $moduleText "'tunnel-status' { Invoke-EwspQuickTunnelStatus" 'command router exposes tunnel-status'
+    Assert-Contains $moduleText "'tunnel-stop' { Invoke-EwspQuickTunnelStop" 'command router exposes tunnel-stop'
+    Assert-NotContains $moduleText '10\.244\.0\.24|127' 'Quick Tunnel implementation does not hardcode the example Pod IP'
+    Assert-NotContains $moduleText '*.trycloudflare.com' 'Quick Tunnel implementation never configures wildcard trycloudflare origin'
+    Assert-NotContains $moduleText "Stop-Process -Name cloudflared" 'Quick Tunnel never kills arbitrary cloudflared processes by name'
+    Assert-NotContains $moduleText "@('delete', 'pvc'" 'Quick Tunnel lifecycle leaves Kubernetes PVCs untouched'
+    Assert-Contains $moduleText 'Wait-EwspBackendServiceReadiness' 'Quick Tunnel synchronizes on Kubernetes backend readiness state'
+    Assert-Contains $moduleText 'kubernetes.io/service-name=backend' 'Quick Tunnel synchronizes on the backend EndpointSlice'
+    Assert-Contains $moduleText '/api/v1/namespaces/ewsp/services/http:backend:8080/proxy/api/health' 'Quick Tunnel verifies direct backend Service health'
+    Assert-NotContains $moduleText "Backend health failed after trusted-proxy configuration." 'one-shot post-rollout health classification is removed'
+    $k8sUpFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspKubernetesUp \{.*?(?=function Invoke-EwspStop \{)').Value
+    $tunnelStartFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspQuickTunnelStart \{.*?(?=function Invoke-EwspQuickTunnelStatus \{)').Value
+    Assert-NotContains $k8sUpFunction 'Invoke-EwspKubernetesSeed' 'k8s-up never invokes local user seeding automatically'
+    Assert-NotContains $tunnelStartFunction 'Invoke-EwspKubernetesSeed' 'tunnel-quick never invokes local user seeding automatically'
     Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'REPOSITORY_STATE', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
     Assert-Contains $moduleText "'--tail=40'" 'Kubernetes failure diagnostics bound recent logs'
     Assert-Contains $moduleText 'Select-Object -Last 12' 'Kubernetes failure diagnostics bound recent events'
