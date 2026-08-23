@@ -130,7 +130,19 @@ PostgreSQL, Redis, and MinIO have health checks. Backend startup waits for all t
 
 ## Kubernetes deployment baseline
 
-Docker Compose remains the convenient local development and full-stack path driven by `.\ewsp.ps1 up` and the advanced commands above. The published plain Kubernetes manifests live under `k8s/`, use the `ewsp` namespace, and currently require manual deployment and integration steps; there is not yet a one-command Kubernetes lifecycle workflow equivalent to the Compose orchestration.
+Docker Compose remains the convenient local development and full-stack path driven by `.\ewsp.ps1 up` and the advanced commands above. The published plain Kubernetes manifests live under `k8s/`, use the `ewsp` namespace, and now have a separate safe local lifecycle:
+
+```powershell
+.\ewsp.ps1 k8s-up
+.\ewsp.ps1 k8s-status
+.\ewsp.ps1 k8s-stop
+```
+
+`k8s-up` requires Docker Desktop Kubernetes, refuses any context other than `docker-desktop`, verifies the single Ready Docker Desktop kind node and default local-path StorageClass, and reconciles resources without deleting persistent data. It applies resources in dependency order, waits for infrastructure before applications, verifies all five workloads and their internal DNS/service contracts, then starts or reuses an EWSP-managed dashboard port-forward. Browser access is through `http://localhost:3000`; dashboard Nginx keeps `/api` and `/ws` on that same origin and forwards them to `backend:8080`. If port 3000 belongs to an external process, Kubernetes startup reports the conflict and does not stop that process.
+
+Application images use the same source-aware identity and reuse/build logic as Compose. Clean images are reused when present; a missing exact image is built from the sibling repository's own Dockerfile; dirty repositories retain their unique non-reusable session tags. Checked-in placeholders remain unchanged while exact non-`latest` images are rendered under ignored `.tmp/k8s/rendered/` files for validation and application. Docker Desktop supplies those local images to its kind cluster through its local registry mirror; nothing is pushed.
+
+The real `ewsp-infrastructure-secrets` Secret is generated from the current ignored `.env`, applied without displaying its values, and its temporary ignored file is removed after application. `k8s/config/secrets.example.yaml` remains placeholder-only and is never applied by the command.
 
 The baseline contains:
 
@@ -139,13 +151,11 @@ The baseline contains:
 - MinIO as a one-replica StatefulSet with a 10 Gi PVC.
 - The backend and dashboard as one-replica Deployments with no PVCs.
 
-All five Services are internal `ClusterIP` Services. The backend and dashboard manifests retain obvious non-latest image placeholders that must be resolved to the intended source-aware image tags at deployment time. Real Kubernetes secrets are never committed: `k8s/config/secrets.example.yaml` contains placeholders only, and a real `ewsp-infrastructure-secrets` Secret must be created locally.
+All five Services are internal `ClusterIP` Services. Only the managed dashboard port-forward occupies a Windows port; backend, PostgreSQL, Redis, and MinIO are not exposed by the Kubernetes workflow.
 
-The baseline was verified on Docker Desktop kind Kubernetes v1.36.1. Initial host access uses dashboard-only port forwarding, which preserves the same-origin `/api` and `/ws` path:
+`k8s-status` reports the guarded environment, controllers, Pods, readiness, restarts, images, expected Services, PVCs, and dashboard access without exposing secrets. `k8s-stop` stops only the managed dashboard port-forward and scales EWSP Deployments and StatefulSets to zero. It preserves the namespace, Services, ConfigMaps, Secret, PVCs, PVs, Docker images, and all Compose resources; the next `k8s-up` restores every workload to one replica.
 
-```powershell
-kubectl port-forward -n ewsp service/dashboard 3000:80
-```
+The guaranteed target is the PC-dependent, single-node Docker Desktop kind cluster (verified with Kubernetes v1.36.1). Do not run Compose and Kubernetes simultaneously when both would need dashboard host port 3000; neither workflow automatically stops the other.
 
 Kubernetes PostgreSQL and MinIO PVCs are separate from the Docker Compose named volumes and do not migrate or reuse their data. Deleting the Kubernetes PVCs or resetting the cluster can destroy Kubernetes data; neither action affects the preserved Compose volumes unless those volumes are separately removed.
 

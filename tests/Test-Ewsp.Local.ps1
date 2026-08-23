@@ -527,10 +527,234 @@ try {
     } $primaryEnvironment
     Assert-Contains ($finalPhaseResult -join '|') 'final-phase-ok' 'final up phase accepts an empty remaining-phase list on PowerShell 5.1'
 
+    $kubeRuntime = [PSCustomObject]@{
+        Platform = [PSCustomObject]@{ Description = 'Windows'; Architecture = 'X64'; PowerShellEdition = 'Desktop'; PowerShellVersion = '5.1' }
+        Git = [PSCustomObject]@{ Available = $true; Version = '2.52.0' }
+        Docker = [PSCustomObject]@{ Available = $true; CliVersion = '29.5.3'; EngineReachable = $true; EngineVersion = '29.5.3' }
+        Compose = [PSCustomObject]@{ Available = $true; DisplayName = 'docker compose'; Version = '5.1.4' }
+    }
+    $clientJson = @{ clientVersion = @{ gitVersion = 'v1.36.1' } } | ConvertTo-Json -Depth 5 -Compress
+    $serverJson = @{ clientVersion = @{ gitVersion = 'v1.36.1' }; serverVersion = @{ gitVersion = 'v1.36.1' } } | ConvertTo-Json -Depth 5 -Compress
+    $readyNodeJson = @{ items = @(@{
+        metadata = @{ name = 'desktop-control-plane' }
+        status = @{ conditions = @(@{ type = 'Ready'; status = 'True' }); nodeInfo = @{ kubeletVersion = 'v1.36.1'; containerRuntimeVersion = 'containerd://1.7.27' } }
+    }) } | ConvertTo-Json -Depth 8 -Compress
+    $storageJson = @{
+        metadata = @{ name = 'standard'; annotations = @{ 'storageclass.kubernetes.io/is-default-class' = 'true' } }
+        provisioner = 'rancher.io/local-path'; reclaimPolicy = 'Delete'; volumeBindingMode = 'WaitForFirstConsumer'
+    } | ConvertTo-Json -Depth 8 -Compress
+    $healthyKubeResults = @{
+        'kubectl|version --client -o json' = New-FakeNativeResult 0 @($clientJson)
+        'kubectl|config current-context' = New-FakeNativeResult 0 @('docker-desktop')
+        'kubectl|version -o json' = New-FakeNativeResult 0 @($serverJson)
+        'kubectl|get nodes -o json' = New-FakeNativeResult 0 @($readyNodeJson)
+        'kubectl|get namespace ewsp -o name' = New-FakeNativeResult 0 @('namespace/ewsp')
+        'kubectl|get storageclass standard -o json' = New-FakeNativeResult 0 @($storageJson)
+    }
+    $kubectlResolver = { param($name) if ($name -eq 'kubectl') { [PSCustomObject]@{ Name = 'kubectl' } } }
+    $healthyKubeRunner = {
+        param($filePath, $arguments)
+        $key = "$filePath|$($arguments -join ' ')"
+        if ($healthyKubeResults.ContainsKey($key)) { return $healthyKubeResults[$key] }
+        New-FakeNativeResult 1 @("unsupported fake command: $key")
+    }.GetNewClosure()
+    $healthyKube = Get-EwspKubernetesEnvironment -RuntimeEnvironment $kubeRuntime -CommandResolver $kubectlResolver -CommandRunner $healthyKubeRunner
+    Assert-Equal $healthyKube.Kubernetes.ClientVersion 'v1.36.1' 'Kubernetes detection records kubectl client version'
+    Assert-Equal $healthyKube.Kubernetes.Context 'docker-desktop' 'Kubernetes detection records current context'
+    Assert-Equal $healthyKube.Kubernetes.ApiReachable $true 'Kubernetes detection records reachable API'
+    Assert-Equal $healthyKube.Kubernetes.DockerDesktopKind $true 'Kubernetes detection verifies Docker Desktop kind identity'
+    Assert-Equal $healthyKube.Kubernetes.NamespaceExists $true 'Kubernetes detection records namespace state'
+    Assert-Equal $healthyKube.Kubernetes.StorageClass.VolumeBindingMode 'WaitForFirstConsumer' 'Kubernetes detection records storage binding mode'
+    Assert-EwspKubernetesEnvironment $healthyKube -RequireDocker | Out-Null
+    $script:PassCount++
+    Write-Host 'PASS: verified Kubernetes environment passes safety gate'
+
+    $missingKubectlRuntime = [PSCustomObject]@{ Kubernetes = $null }
+    $missingKubectl = Get-EwspKubernetesEnvironment -RuntimeEnvironment $missingKubectlRuntime -CommandResolver { param($name) $null } -CommandRunner $healthyKubeRunner
+    Assert-ThrowsContains { Assert-EwspKubernetesEnvironment $missingKubectl | Out-Null } 'kubectl is not installed' 'missing kubectl is rejected'
+
+    $wrongContextResults = @{
+        'kubectl|version --client -o json' = New-FakeNativeResult 0 @($clientJson)
+        'kubectl|config current-context' = New-FakeNativeResult 0 @('production')
+    }
+    $wrongContextRunner = {
+        param($filePath, $arguments)
+        $key = "$filePath|$($arguments -join ' ')"
+        if ($wrongContextResults.ContainsKey($key)) { return $wrongContextResults[$key] }
+        New-FakeNativeResult 1
+    }.GetNewClosure()
+    $wrongContext = Get-EwspKubernetesEnvironment -RuntimeEnvironment ([PSCustomObject]@{}) -CommandResolver $kubectlResolver -CommandRunner $wrongContextRunner
+    Assert-ThrowsContains { Assert-EwspKubernetesEnvironment $wrongContext | Out-Null } "current context is 'production'" 'wrong Kubernetes context fails before cluster access'
+    Assert-Equal $wrongContext.Kubernetes.ApiReachable $false 'wrong context is not probed through the Kubernetes API'
+
+    $apiResults = $healthyKubeResults.Clone()
+    $apiResults['kubectl|version -o json'] = New-FakeNativeResult 1 @('connection refused')
+    $apiRunner = {
+        param($filePath, $arguments)
+        $key = "$filePath|$($arguments -join ' ')"
+        if ($apiResults.ContainsKey($key)) { return $apiResults[$key] }
+        New-FakeNativeResult 1
+    }.GetNewClosure()
+    $unreachableApi = Get-EwspKubernetesEnvironment -RuntimeEnvironment ([PSCustomObject]@{}) -CommandResolver $kubectlResolver -CommandRunner $apiRunner
+    Assert-ThrowsContains { Assert-EwspKubernetesEnvironment $unreachableApi | Out-Null } 'API for context' 'unreachable Kubernetes API is rejected'
+
+    $notReadyResults = $healthyKubeResults.Clone()
+    $notReadyResults['kubectl|get nodes -o json'] = New-FakeNativeResult 0 @(($readyNodeJson -replace '"status":"True"', '"status":"False"'))
+    $notReadyRunner = {
+        param($filePath, $arguments)
+        $key = "$filePath|$($arguments -join ' ')"
+        if ($notReadyResults.ContainsKey($key)) { return $notReadyResults[$key] }
+        New-FakeNativeResult 1
+    }.GetNewClosure()
+    $notReady = Get-EwspKubernetesEnvironment -RuntimeEnvironment ([PSCustomObject]@{}) -CommandResolver $kubectlResolver -CommandRunner $notReadyRunner
+    Assert-ThrowsContains { Assert-EwspKubernetesEnvironment $notReady | Out-Null } 'NotReady' 'NotReady Kubernetes node is rejected'
+
+    $testSecretValues = @{
+        POSTGRES_USER = 'test-db-user'; POSTGRES_PASSWORD = 'test-db-password-private'
+        MINIO_ROOT_USER = 'test-minio-user'; MINIO_ROOT_PASSWORD = 'test-minio-password-private'
+        JWT_SECRET = 'test-jwt-private'
+    }
+    $secretOutput = @(& { New-EwspKubernetesSecretArtifact $localRoot $testSecretValues -SkipAcl } *>&1)
+    $secretPath = [string]$secretOutput[-1]
+    $secretText = Get-Content -Raw -LiteralPath $secretPath
+    Assert-NotContains $secretText 'test-db-password-private' 'temporary Kubernetes Secret stores no plaintext password'
+    Assert-NotContains ($secretOutput -join ' ') 'test-jwt-private' 'Kubernetes Secret preparation does not log secret values'
+    $secretObject = $secretText | ConvertFrom-Json
+    Assert-Equal (@($secretObject.data.PSObject.Properties.Name | Sort-Object) -join ',') 'JWT_SECRET,MINIO_ROOT_PASSWORD,MINIO_ROOT_USER,POSTGRES_PASSWORD,POSTGRES_USER' 'temporary Kubernetes Secret has exactly required keys'
+    $incompleteSecretValues = $testSecretValues.Clone()
+    $incompleteSecretValues.Remove('JWT_SECRET')
+    Assert-ThrowsContains { New-EwspKubernetesSecretArtifact $localRoot $incompleteSecretValues -SkipAcl | Out-Null } 'JWT_SECRET' 'missing Kubernetes Secret setting is rejected by name'
+
+    $backendSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash
+    $dashboardSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash
+    $renderRunner = {
+        param($filePath, $arguments)
+        $source = $arguments[[Array]::IndexOf($arguments, '-f') + 1]
+        $assignment = @($arguments | Where-Object { $_ -match '^(backend|dashboard)=' })[0]
+        $image = $assignment.Substring($assignment.IndexOf('=') + 1)
+        $renderedText = (Get-Content -Raw -LiteralPath $source) -replace 'ewsp-(backend|dashboard):replace-with-ewsp-local-tag', $image
+        New-FakeNativeResult 0 @($renderedText -split "`r?`n")
+    }
+    $rendered = New-EwspKubernetesRenderedManifests $localRoot 'ewsp-backend:test-a8b83aa9' 'ewsp-dashboard:test-471172e8' $renderRunner
+    Assert-Contains (Get-Content -Raw $rendered.Backend) 'ewsp-backend:test-a8b83aa9' 'backend placeholder renders to exact image'
+    Assert-Contains (Get-Content -Raw $rendered.Dashboard) 'ewsp-dashboard:test-471172e8' 'dashboard placeholder renders to exact image'
+    Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash $backendSourceHash 'backend source manifest remains unchanged after rendering'
+    Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash $dashboardSourceHash 'dashboard source manifest remains unchanged after rendering'
+    Assert-ThrowsContains { New-EwspKubernetesRenderedManifests $localRoot 'ewsp-backend:latest' 'ewsp-dashboard:test' $renderRunner | Out-Null } 'Invalid resolved application image' 'latest Kubernetes application image is rejected'
+
+    $applyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath)
+    Assert-Equal (@($applyPlan.Stage) -join ',') 'NAMESPACE,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD' 'Kubernetes resources have deterministic apply order'
+    Assert-Equal @($applyPlan | Where-Object { $_.Files -contains (Join-Path $localRoot 'k8s\config\secrets.example.yaml') }).Count 0 'placeholder Secret is absent from apply plan'
+    $validationCapture = @{}
+    $validationRunner = {
+        param($filePath, $arguments)
+        $validationCapture['Arguments'] = @($arguments)
+        [PSCustomObject]@{ ExitCode = 0; Output = @('validated') }
+    }.GetNewClosure()
+    Assert-EwspKubernetesManifestSet $localRoot $applyPlan 'ewsp-backend:test-a8b83aa9' 'ewsp-dashboard:test-471172e8' $validationRunner | Out-Null
+    $script:PassCount++
+    Write-Host 'PASS: complete rendered Kubernetes manifest set validates'
+    Assert-Contains ($validationCapture.Arguments -join ' ') '--dry-run=client --validate=true' 'manifest validation is strict client-side validation'
+    Assert-NotContains ($validationCapture.Arguments -join ' ') 'secrets.example.yaml' 'example Secret is never validated as a real apply input'
+
+    $pullPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Pending'; containerStatuses = @([PSCustomObject]@{ state = [PSCustomObject]@{ waiting = [PSCustomObject]@{ reason = 'ImagePullBackOff' } }; lastState = [PSCustomObject]@{} }) } }
+    Assert-Equal (Get-EwspKubernetesPodReason $pullPod) 'ImagePullBackOff' 'Pod diagnostics recognize image pull failure'
+    $oomPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Running'; containerStatuses = @([PSCustomObject]@{ state = [PSCustomObject]@{}; lastState = [PSCustomObject]@{ terminated = [PSCustomObject]@{ reason = 'OOMKilled' } } }) } }
+    Assert-Equal (Get-EwspKubernetesPodReason $oomPod) 'OOMKilled' 'Pod diagnostics recognize OOMKilled'
+    $unscheduledPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Pending'; containerStatuses = @(); conditions = @([PSCustomObject]@{ type = 'PodScheduled'; status = 'False'; reason = 'Unschedulable'; message = 'insufficient memory' }) } }
+    Assert-Contains (Get-EwspKubernetesPodReason $unscheduledPod) 'insufficient memory' 'Pod diagnostics preserve scheduling evidence'
+    Assert-Equal (Get-EwspKubernetesPodReason $null) 'Missing' 'Pod diagnostics recognize missing Pod'
+
+    $snapshotMode = @{ BackendReason = $null; MissingDashboard = $false }
+    $snapshotRunner = {
+        param($filePath, $arguments)
+        if ($arguments[1] -in @('deployment', 'statefulset')) {
+            $name = $arguments[2]
+            if ($name -eq 'dashboard' -and $snapshotMode.MissingDashboard) {
+                return [PSCustomObject]@{ ExitCode = 1; Output = @('not found') }
+            }
+            $ready = if ($name -eq 'backend' -and $snapshotMode.BackendReason) { 0 } else { 1 }
+            $controller = @{
+                spec = @{ replicas = 1; template = @{ spec = @{ containers = @(@{ name = $name; image = "${name}:test-tag" }) } } }
+                status = @{ readyReplicas = $ready }
+            }
+            return [PSCustomObject]@{ ExitCode = 0; Output = @(($controller | ConvertTo-Json -Depth 8 -Compress)) }
+        }
+        if ($arguments[1] -eq 'pods') {
+            $selector = $arguments[[Array]::IndexOf($arguments, '-l') + 1]
+            $name = $selector.Substring($selector.LastIndexOf('=') + 1)
+            if ($name -eq 'dashboard' -and $snapshotMode.MissingDashboard) {
+                return [PSCustomObject]@{ ExitCode = 0; Output = @('{"items":[]}') }
+            }
+            $isFailure = $name -eq 'backend' -and $snapshotMode.BackendReason
+            $state = if ($isFailure) { @{ waiting = @{ reason = $snapshotMode.BackendReason } } } else { @{ running = @{} } }
+            $pod = @{
+                metadata = @{ name = "${name}-pod"; creationTimestamp = '2026-08-23T00:00:00Z' }
+                spec = @{ containers = @(@{ name = $name; image = "${name}:test-tag" }) }
+                status = @{ phase = $(if ($isFailure) { 'Pending' } else { 'Running' }); containerStatuses = @(@{ ready = (-not $isFailure); restartCount = $(if ($isFailure) { 3 } else { 0 }); imageID = "sha256:${name}"; state = $state }) }
+            }
+            return [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($pod) } | ConvertTo-Json -Depth 12 -Compress)) }
+        }
+        [PSCustomObject]@{ ExitCode = 1; Output = @('unsupported') }
+    }.GetNewClosure()
+    $healthySnapshots = @(Get-EwspKubernetesWorkloadSnapshot $snapshotRunner)
+    Assert-Equal @($healthySnapshots | Where-Object Ready).Count 5 'Kubernetes status recognizes all five healthy workloads'
+    Assert-Equal @($healthySnapshots | Where-Object Name -eq 'backend')[0].Image 'backend:test-tag' 'Kubernetes status reports running application image'
+    $snapshotMode.BackendReason = 'ImagePullBackOff'
+    $unhealthySnapshots = @(Get-EwspKubernetesWorkloadSnapshot $snapshotRunner)
+    $unhealthyBackend = @($unhealthySnapshots | Where-Object Name -eq 'backend')[0]
+    Assert-Equal $unhealthyBackend.Ready $false 'Kubernetes status marks unhealthy Pod non-ready'
+    Assert-Equal $unhealthyBackend.Reason 'ImagePullBackOff' 'Kubernetes status reports unhealthy Pod reason'
+    Assert-Equal $unhealthyBackend.Restarts 3 'Kubernetes status reports restart count'
+    $snapshotMode.MissingDashboard = $true
+    $missingSnapshots = @(Get-EwspKubernetesWorkloadSnapshot $snapshotRunner)
+    Assert-Equal @($missingSnapshots | Where-Object Name -eq 'dashboard')[0].ControllerExists $false 'Kubernetes status recognizes missing controller'
+    $pendingPvcRunner = {
+        param($filePath, $arguments)
+        $pvc = @{ metadata = @{ name = 'postgres-data-postgres-0' }; spec = @{ storageClassName = 'standard'; volumeName = $null }; status = @{ phase = 'Pending' } }
+        [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($pvc) } | ConvertTo-Json -Depth 8 -Compress)) }
+    }
+    $pendingPvc = @(Get-EwspKubernetesPvcSnapshot $pendingPvcRunner)[0]
+    Assert-Equal $pendingPvc.Status 'Pending' 'Kubernetes status recognizes Pending PVC'
+    Assert-Equal $pendingPvc.Capacity '<pending>' 'Pending PVC status does not require a capacity field'
+
+    Assert-Equal (Resolve-EwspKubernetesPortForwardAction $true $true $true) 'REUSE' 'healthy managed port-forward is reused'
+    Assert-Equal (Resolve-EwspKubernetesPortForwardAction $false $false $true) 'CONFLICT' 'external dashboard port conflict is refused'
+    Assert-Equal (Resolve-EwspKubernetesPortForwardAction $false $false $false) 'START' 'free dashboard port starts managed forward'
+    Assert-Equal (Resolve-EwspKubernetesPortForwardAction $true $false $true) 'START' 'unhealthy managed forward is safely replaced'
+
+    $stoppedRunner = {
+        param($filePath, $arguments)
+        [PSCustomObject]@{ ExitCode = 0; Output = @('{"items":[]}') }
+    }
+    Assert-Equal (Wait-EwspKubernetesPodsStopped -TimeoutSeconds 2 -CommandRunner $stoppedRunner -SleepAction { }) $true 'Kubernetes stop confirms controller-managed Pods disappeared'
+
+    $kubeCause = New-EwspKubernetesException 'image pull failed without secret value test-jwt-private' 'KUBERNETES_READINESS_FAILURE' 'backend' 'kubectl rollout status deployment/backend'
+    $kubeCompleted = New-Object System.Collections.Generic.List[string]
+    $kubeCompleted.Add('K8S_ENVIRONMENT')
+    $kubeFailure = New-EwspUpFailureException 'READINESS_WAIT' 'Waiting for Kubernetes readiness' $kubeCause $healthyKube $kubeCompleted @('FINAL_VERIFICATION', 'ACCESS_SETUP') 'rollout backend' 'backend' 'k8s-up'
+    Assert-Contains $kubeFailure.Message 'EWSP k8s-up failed' 'Kubernetes failure uses structured workflow diagnostics'
+    Assert-Contains $kubeFailure.Message 'Category: KUBERNETES_READINESS_FAILURE' 'Kubernetes failure preserves category'
+    Assert-Contains $kubeFailure.Message 'Not attempted afterward: FINAL_VERIFICATION, ACCESS_SETUP' 'Kubernetes failure lists skipped phases'
+    Assert-NotContains (Protect-EwspDiagnosticText $kubeFailure.Message $testSecretValues) 'test-jwt-private' 'Kubernetes diagnostics redact secret values'
+
+    Remove-EwspKubernetesSecretArtifact $localRoot
+
     $moduleText = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
     foreach ($destructiveGitOperation in @("@('reset'", "@('clean'", "@('stash'", "@('checkout'", "@('rebase'")) {
         Assert-NotContains $moduleText $destructiveGitOperation "orchestration does not introduce destructive Git operation $destructiveGitOperation"
     }
+    Assert-NotContains $moduleText "@('delete', 'namespace'" 'Kubernetes orchestration does not delete its namespace'
+    Assert-NotContains $moduleText "@('delete', 'pvc'" 'Kubernetes orchestration does not delete PVCs'
+    Assert-Contains $moduleText "'k8s-up' { Invoke-EwspKubernetesUp" 'command router exposes k8s-up'
+    Assert-Contains $moduleText "'k8s-status' { Invoke-EwspKubernetesStatus" 'command router exposes k8s-status'
+    Assert-Contains $moduleText "'k8s-stop' { Invoke-EwspKubernetesStop" 'command router exposes k8s-stop'
+    Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'REPOSITORY_STATE', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
+    Assert-Contains $moduleText "'--tail=40'" 'Kubernetes failure diagnostics bound recent logs'
+    Assert-Contains $moduleText 'Select-Object -Last 12' 'Kubernetes failure diagnostics bound recent events'
+    Assert-Contains $moduleText "@('scale', `$target.Type, `$name" 'k8s-stop uses reversible controller scaling'
+    Assert-Contains (Get-Content -Raw (Join-Path $localRoot 'k8s\postgres\statefulset.yaml')) 'replicas: 1' 'k8s-up source restores PostgreSQL replica count'
+    Assert-Contains (Get-Content -Raw (Join-Path $localRoot 'k8s\minio\statefulset.yaml')) 'replicas: 1' 'k8s-up source restores MinIO replica count'
 
     Write-Host "All EWSP orchestration tests passed ($script:PassCount assertions)." -ForegroundColor Green
 } finally {

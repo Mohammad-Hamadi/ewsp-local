@@ -1,6 +1,8 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $script:EwspResolvedEnvironment = $null
+$script:EwspKubernetesContext = 'docker-desktop'
+$script:EwspKubernetesNamespace = 'ewsp'
 
 function Invoke-EwspNative {
     [CmdletBinding()]
@@ -565,14 +567,21 @@ function Format-EwspEnvironmentSummary {
     $compose = if ($EnvironmentInfo.Compose.Available) {
         "$($EnvironmentInfo.Compose.DisplayName) $($EnvironmentInfo.Compose.Version)"
     } else { 'unavailable' }
-    @(
+    $parts = @(
         "OS: $($EnvironmentInfo.Platform.Description) [$($EnvironmentInfo.Platform.Architecture)]"
         "PowerShell: $($EnvironmentInfo.Platform.PowerShellEdition) $($EnvironmentInfo.Platform.PowerShellVersion)"
         "Git: $(if ($EnvironmentInfo.Git.Version) { $EnvironmentInfo.Git.Version } else { 'unavailable' })"
         "Docker CLI: $(if ($EnvironmentInfo.Docker.CliVersion) { $EnvironmentInfo.Docker.CliVersion } else { 'unavailable' })"
         "Docker Engine: $(if ($EnvironmentInfo.Docker.EngineVersion) { $EnvironmentInfo.Docker.EngineVersion } else { 'unreachable' })"
         "Compose: $compose"
-    ) -join '; '
+    )
+    if ($EnvironmentInfo.PSObject.Properties.Name -contains 'Kubernetes') {
+        $kubernetes = $EnvironmentInfo.Kubernetes
+        $parts += "kubectl: $(if ($kubernetes.ClientVersion) { $kubernetes.ClientVersion } else { 'unavailable' })"
+        $parts += "Kubernetes context: $(if ($kubernetes.Context) { $kubernetes.Context } else { 'unavailable' })"
+        $parts += "Kubernetes server: $(if ($kubernetes.ServerVersion) { $kubernetes.ServerVersion } else { 'unreachable' })"
+    }
+    $parts -join '; '
 }
 
 function Assert-EwspPrerequisites {
@@ -1262,10 +1271,11 @@ function Assert-EwspEndpoints {
 }
 
 function Get-EwspFailureNextAction {
-    param([string]$Category, [string]$Phase)
+    param([string]$Category, [string]$Phase, [string]$Command = 'up')
+    $retry = ".\ewsp.ps1 $Command"
     switch ($Category) {
-        'PREREQUISITE_MISSING' { return 'Install or expose the named prerequisite on PATH, then rerun .\ewsp.ps1 up. No automatic installation was attempted.' }
-        'DOCKER_ENGINE_UNREACHABLE' { return 'Start Docker Desktop/Engine, wait until it is ready, and rerun .\ewsp.ps1 up.' }
+        'PREREQUISITE_MISSING' { return "Install or expose the named prerequisite on PATH, then rerun $retry. No automatic installation was attempted." }
+        'DOCKER_ENGINE_UNREACHABLE' { return "Start Docker Desktop/Engine, wait until it is ready, and rerun $retry." }
         'UNSUPPORTED_COMPOSE' { return 'Enable the Docker Compose plugin or install a compatible docker-compose command, then retry.' }
         'WRONG_REPOSITORY_IDENTITY' { return 'Move or rename the unexpected sibling directory yourself, then rerun .\ewsp.ps1 up. It was not overwritten.' }
         'REQUIRED_DOCKER_ASSET_MISSING' { return 'Safely update the named sibling checkout, or resolve its Git state manually if automatic update was skipped; then retry.' }
@@ -1277,9 +1287,19 @@ function Get-EwspFailureNextAction {
         'HEALTH_TIMEOUT' { return 'Review the waiting services and bounded logs above; use .\ewsp.ps1 status before retrying.' }
         'COMPOSE_VALIDATION_FAILURE' { return 'Correct compose.yml or the named environment setting, then rerun .\ewsp.ps1 up.' }
         'ENDPOINT_VERIFICATION_FAILURE' { return 'Inspect the named endpoint and service logs, then rerun .\ewsp.ps1 up.' }
+        'KUBECTL_MISSING' { return 'Install kubectl or expose it on PATH, then rerun the Kubernetes command.' }
+        'KUBERNETES_WRONG_CONTEXT' { return "Review the reported context and explicitly select '$script:EwspKubernetesContext' yourself before retrying. No context was switched automatically." }
+        'KUBERNETES_API_UNREACHABLE' { return 'Start Docker Desktop Kubernetes, wait for its API to become ready, and retry. The cluster was not reset.' }
+        'KUBERNETES_NODE_NOT_READY' { return 'Wait for the Docker Desktop Kubernetes node to become Ready and retry; inspect Docker Desktop diagnostics if it remains NotReady.' }
+        'KUBERNETES_STORAGE_UNAVAILABLE' { return "Restore the default 'standard' StorageClass backed by rancher.io/local-path, then retry without deleting existing PVCs." }
+        'KUBERNETES_MANIFEST_INVALID' { return 'Correct the reported source or rendered manifest contract and rerun k8s-up. No placeholder Secret was applied.' }
+        'KUBERNETES_APPLY_FAILURE' { return 'Review the named resource and bounded Kubernetes diagnostics, correct the manifest or cluster condition, and rerun k8s-up.' }
+        'KUBERNETES_READINESS_FAILURE' { return 'Review the bounded Pod, event, and PVC diagnostics, correct the evidenced condition, and rerun k8s-up.' }
+        'KUBERNETES_VERIFICATION_FAILURE' { return 'Review the named in-cluster check and workload logs, then rerun k8s-up.' }
+        'KUBERNETES_PORT_CONFLICT' { return 'Stop or reconfigure the external listener, or change DASHBOARD_HOST_PORT in .env. No unrelated process was stopped.' }
         default {
             if ($Phase -eq 'REPOSITORY_UPDATE') { return 'Resolve the reported Git state manually only if the required application assets are unavailable.' }
-            return 'Correct the reported condition and rerun .\ewsp.ps1 up. Existing source changes and persistent volumes were preserved.'
+            return "Correct the reported condition and rerun $retry. Existing source changes and persistent volumes were preserved."
         }
     }
 }
@@ -1293,7 +1313,8 @@ function New-EwspUpFailureException {
         [Parameter(Mandatory = $true)][object]$CompletedPhases,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$RemainingPhases,
         [string]$Operation,
-        [string]$Component
+        [string]$Component,
+        [string]$WorkflowName = 'up'
     )
     if ($Cause.Data.Contains('Category')) {
         $category = [string]$Cause.Data['Category']
@@ -1334,9 +1355,11 @@ function New-EwspUpFailureException {
     $succeeded = if ($CompletedPhases.Count -gt 0) { $CompletedPhases -join ', ' } else { 'none' }
     $notAttempted = if ($RemainingPhases.Count -gt 0) { $RemainingPhases -join ', ' } else { 'none' }
     $reason = Protect-EwspDiagnosticText $Cause.Message
-    $nextAction = Get-EwspFailureNextAction $category $Phase
+    $nextAction = if ($Cause.Data.Contains('NextAction')) {
+        [string]$Cause.Data['NextAction']
+    } else { Get-EwspFailureNextAction $category $Phase $WorkflowName }
     $message = @(
-        'EWSP up failed.'
+        "EWSP $WorkflowName failed."
         "Phase: $Phase ($FriendlyPhase)"
         "Category: $category"
         "Component: $Component"
@@ -1366,7 +1389,8 @@ function Invoke-EwspUpPhase {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$RemainingPhases,
         $EnvironmentInfo,
         [string]$Operation,
-        [string]$Component
+        [string]$Component,
+        [string]$WorkflowName = 'up'
     )
     Write-Host "[$Index/$Total] $FriendlyName..." -ForegroundColor Cyan
     try {
@@ -1378,7 +1402,7 @@ function Invoke-EwspUpPhase {
             $EnvironmentInfo = $script:EwspResolvedEnvironment
         }
         throw (New-EwspUpFailureException $Phase $FriendlyName $_.Exception $EnvironmentInfo `
-            $CompletedPhases $RemainingPhases $Operation $Component)
+            $CompletedPhases $RemainingPhases $Operation $Component $WorkflowName)
     }
 }
 
@@ -1586,6 +1610,1076 @@ function Invoke-EwspUp {
     Show-EwspReadySummary $context $context.States
 }
 
+function New-EwspKubernetesException {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][string]$Category,
+        [string]$Component = 'Kubernetes environment',
+        [string]$Operation = 'kubectl'
+    )
+    $exception = New-Object System.Exception($Message)
+    $exception.Data['Category'] = $Category
+    $exception.Data['Component'] = $Component
+    $exception.Data['Operation'] = $Operation
+    $exception
+}
+
+function Invoke-EwspKubectl {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [scriptblock]$CommandRunner
+    )
+    if ($CommandRunner) { return (& $CommandRunner 'kubectl' $Arguments) }
+    Invoke-EwspNative 'kubectl' $Arguments
+}
+
+function Invoke-EwspKubectlStreaming {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+    Invoke-EwspNativeStreaming 'kubectl' $Arguments $null $FailureMessage
+}
+
+function Get-EwspKubernetesEnvironment {
+    [CmdletBinding()]
+    param(
+        $RuntimeEnvironment,
+        [scriptblock]$CommandResolver,
+        [scriptblock]$CommandRunner
+    )
+    if (-not $RuntimeEnvironment) { $RuntimeEnvironment = Get-EwspRuntimeEnvironment }
+    if (-not $CommandResolver) {
+        $CommandResolver = { param($name) Get-Command $name -ErrorAction SilentlyContinue }
+    }
+    $available = $null -ne (& $CommandResolver 'kubectl')
+    $clientVersion = $null
+    $context = $null
+    $apiReachable = $false
+    $serverVersion = $null
+    $nodes = @()
+    $namespaceExists = $false
+    $storageClass = $null
+
+    if ($available) {
+        $clientResult = Invoke-EwspKubectl @('version', '--client', '-o', 'json') $CommandRunner
+        if ($clientResult.ExitCode -eq 0) {
+            try { $clientVersion = (($clientResult.Output -join "`n") | ConvertFrom-Json).clientVersion.gitVersion } catch { }
+        }
+        $contextResult = Invoke-EwspKubectl @('config', 'current-context') $CommandRunner
+        if ($contextResult.ExitCode -eq 0) { $context = ($contextResult.Output -join '').Trim() }
+        if ($context -eq $script:EwspKubernetesContext) {
+            $versionResult = Invoke-EwspKubectl @('version', '-o', 'json') $CommandRunner
+            if ($versionResult.ExitCode -eq 0) {
+                try {
+                    $versionObject = ($versionResult.Output -join "`n") | ConvertFrom-Json
+                    $serverVersion = $versionObject.serverVersion.gitVersion
+                    $apiReachable = -not [string]::IsNullOrWhiteSpace([string]$serverVersion)
+                } catch { }
+            }
+            if ($apiReachable) {
+                $nodeResult = Invoke-EwspKubectl @('get', 'nodes', '-o', 'json') $CommandRunner
+                if ($nodeResult.ExitCode -eq 0) {
+                    try {
+                        $nodeObject = ($nodeResult.Output -join "`n") | ConvertFrom-Json
+                        $nodes = @($nodeObject.items | ForEach-Object {
+                            $condition = @($_.status.conditions | Where-Object type -eq 'Ready')
+                            [PSCustomObject]@{
+                                Name = $_.metadata.name
+                                Ready = [bool]($condition.Count -gt 0 -and $condition[0].status -eq 'True')
+                                Version = $_.status.nodeInfo.kubeletVersion
+                                ContainerRuntime = $_.status.nodeInfo.containerRuntimeVersion
+                            }
+                        })
+                    } catch { }
+                }
+                $namespaceResult = Invoke-EwspKubectl @('get', 'namespace', $script:EwspKubernetesNamespace, '-o', 'name') $CommandRunner
+                $namespaceExists = $namespaceResult.ExitCode -eq 0
+                $storageResult = Invoke-EwspKubectl @('get', 'storageclass', 'standard', '-o', 'json') $CommandRunner
+                if ($storageResult.ExitCode -eq 0) {
+                    try {
+                        $storageObject = ($storageResult.Output -join "`n") | ConvertFrom-Json
+                        $defaultValue = $storageObject.metadata.annotations.'storageclass.kubernetes.io/is-default-class'
+                        $storageClass = [PSCustomObject]@{
+                            Name = $storageObject.metadata.name
+                            Provisioner = $storageObject.provisioner
+                            ReclaimPolicy = $storageObject.reclaimPolicy
+                            VolumeBindingMode = $storageObject.volumeBindingMode
+                            Default = $defaultValue -eq 'true'
+                        }
+                    } catch { }
+                }
+            }
+        }
+    }
+
+    $kubernetes = [PSCustomObject]@{
+        Available = $available
+        ClientVersion = $clientVersion
+        Context = $context
+        ExpectedContext = $script:EwspKubernetesContext
+        ApiReachable = $apiReachable
+        ServerVersion = $serverVersion
+        Nodes = @($nodes)
+        NamespaceExists = $namespaceExists
+        Namespace = $script:EwspKubernetesNamespace
+        StorageClass = $storageClass
+        DockerDesktopKind = [bool]($nodes.Count -eq 1 -and $nodes[0].Name -eq 'desktop-control-plane' -and $nodes[0].ContainerRuntime -like 'containerd://*')
+    }
+    $RuntimeEnvironment | Add-Member -NotePropertyName Kubernetes -NotePropertyValue $kubernetes -Force
+    $script:EwspResolvedEnvironment = $RuntimeEnvironment
+    $RuntimeEnvironment
+}
+
+function Assert-EwspKubernetesEnvironment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$EnvironmentInfo,
+        [switch]$RequireDocker
+    )
+    $kubernetes = $EnvironmentInfo.Kubernetes
+    if (-not $kubernetes.Available) {
+        throw (New-EwspKubernetesException 'Prerequisite missing: kubectl is not installed or is not available on PATH.' 'KUBECTL_MISSING' 'kubectl' 'kubectl version --client')
+    }
+    if (-not $kubernetes.ClientVersion) {
+        throw (New-EwspKubernetesException 'kubectl client version could not be detected.' 'KUBECTL_MISSING' 'kubectl' 'kubectl version --client -o json')
+    }
+    if ($kubernetes.Context -ne $kubernetes.ExpectedContext) {
+        $actual = if ($kubernetes.Context) { $kubernetes.Context } else { '<none>' }
+        throw (New-EwspKubernetesException "Refusing Kubernetes deployment: current context is '$actual'; expected '$($kubernetes.ExpectedContext)'. No context was switched." 'KUBERNETES_WRONG_CONTEXT' 'Kubernetes context' 'kubectl config current-context')
+    }
+    if (-not $kubernetes.ApiReachable) {
+        throw (New-EwspKubernetesException "Kubernetes API for context '$($kubernetes.Context)' is not reachable." 'KUBERNETES_API_UNREACHABLE' 'Kubernetes API' 'kubectl version -o json')
+    }
+    if ($kubernetes.Nodes.Count -eq 0 -or @($kubernetes.Nodes | Where-Object { -not $_.Ready }).Count -gt 0) {
+        $state = if ($kubernetes.Nodes.Count) {
+            @($kubernetes.Nodes | ForEach-Object { "$($_.Name)=$(if ($_.Ready) { 'Ready' } else { 'NotReady' })" }) -join ', '
+        } else { 'no nodes returned' }
+        throw (New-EwspKubernetesException "Kubernetes node readiness check failed: $state." 'KUBERNETES_NODE_NOT_READY' 'Kubernetes nodes' 'kubectl get nodes')
+    }
+    if (-not $kubernetes.DockerDesktopKind) {
+        throw (New-EwspKubernetesException "Refusing Kubernetes deployment: context '$($kubernetes.Context)' is not the verified single-node Docker Desktop kind cluster (expected Ready node desktop-control-plane using containerd)." 'KUBERNETES_WRONG_CONTEXT' 'Kubernetes cluster identity' 'kubectl get nodes -o json')
+    }
+    $storage = $kubernetes.StorageClass
+    if (-not $storage -or $storage.Name -ne 'standard' -or $storage.Provisioner -ne 'rancher.io/local-path' -or -not $storage.Default) {
+        throw (New-EwspKubernetesException "Required default StorageClass 'standard' backed by rancher.io/local-path is unavailable." 'KUBERNETES_STORAGE_UNAVAILABLE' 'Kubernetes storage' 'kubectl get storageclass standard')
+    }
+    if ($RequireDocker) {
+        if (-not $EnvironmentInfo.Docker.Available) {
+            throw (New-EwspKubernetesException 'Docker CLI is required for local Kubernetes image resolution.' 'PREREQUISITE_MISSING' 'Docker CLI' 'docker --version')
+        }
+        if (-not $EnvironmentInfo.Docker.EngineReachable) {
+            throw (New-EwspKubernetesException 'Docker Engine is not reachable; Docker Desktop local images cannot be prepared.' 'DOCKER_ENGINE_UNREACHABLE' 'Docker Engine' 'docker version')
+        }
+    }
+    $EnvironmentInfo
+}
+
+function Show-EwspKubernetesEnvironment {
+    param([Parameter(Mandatory = $true)]$EnvironmentInfo)
+    $kubernetes = $EnvironmentInfo.Kubernetes
+    Write-Host "      kubectl      $($kubernetes.ClientVersion)"
+    Write-Host "      context      $($kubernetes.Context) (expected $($kubernetes.ExpectedContext))"
+    Write-Host "      server       $($kubernetes.ServerVersion)"
+    foreach ($node in $kubernetes.Nodes) {
+        Write-Host ("      node         {0} {1} [{2}]" -f $node.Name, $(if ($node.Ready) { 'Ready' } else { 'NotReady' }), $node.Version)
+    }
+    Write-Host "      namespace    $($kubernetes.Namespace) ($(if ($kubernetes.NamespaceExists) { 'present' } else { 'absent' }))"
+    Write-Host "      storage      $($kubernetes.StorageClass.Name) [$($kubernetes.StorageClass.Provisioner)]"
+    Write-Host "      Docker       $($EnvironmentInfo.Docker.EngineVersion)"
+}
+
+function Get-EwspKubernetesPaths {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $temporaryRoot = Join-Path $LocalRoot '.tmp\k8s'
+    [PSCustomObject]@{
+        SourceRoot = Join-Path $LocalRoot 'k8s'
+        TemporaryRoot = $temporaryRoot
+        RenderedRoot = Join-Path $temporaryRoot 'rendered'
+        BackendRendered = Join-Path $temporaryRoot 'rendered\backend-deployment.yaml'
+        DashboardRendered = Join-Path $temporaryRoot 'rendered\dashboard-deployment.yaml'
+        Secret = Join-Path $temporaryRoot 'secrets.local.json'
+        PortForwardState = Join-Path $temporaryRoot 'port-forward.json'
+        PortForwardOutput = Join-Path $temporaryRoot 'port-forward.out.log'
+        PortForwardError = Join-Path $temporaryRoot 'port-forward.err.log'
+    }
+}
+
+function Assert-EwspSafeTemporaryPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $safeRoot = [IO.Path]::GetFullPath((Join-Path $LocalRoot '.tmp')).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $target = [IO.Path]::GetFullPath($Path)
+    if (-not $target.StartsWith($safeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Temporary Kubernetes path escaped the ignored .tmp directory: $target"
+    }
+    $target
+}
+
+function Clear-EwspKubernetesRenderedArtifacts {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $renderedRoot = Assert-EwspSafeTemporaryPath $LocalRoot $paths.RenderedRoot
+    if (Test-Path -LiteralPath $renderedRoot) { Remove-Item -LiteralPath $renderedRoot -Recurse -Force }
+    New-Item -ItemType Directory -Path $renderedRoot -Force | Out-Null
+    $paths
+}
+
+function New-EwspKubernetesSecretArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][hashtable]$EnvironmentValues,
+        [switch]$SkipAcl
+    )
+    $required = @('POSTGRES_USER', 'POSTGRES_PASSWORD', 'MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD', 'JWT_SECRET')
+    $missing = @($required | Where-Object {
+        -not $EnvironmentValues.ContainsKey($_) -or [string]::IsNullOrWhiteSpace([string]$EnvironmentValues[$_])
+    })
+    if ($missing.Count) {
+        throw (New-EwspKubernetesException "Required Kubernetes Secret settings are missing or empty: $($missing -join ', '). Values were not printed." 'INVALID_ENV_CONFIGURATION' 'Kubernetes Secret' 'Read .env')
+    }
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $secretPath = Assert-EwspSafeTemporaryPath $LocalRoot $paths.Secret
+    New-Item -ItemType Directory -Path (Split-Path -Parent $secretPath) -Force | Out-Null
+    $data = [ordered]@{}
+    foreach ($key in $required) {
+        $data[$key] = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$EnvironmentValues[$key]))
+    }
+    $secret = [ordered]@{
+        apiVersion = 'v1'; kind = 'Secret'
+        metadata = [ordered]@{
+            name = 'ewsp-infrastructure-secrets'; namespace = $script:EwspKubernetesNamespace
+            labels = [ordered]@{ 'app.kubernetes.io/component' = 'infrastructure'; 'app.kubernetes.io/part-of' = 'ewsp' }
+        }
+        type = 'Opaque'; data = $data
+    }
+    try {
+        [IO.File]::WriteAllText($secretPath, ($secret | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        $ignored = Invoke-EwspNative 'git' @('-C', $LocalRoot, 'check-ignore', '--quiet', '--', '.tmp/k8s/secrets.local.json')
+        if ($ignored.ExitCode -ne 0) { throw 'Temporary Kubernetes Secret artifact is not ignored by Git.' }
+        if (-not $SkipAcl -and (Get-EwspHostPlatform).Name -eq 'Windows') {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $aclResult = Invoke-EwspNative 'icacls' @($secretPath, '/inheritance:r', '/grant:r', "${identity}:(F)")
+            if ($aclResult.ExitCode -ne 0) { throw 'Failed to restrict the temporary Kubernetes Secret artifact ACL.' }
+        }
+    } catch {
+        if (Test-Path -LiteralPath $secretPath -PathType Leaf) { Remove-Item -LiteralPath $secretPath -Force }
+        throw
+    }
+    $secretPath
+}
+
+function Remove-EwspKubernetesSecretArtifact {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $path = Assert-EwspSafeTemporaryPath $LocalRoot (Get-EwspKubernetesPaths $LocalRoot).Secret
+    if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+}
+
+function New-EwspKubernetesRenderedManifests {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][string]$BackendImage,
+        [Parameter(Mandatory = $true)][string]$DashboardImage,
+        [scriptblock]$CommandRunner
+    )
+    foreach ($image in @($BackendImage, $DashboardImage)) {
+        if ($image -match ':latest$' -or $image -match 'replace-with-ewsp-local-tag') {
+            throw (New-EwspKubernetesException "Invalid resolved application image '$image'." 'KUBERNETES_MANIFEST_INVALID' 'Application images' 'Resolve source-aware image tags')
+        }
+    }
+    $paths = Clear-EwspKubernetesRenderedArtifacts $LocalRoot
+    $sources = @(
+        @{ Name = 'backend'; Source = Join-Path $paths.SourceRoot 'backend\deployment.yaml'; Destination = $paths.BackendRendered; Image = $BackendImage },
+        @{ Name = 'dashboard'; Source = Join-Path $paths.SourceRoot 'dashboard\deployment.yaml'; Destination = $paths.DashboardRendered; Image = $DashboardImage }
+    )
+    foreach ($item in $sources) {
+        $before = (Get-FileHash -LiteralPath $item.Source -Algorithm SHA256).Hash
+        $result = Invoke-EwspKubectl @('set', 'image', '-f', $item.Source, "$($item.Name)=$($item.Image)", '--local', '-o', 'yaml') $CommandRunner
+        if ($result.ExitCode -ne 0) {
+            $reason = Protect-EwspDiagnosticText ($result.Output -join ' ')
+            throw (New-EwspKubernetesException "Failed to render $($item.Name) Deployment: $reason" 'KUBERNETES_MANIFEST_INVALID' $item.Name 'kubectl set image --local')
+        }
+        $content = ($result.Output -join [Environment]::NewLine).TrimEnd() + [Environment]::NewLine
+        if ($content -match 'replace-with-ewsp-local-tag' -or -not $content.Contains($item.Image)) {
+            throw (New-EwspKubernetesException "Rendered $($item.Name) Deployment did not contain the exact resolved image." 'KUBERNETES_MANIFEST_INVALID' $item.Name 'kubectl set image --local')
+        }
+        [IO.File]::WriteAllText($item.Destination, $content, [Text.UTF8Encoding]::new($false))
+        $after = (Get-FileHash -LiteralPath $item.Source -Algorithm SHA256).Hash
+        if ($before -ne $after) { throw "Source manifest changed while rendering: $($item.Source)" }
+    }
+    [PSCustomObject]@{ Backend = $paths.BackendRendered; Dashboard = $paths.DashboardRendered; Root = $paths.RenderedRoot }
+}
+
+function Get-EwspKubernetesApplyPlan {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)]$Rendered,
+        [Parameter(Mandatory = $true)][string]$SecretPath
+    )
+    $root = Join-Path $LocalRoot 'k8s'
+    @(
+        [PSCustomObject]@{ Stage = 'NAMESPACE'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'namespace.yaml')) },
+        [PSCustomObject]@{ Stage = 'CONFIGMAPS'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'config\postgres-configmap.yaml'), (Join-Path $root 'backend\configmap.yaml')) },
+        [PSCustomObject]@{ Stage = 'SECRET'; Scope = 'Infrastructure'; Files = @($SecretPath) },
+        [PSCustomObject]@{ Stage = 'POSTGRES'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'postgres\service.yaml'), (Join-Path $root 'postgres\statefulset.yaml')) },
+        [PSCustomObject]@{ Stage = 'REDIS'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'redis\service.yaml'), (Join-Path $root 'redis\deployment.yaml')) },
+        [PSCustomObject]@{ Stage = 'MINIO'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'minio\service.yaml'), (Join-Path $root 'minio\statefulset.yaml')) },
+        [PSCustomObject]@{ Stage = 'BACKEND'; Scope = 'Application'; Files = @((Join-Path $root 'backend\service.yaml'), $Rendered.Backend) },
+        [PSCustomObject]@{ Stage = 'DASHBOARD'; Scope = 'Application'; Files = @((Join-Path $root 'dashboard\service.yaml'), $Rendered.Dashboard) }
+    )
+}
+
+function Assert-EwspKubernetesManifestSet {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][object[]]$ApplyPlan,
+        [Parameter(Mandatory = $true)][string]$BackendImage,
+        [Parameter(Mandatory = $true)][string]$DashboardImage,
+        [scriptblock]$CommandRunner
+    )
+    $files = @($ApplyPlan | ForEach-Object { $_.Files })
+    $examplePath = [IO.Path]::GetFullPath((Join-Path $LocalRoot 'k8s\config\secrets.example.yaml'))
+    if (@($files | Where-Object { [IO.Path]::GetFullPath($_) -eq $examplePath }).Count) {
+        throw (New-EwspKubernetesException 'Placeholder secrets.example.yaml must never be part of the apply plan.' 'KUBERNETES_MANIFEST_INVALID' 'Kubernetes Secret' 'Build apply plan')
+    }
+    foreach ($file in $files) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw (New-EwspKubernetesException "Manifest is missing: $file" 'KUBERNETES_MANIFEST_INVALID' 'Manifest set' 'Validate manifest paths')
+        }
+        if ([IO.Path]::GetFullPath($file) -ne [IO.Path]::GetFullPath((Join-Path $LocalRoot 'k8s\namespace.yaml')) -and
+            ([IO.File]::ReadAllText($file)) -notmatch '(?m)(namespace:\s*ewsp|"namespace"\s*:\s*"ewsp")') {
+            throw (New-EwspKubernetesException "Manifest does not explicitly target namespace ewsp: $file" 'KUBERNETES_MANIFEST_INVALID' 'Manifest namespace' 'Validate namespace references')
+        }
+    }
+    $combined = ($files | ForEach-Object { [IO.File]::ReadAllText($_) }) -join "`n"
+    if ($combined -match 'replace-with-ewsp-local-tag' -or -not $combined.Contains($BackendImage) -or -not $combined.Contains($DashboardImage)) {
+        throw (New-EwspKubernetesException 'Rendered manifest set contains an unresolved image placeholder or lacks an exact resolved image.' 'KUBERNETES_MANIFEST_INVALID' 'Application manifests' 'Validate rendered images')
+    }
+    foreach ($requiredText in @(
+        'namespace: ewsp', 'name: ewsp-infrastructure-secrets', 'name: postgres-config', 'name: backend-config',
+        'storage: 5Gi', 'storage: 10Gi', 'medium: Memory', 'sizeLimit: 128Mi',
+        'imagePullPolicy: IfNotPresent', 'app.kubernetes.io/part-of: ewsp'
+    )) {
+        if (-not $combined.Contains($requiredText)) {
+            throw (New-EwspKubernetesException "Manifest contract is missing '$requiredText'." 'KUBERNETES_MANIFEST_INVALID' 'Manifest set' 'Validate Kubernetes source contract')
+        }
+    }
+    if ($combined -match '(?m)^\s*type:\s*(NodePort|LoadBalancer)\s*$' -or $combined -match '(?m)^\s*image:\s*\S+:latest\s*$') {
+        throw (New-EwspKubernetesException 'Manifest set contains a public Service type or latest image tag.' 'KUBERNETES_MANIFEST_INVALID' 'Manifest set' 'Validate local-only service and image policy')
+    }
+    foreach ($name in @('postgres', 'redis', 'minio', 'backend', 'dashboard')) {
+        $serviceFile = @($files | Where-Object { $_ -like "*\$name\service.yaml" })
+        $workloadFile = @($files | Where-Object { $_ -like "*\$name\deployment.yaml" -or $_ -like "*\$name\statefulset.yaml" -or $_ -like "*\${name}-deployment.yaml" })
+        if (-not $serviceFile.Count -or -not $workloadFile.Count) {
+            throw (New-EwspKubernetesException "Service/workload pair is incomplete for $name." 'KUBERNETES_MANIFEST_INVALID' $name 'Validate Service and workload inventory')
+        }
+        $serviceText = [IO.File]::ReadAllText($serviceFile[0])
+        $workloadText = [IO.File]::ReadAllText($workloadFile[0])
+        $escapedName = [regex]::Escape($name)
+        $serviceSelector = "(?ms)^  selector:\s*\r?\n    app\.kubernetes\.io/name: $escapedName\s*\r?\n    app\.kubernetes\.io/part-of: ewsp\s*$"
+        $workloadSelector = "(?ms)^  selector:\s*\r?\n    matchLabels:\s*\r?\n      app\.kubernetes\.io/name: $escapedName\s*\r?\n      app\.kubernetes\.io/part-of: ewsp\s*$"
+        if ($serviceText -notmatch $serviceSelector -or $workloadText -notmatch $workloadSelector) {
+            throw (New-EwspKubernetesException "Service selector does not match the $name workload identity." 'KUBERNETES_MANIFEST_INVALID' $name 'Validate Service selectors')
+        }
+    }
+    $arguments = @('apply', '--dry-run=client', '--validate=true')
+    foreach ($file in $files) { $arguments += @('-f', $file) }
+    $result = Invoke-EwspKubectl $arguments $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        $reason = Protect-EwspDiagnosticText ($result.Output -join ' ')
+        throw (New-EwspKubernetesException "Strict client manifest validation failed: $reason" 'KUBERNETES_MANIFEST_INVALID' 'Manifest set' 'kubectl apply --dry-run=client --validate=true')
+    }
+    $true
+}
+
+function Invoke-EwspKubernetesApplyStages {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ApplyPlan,
+        [Parameter(Mandatory = $true)][ValidateSet('Infrastructure', 'Application')][string]$Scope
+    )
+    foreach ($stage in @($ApplyPlan | Where-Object Scope -eq $Scope)) {
+        Write-Host "      $($stage.Stage.ToLowerInvariant())"
+        foreach ($file in $stage.Files) {
+            try {
+                Invoke-EwspKubectlStreaming @('apply', '-f', $file) "Kubernetes apply failed for $($stage.Stage)"
+            } catch {
+                $_.Exception.Data['Category'] = 'KUBERNETES_APPLY_FAILURE'
+                $_.Exception.Data['Component'] = $stage.Stage.ToLowerInvariant()
+                throw
+            }
+        }
+    }
+}
+
+function Get-EwspKubernetesWorkloadDefinitions {
+    @(
+        [PSCustomObject]@{ Name = 'postgres'; DisplayName = 'PostgreSQL'; ControllerType = 'statefulset'; ControllerKind = 'StatefulSet' },
+        [PSCustomObject]@{ Name = 'redis'; DisplayName = 'Redis'; ControllerType = 'deployment'; ControllerKind = 'Deployment' },
+        [PSCustomObject]@{ Name = 'minio'; DisplayName = 'MinIO'; ControllerType = 'statefulset'; ControllerKind = 'StatefulSet' },
+        [PSCustomObject]@{ Name = 'backend'; DisplayName = 'Backend'; ControllerType = 'deployment'; ControllerKind = 'Deployment' },
+        [PSCustomObject]@{ Name = 'dashboard'; DisplayName = 'Dashboard'; ControllerType = 'deployment'; ControllerKind = 'Deployment' }
+    )
+}
+
+function Get-EwspKubernetesPodReason {
+    param($Pod)
+    if (-not $Pod) { return 'Missing' }
+    $containerStatuses = if ($Pod.status.PSObject.Properties['containerStatuses']) { @($Pod.status.containerStatuses) } else { @() }
+    foreach ($status in $containerStatuses) {
+        $state = if ($status.PSObject.Properties['state']) { $status.state } else { $null }
+        $lastState = if ($status.PSObject.Properties['lastState']) { $status.lastState } else { $null }
+        $waiting = if ($state -and $state.PSObject.Properties['waiting']) { $state.waiting } else { $null }
+        $terminated = if ($state -and $state.PSObject.Properties['terminated']) { $state.terminated } else { $null }
+        $lastTerminated = if ($lastState -and $lastState.PSObject.Properties['terminated']) { $lastState.terminated } else { $null }
+        if ($waiting -and $waiting.reason) { return [string]$waiting.reason }
+        if ($terminated -and $terminated.reason) { return [string]$terminated.reason }
+        if ($lastTerminated -and $lastTerminated.reason -eq 'OOMKilled') { return 'OOMKilled' }
+    }
+    $conditions = if ($Pod.status.PSObject.Properties['conditions']) { @($Pod.status.conditions) } else { @() }
+    $scheduled = @($conditions | Where-Object type -eq 'PodScheduled')
+    if ($scheduled.Count -and $scheduled[0].status -eq 'False') {
+        return "$(if ($scheduled[0].reason) { $scheduled[0].reason } else { 'Unschedulable' }): $($scheduled[0].message)".Trim()
+    }
+    if ($Pod.status.PSObject.Properties['phase'] -and $Pod.status.phase) { return [string]$Pod.status.phase }
+    'Unknown'
+}
+
+function Get-EwspKubernetesWorkloadSnapshot {
+    param([scriptblock]$CommandRunner)
+    $snapshots = @()
+    foreach ($definition in Get-EwspKubernetesWorkloadDefinitions) {
+        $controllerResult = Invoke-EwspKubectl @('get', $definition.ControllerType, $definition.Name, '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+        $controller = $null
+        if ($controllerResult.ExitCode -eq 0) {
+            try { $controller = ($controllerResult.Output -join "`n") | ConvertFrom-Json } catch { }
+        }
+        $podResult = Invoke-EwspKubectl @('get', 'pods', '-n', $script:EwspKubernetesNamespace, '-l', "app.kubernetes.io/name=$($definition.Name)", '-o', 'json') $CommandRunner
+        $pod = $null
+        if ($podResult.ExitCode -eq 0) {
+            try {
+                $podList = ($podResult.Output -join "`n") | ConvertFrom-Json
+                $pods = @($podList.items | Sort-Object { $_.metadata.creationTimestamp } -Descending | Select-Object -First 1)
+                if ($pods.Count) { $pod = $pods[0] }
+            } catch { }
+        }
+        $containers = @()
+        if ($pod -and $pod.spec.PSObject.Properties['containers']) { $containers = @($pod.spec.containers) }
+        $statuses = @()
+        if ($pod -and $pod.status.PSObject.Properties['containerStatuses']) { $statuses = @($pod.status.containerStatuses) }
+        $container = if ($containers.Count) { $containers[0] } else { $null }
+        $containerStatus = if ($statuses.Count) { $statuses[0] } else { $null }
+        $desired = if ($controller) { [int]$controller.spec.replicas } else { 0 }
+        $readyReplicas = if ($controller -and $controller.status.PSObject.Properties['readyReplicas']) { [int]$controller.status.readyReplicas } else { 0 }
+        $snapshots += [PSCustomObject]@{
+            Name = $definition.Name
+            DisplayName = $definition.DisplayName
+            ControllerType = $definition.ControllerKind
+            ControllerExists = $null -ne $controller
+            Desired = $desired
+            ReadyReplicas = $readyReplicas
+            Ready = [bool]($controller -and $desired -eq 1 -and $readyReplicas -eq 1 -and $containerStatus -and $containerStatus.ready)
+            PodName = if ($pod) { $pod.metadata.name } else { $null }
+            PodPhase = if ($pod -and $pod.status.PSObject.Properties['phase']) { $pod.status.phase } elseif ($pod) { 'Unknown' } else { 'Missing' }
+            Restarts = if ($containerStatus -and $containerStatus.PSObject.Properties['restartCount']) { [int]$containerStatus.restartCount } else { 0 }
+            Reason = Get-EwspKubernetesPodReason $pod
+            Image = if ($container) { $container.image } elseif ($controller) { $controller.spec.template.spec.containers[0].image } else { $null }
+            ImageId = if ($containerStatus -and $containerStatus.PSObject.Properties['imageID']) { $containerStatus.imageID } else { $null }
+        }
+    }
+    $snapshots
+}
+
+function Get-EwspKubernetesPvcSnapshot {
+    param([scriptblock]$CommandRunner)
+    $result = Invoke-EwspKubectl @('get', 'pvc', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    if ($result.ExitCode -ne 0) { return @() }
+    try {
+        $object = ($result.Output -join "`n") | ConvertFrom-Json
+        @($object.items | ForEach-Object {
+            [PSCustomObject]@{
+                Name = $_.metadata.name
+                Status = $_.status.phase
+                Capacity = if ($_.status.PSObject.Properties['capacity']) { $_.status.capacity.storage } else { '<pending>' }
+                StorageClass = $_.spec.storageClassName
+                Volume = $_.spec.volumeName
+            }
+        })
+    } catch { @() }
+}
+
+function Get-EwspKubernetesServiceSnapshot {
+    param([scriptblock]$CommandRunner)
+    $result = Invoke-EwspKubectl @('get', 'services', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    if ($result.ExitCode -ne 0) { return @() }
+    try {
+        $object = ($result.Output -join "`n") | ConvertFrom-Json
+        @($object.items | ForEach-Object {
+            [PSCustomObject]@{ Name = $_.metadata.name; Type = $_.spec.type; Ports = @($_.spec.ports.port) }
+        })
+    } catch { @() }
+}
+
+function Show-EwspKubernetesFailureDiagnostics {
+    param(
+        [hashtable]$EnvironmentValues,
+        [scriptblock]$CommandRunner
+    )
+    Write-Host ''
+    Write-Host 'Kubernetes diagnostics (bounded)' -ForegroundColor Yellow
+    $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+    foreach ($snapshot in $snapshots) {
+        if ($snapshot.Ready) { continue }
+        Write-Host ("  {0,-10} controller={1} desired={2} ready={3} pod={4} phase={5} restarts={6} reason={7} image={8}" -f `
+            $snapshot.Name, $(if ($snapshot.ControllerExists) { $snapshot.ControllerType } else { 'Missing' }), `
+            $snapshot.Desired, $snapshot.ReadyReplicas, $(if ($snapshot.PodName) { $snapshot.PodName } else { '<none>' }), `
+            $snapshot.PodPhase, $snapshot.Restarts, $snapshot.Reason, $(if ($snapshot.Image) { $snapshot.Image } else { '<none>' }))
+        if ($snapshot.PodName) {
+            $logs = Invoke-EwspKubectl @('logs', '-n', $script:EwspKubernetesNamespace, $snapshot.PodName, '--tail=40') $CommandRunner
+            if ($logs.ExitCode -eq 0 -and $logs.Output.Count) {
+                Write-Host '    recent logs:'
+                @($logs.Output | Select-Object -Last 40) | ForEach-Object {
+                    Write-Host "      $(Protect-EwspDiagnosticText ([string]$_) $EnvironmentValues)"
+                }
+            }
+            $events = Invoke-EwspKubectl @('get', 'events', '-n', $script:EwspKubernetesNamespace, '--field-selector', "involvedObject.name=$($snapshot.PodName)", '--sort-by=.lastTimestamp', '-o', 'custom-columns=TYPE:.type,REASON:.reason,MESSAGE:.message', '--no-headers') $CommandRunner
+            if ($events.ExitCode -eq 0 -and $events.Output.Count) {
+                Write-Host '    recent events:'
+                @($events.Output | Select-Object -Last 12) | ForEach-Object {
+                    Write-Host "      $(Protect-EwspDiagnosticText ([string]$_) $EnvironmentValues)"
+                }
+            }
+        }
+    }
+    foreach ($pvc in @(Get-EwspKubernetesPvcSnapshot $CommandRunner)) {
+        if ($pvc.Status -ne 'Bound') {
+            Write-Host "  PVC $($pvc.Name): status=$($pvc.Status) capacity=$($pvc.Capacity) storageClass=$($pvc.StorageClass)"
+        }
+    }
+}
+
+function Wait-EwspKubernetesWorkloads {
+    param(
+        [hashtable]$EnvironmentValues,
+        [scriptblock]$CommandRunner
+    )
+    $waits = @(
+        @{ Type = 'statefulset'; Name = 'postgres'; Timeout = '180s' },
+        @{ Type = 'deployment'; Name = 'redis'; Timeout = '120s' },
+        @{ Type = 'statefulset'; Name = 'minio'; Timeout = '180s' },
+        @{ Type = 'deployment'; Name = 'backend'; Timeout = '240s' },
+        @{ Type = 'deployment'; Name = 'dashboard'; Timeout = '120s' }
+    )
+    try {
+        foreach ($wait in $waits) {
+            $result = Invoke-EwspKubectl @('rollout', 'status', "$($wait.Type)/$($wait.Name)", '-n', $script:EwspKubernetesNamespace, "--timeout=$($wait.Timeout)") $CommandRunner
+            if ($result.ExitCode -ne 0) {
+                $reason = Protect-EwspDiagnosticText ($result.Output -join ' ') $EnvironmentValues
+                throw "Rollout failed for $($wait.Name): $reason"
+            }
+            Write-Host "      $($wait.Name) Ready"
+        }
+        foreach ($claim in @('postgres-data-postgres-0', 'minio-data-minio-0')) {
+            $result = Invoke-EwspKubectl @('wait', '-n', $script:EwspKubernetesNamespace, '--for=jsonpath={.status.phase}=Bound', "pvc/$claim", '--timeout=120s') $CommandRunner
+            if ($result.ExitCode -ne 0) { throw "PVC did not become Bound: $claim" }
+            Write-Host "      $claim Bound"
+        }
+        $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+        $notReady = @($snapshots | Where-Object { -not $_.Ready })
+        if ($notReady.Count) { throw "Workloads remained non-ready: $(@($notReady.Name) -join ', ')" }
+    } catch {
+        Show-EwspKubernetesFailureDiagnostics $EnvironmentValues $CommandRunner
+        $exception = New-EwspKubernetesException $_.Exception.Message 'KUBERNETES_READINESS_FAILURE' 'EWSP workloads' 'Wait for Kubernetes rollouts and PVC binding'
+        throw $exception
+    }
+    Get-EwspKubernetesWorkloadSnapshot $CommandRunner
+}
+
+function Wait-EwspKubernetesInfrastructure {
+    param(
+        [hashtable]$EnvironmentValues,
+        [scriptblock]$CommandRunner
+    )
+    try {
+        foreach ($target in @('statefulset/postgres', 'deployment/redis', 'statefulset/minio')) {
+            $result = Invoke-EwspKubectl @('rollout', 'status', $target, '-n', $script:EwspKubernetesNamespace, '--timeout=180s') $CommandRunner
+            if ($result.ExitCode -ne 0) { throw "Infrastructure rollout failed for $target." }
+        }
+        foreach ($claim in @('postgres-data-postgres-0', 'minio-data-minio-0')) {
+            $result = Invoke-EwspKubectl @('wait', '-n', $script:EwspKubernetesNamespace, '--for=jsonpath={.status.phase}=Bound', "pvc/$claim", '--timeout=120s') $CommandRunner
+            if ($result.ExitCode -ne 0) { throw "PVC did not become Bound: $claim" }
+        }
+        Write-Host '      PostgreSQL, Redis, MinIO, and persistent claims are Ready'
+    } catch {
+        Show-EwspKubernetesFailureDiagnostics $EnvironmentValues $CommandRunner
+        throw (New-EwspKubernetesException $_.Exception.Message 'KUBERNETES_READINESS_FAILURE' 'Kubernetes infrastructure' 'Wait for infrastructure rollouts and PVC binding')
+    }
+    $true
+}
+
+function Assert-EwspKubernetesCommandResult {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][string]$Check,
+        [string]$ExpectedText
+    )
+    $output = ($Result.Output -join "`n").Trim()
+    if ($Result.ExitCode -ne 0 -or ($ExpectedText -and -not $output.Contains($ExpectedText))) {
+        throw (New-EwspKubernetesException "Kubernetes verification failed for $Check." 'KUBERNETES_VERIFICATION_FAILURE' $Check $Check)
+    }
+    $output
+}
+
+function Assert-EwspKubernetesFunctionality {
+    param([scriptblock]$CommandRunner)
+    $postgres = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'sh', '-c', 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"') $CommandRunner
+    Assert-EwspKubernetesCommandResult $postgres 'PostgreSQL pg_isready' 'accepting connections' | Out-Null
+    $redisSnapshot = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner | Where-Object Name -eq 'redis')[0]
+    $redis = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, $redisSnapshot.PodName, '--', 'redis-cli', 'ping') $CommandRunner
+    Assert-EwspKubernetesCommandResult $redis 'Redis PING' 'PONG' | Out-Null
+    foreach ($path in @('/minio/health/live', '/minio/health/ready')) {
+        $minio = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'minio-0', '--', 'curl', '-fsS', '-o', '/dev/null', '-w', '%{http_code}', "http://localhost:9000$path") $CommandRunner
+        Assert-EwspKubernetesCommandResult $minio "MinIO $path" '200' | Out-Null
+    }
+    $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+    $backendPod = @($snapshots | Where-Object Name -eq 'backend')[0].PodName
+    $dashboardPod = @($snapshots | Where-Object Name -eq 'dashboard')[0].PodName
+    $dns = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, $backendPod, '--', 'getent', 'hosts', 'postgres', 'redis', 'minio', 'backend') $CommandRunner
+    Assert-EwspKubernetesCommandResult $dns 'Kubernetes DNS contracts' 'postgres.ewsp.svc.cluster.local' | Out-Null
+    foreach ($check in @(
+        @{ Name = 'Backend health'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $backendPod, '--', 'curl', '-fsS', 'http://backend:8080/api/health'); Expected = 'UP' },
+        @{ Name = 'Dashboard root'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $dashboardPod, '--', 'wget', '-q', '-O', '/dev/null', 'http://dashboard/'); Expected = $null },
+        @{ Name = 'Dashboard backend proxy'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $dashboardPod, '--', 'wget', '-q', '-O', '-', 'http://dashboard/api/health'); Expected = 'UP' }
+    )) {
+        $result = Invoke-EwspKubectl $check.Args $CommandRunner
+        Assert-EwspKubernetesCommandResult $result $check.Name $check.Expected | Out-Null
+        Write-Host "      $($check.Name) passed"
+    }
+    Write-Host '      PostgreSQL, Redis, MinIO, and Kubernetes DNS checks passed'
+    $true
+}
+
+function Resolve-EwspKubernetesPortForwardAction {
+    param(
+        [bool]$ManagedProcessActive,
+        [bool]$ManagedProbeHealthy,
+        [bool]$PortOccupied
+    )
+    if ($ManagedProcessActive -and $ManagedProbeHealthy) { return 'REUSE' }
+    if ($PortOccupied -and -not $ManagedProcessActive) { return 'CONFLICT' }
+    'START'
+}
+
+function Test-EwspKubernetesDashboardEndpoint {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [string]$Path = '/'
+    )
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$Port$Path" -TimeoutSec 3
+        [PSCustomObject]@{ Success = [int]$response.StatusCode -eq 200; StatusCode = [int]$response.StatusCode; Content = [string]$response.Content }
+    } catch {
+        $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        [PSCustomObject]@{ Success = $false; StatusCode = $status; Content = '' }
+    }
+}
+
+function Test-EwspKubernetesWebSocketUpgrade {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $socket = New-Object System.Net.WebSockets.ClientWebSocket
+    $cancellation = New-Object System.Threading.CancellationTokenSource
+    $cancellation.CancelAfter([TimeSpan]::FromSeconds(5))
+    try {
+        $socket.ConnectAsync([Uri]"ws://localhost:$Port/ws", $cancellation.Token).GetAwaiter().GetResult()
+        $connected = $socket.State -eq [System.Net.WebSockets.WebSocketState]::Open
+        if ($connected) {
+            $socket.CloseOutputAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'EWSP verification', [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+        }
+        $connected
+    } catch { $false } finally {
+        $socket.Dispose()
+        $cancellation.Dispose()
+    }
+}
+
+function Get-EwspManagedKubernetesPortForward {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [scriptblock]$ProcessProvider,
+        [scriptblock]$Probe
+    )
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    if (-not (Test-Path -LiteralPath $paths.PortForwardState -PathType Leaf)) {
+        return [PSCustomObject]@{ Active = $false; Healthy = $false; Process = $null; State = $null; Url = $null }
+    }
+    try { $state = Get-Content -Raw -LiteralPath $paths.PortForwardState | ConvertFrom-Json } catch {
+        return [PSCustomObject]@{ Active = $false; Healthy = $false; Process = $null; State = $null; Url = $null }
+    }
+    if (-not $ProcessProvider) {
+        $ProcessProvider = { param($id) Get-Process -Id $id -ErrorAction SilentlyContinue }
+    }
+    $process = & $ProcessProvider ([int]$state.ProcessId)
+    $active = $false
+    if ($process) {
+        try {
+            $active = $process.ProcessName -eq 'kubectl' -and
+                [string]$process.StartTime.ToUniversalTime().Ticks -eq [string]$state.StartTimeUtcTicks -and
+                $state.Namespace -eq $script:EwspKubernetesNamespace -and $state.Service -eq 'dashboard'
+        } catch { $active = $false }
+    }
+    $healthy = $false
+    if ($active) {
+        if ($Probe) { $healthy = [bool](& $Probe ([int]$state.LocalPort)) }
+        else { $healthy = (Test-EwspKubernetesDashboardEndpoint ([int]$state.LocalPort)).Success }
+    }
+    [PSCustomObject]@{
+        Active = $active; Healthy = $healthy; Process = $process; State = $state
+        Url = if ($active) { "http://localhost:$($state.LocalPort)" } else { $null }
+    }
+}
+
+function Assert-EwspKubernetesAccessPortAvailable {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+    $managed = Get-EwspManagedKubernetesPortForward $LocalRoot
+    $occupied = @(Get-EwspOccupiedTcpPorts) -contains $Port
+    $action = Resolve-EwspKubernetesPortForwardAction $managed.Active $managed.Healthy $occupied
+    if ($action -eq 'CONFLICT') {
+        throw (New-EwspKubernetesException "Dashboard port $Port is occupied by a process not managed by EWSP Kubernetes orchestration. It was not stopped." 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "Listen on localhost:$Port")
+    }
+    $action
+}
+
+function Stop-EwspKubernetesPortForward {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [switch]$Quiet
+    )
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $managed = Get-EwspManagedKubernetesPortForward $LocalRoot
+    if ($managed.Active) {
+        Stop-Process -Id $managed.Process.Id -ErrorAction Stop
+        $managed.Process.WaitForExit(5000) | Out-Null
+        if (-not $Quiet) { Write-Host "Stopped EWSP-managed dashboard port-forward (PID $($managed.Process.Id))." }
+    } elseif (-not $Quiet) {
+        Write-Host 'No active EWSP-managed dashboard port-forward.'
+    }
+    if (Test-Path -LiteralPath $paths.PortForwardState) { Remove-Item -LiteralPath $paths.PortForwardState -Force }
+    $managed.Active
+}
+
+function Start-EwspKubernetesPortForward {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $managed = Get-EwspManagedKubernetesPortForward $LocalRoot
+    $occupied = @(Get-EwspOccupiedTcpPorts) -contains $Port
+    $action = Resolve-EwspKubernetesPortForwardAction $managed.Active $managed.Healthy $occupied
+    if ($action -eq 'REUSE') {
+        Write-Host "      reused managed dashboard port-forward (PID $($managed.Process.Id))"
+        return $managed
+    }
+    if ($action -eq 'CONFLICT') {
+        throw (New-EwspKubernetesException "Dashboard port $Port is occupied by a process not managed by EWSP Kubernetes orchestration. It was not stopped." 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "kubectl port-forward service/dashboard $Port`:80")
+    }
+    if ($managed.Active) { Stop-EwspKubernetesPortForward $LocalRoot -Quiet | Out-Null }
+    New-Item -ItemType Directory -Path $paths.TemporaryRoot -Force | Out-Null
+    foreach ($log in @($paths.PortForwardOutput, $paths.PortForwardError)) {
+        $safeLog = Assert-EwspSafeTemporaryPath $LocalRoot $log
+        if (Test-Path -LiteralPath $safeLog) { Remove-Item -LiteralPath $safeLog -Force }
+    }
+    $kubectl = Get-Command kubectl -ErrorAction Stop
+    $arguments = @('port-forward', '-n', $script:EwspKubernetesNamespace, 'service/dashboard', "$Port`:80")
+    $startArguments = @{
+        FilePath = $kubectl.Source; ArgumentList = $arguments; PassThru = $true
+        RedirectStandardOutput = $paths.PortForwardOutput; RedirectStandardError = $paths.PortForwardError
+    }
+    if ((Get-EwspHostPlatform).Name -eq 'Windows') { $startArguments.WindowStyle = 'Hidden' }
+    $process = Start-Process @startArguments
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $healthy = $false
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($process.HasExited) { break }
+        $probe = Test-EwspKubernetesDashboardEndpoint $Port
+        if ($probe.Success) { $healthy = $true; break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $healthy) {
+        if (-not $process.HasExited) { Stop-Process -Id $process.Id -ErrorAction SilentlyContinue }
+        $reason = if (Test-Path -LiteralPath $paths.PortForwardError) {
+            Protect-EwspDiagnosticText ((Get-Content -LiteralPath $paths.PortForwardError -Tail 20) -join ' ')
+        } else { 'dashboard endpoint did not become reachable' }
+        throw (New-EwspKubernetesException "Managed dashboard port-forward failed: $reason" 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "kubectl port-forward service/dashboard $Port`:80")
+    }
+    $state = [ordered]@{
+        ProcessId = $process.Id
+        StartTimeUtcTicks = [string]$process.StartTime.ToUniversalTime().Ticks
+        Namespace = $script:EwspKubernetesNamespace
+        Service = 'dashboard'
+        LocalPort = $Port
+        RemotePort = 80
+        StartedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    [IO.File]::WriteAllText($paths.PortForwardState, ($state | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    Write-Host "      started managed dashboard port-forward (PID $($process.Id))"
+    Get-EwspManagedKubernetesPortForward $LocalRoot
+}
+
+function Assert-EwspKubernetesDashboardAccess {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $root = Test-EwspKubernetesDashboardEndpoint $Port '/'
+    $route = Test-EwspKubernetesDashboardEndpoint $Port '/complaints'
+    $api = Test-EwspKubernetesDashboardEndpoint $Port '/api/health'
+    $missing = Test-EwspKubernetesDashboardEndpoint $Port '/assets/ewsp-missing-verification.js'
+    $webSocket = Test-EwspKubernetesWebSocketUpgrade $Port
+    if (-not $root.Success -or -not $route.Success -or $root.Content -cne $route.Content -or
+        -not $api.Success -or $api.Content -notmatch 'UP' -or $missing.StatusCode -ne 404 -or -not $webSocket) {
+        throw (New-EwspKubernetesException 'Dashboard port-forward verification failed for the SPA, missing asset, backend proxy, or WebSocket upgrade.' 'KUBERNETES_VERIFICATION_FAILURE' 'Dashboard access' "http://localhost:$Port")
+    }
+    Write-Host '      dashboard / and /complaints: HTTP 200 (same SPA shell)'
+    Write-Host '      dashboard missing asset: HTTP 404'
+    Write-Host '      dashboard /api/health: HTTP 200'
+    Write-Host '      dashboard /ws: WebSocket upgraded'
+    $true
+}
+
+function Get-EwspRunningKubernetesImage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Deployment,
+        [scriptblock]$CommandRunner
+    )
+    $result = Invoke-EwspKubectl @('get', 'deployment', $Deployment, '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    if ($result.ExitCode -ne 0) { return $null }
+    try { (($result.Output -join "`n") | ConvertFrom-Json).spec.template.spec.containers[0].image } catch { $null }
+}
+
+function Show-EwspKubernetesStatusSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)]$EnvironmentInfo,
+        [scriptblock]$CommandRunner
+    )
+    $kubernetes = $EnvironmentInfo.Kubernetes
+    Write-Host 'Environment'
+    Write-Host '-----------'
+    Write-Host "Context: $($kubernetes.Context)"
+    Write-Host "Server:  $($kubernetes.ServerVersion)"
+    foreach ($node in $kubernetes.Nodes) { Write-Host "Node:    $($node.Name) $(if ($node.Ready) { 'Ready' } else { 'NotReady' })" }
+    Write-Host ''
+    Write-Host 'Applications'
+    Write-Host '------------'
+    $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+    foreach ($snapshot in $snapshots) {
+        $state = if (-not $snapshot.ControllerExists) { 'Missing' } elseif ($snapshot.Desired -eq 0) { 'Stopped' } elseif ($snapshot.Ready) { 'Ready' } else { $snapshot.Reason }
+        Write-Host ("{0,-10} {1,-11} {2,-18} ready={3}/{4} restarts={5} image={6}" -f `
+            $snapshot.Name, $snapshot.ControllerType, $(if ($snapshot.PodName) { $snapshot.PodName } else { '<none>' }), `
+            $snapshot.ReadyReplicas, $snapshot.Desired, $snapshot.Restarts, $(if ($snapshot.Image) { $snapshot.Image } else { '<none>' }))
+        if ($state -notin @('Ready', 'Stopped')) { Write-Host "             state=$state" -ForegroundColor Yellow }
+    }
+    Write-Host ''
+    Write-Host 'Storage'
+    Write-Host '-------'
+    $pvcs = @(Get-EwspKubernetesPvcSnapshot $CommandRunner)
+    foreach ($name in @('postgres-data-postgres-0', 'minio-data-minio-0')) {
+        $pvc = @($pvcs | Where-Object Name -eq $name)
+        if ($pvc.Count) { Write-Host ("{0,-28} {1,-8} {2}" -f $name, $pvc[0].Status, $pvc[0].Capacity) }
+        else { Write-Host ("{0,-28} Missing" -f $name) -ForegroundColor Yellow }
+    }
+    Write-Host ''
+    Write-Host 'Services'
+    Write-Host '--------'
+    $services = @(Get-EwspKubernetesServiceSnapshot $CommandRunner)
+    foreach ($name in @('postgres', 'redis', 'minio', 'backend', 'dashboard')) {
+        $service = @($services | Where-Object Name -eq $name)
+        if ($service.Count) { Write-Host ("{0,-10} {1,-10} ports={2}" -f $name, $service[0].Type, (@($service[0].Ports) -join ',')) }
+        else { Write-Host ("{0,-10} Missing" -f $name) -ForegroundColor Yellow }
+    }
+    Write-Host ''
+    Write-Host 'Access'
+    Write-Host '------'
+    $forward = Get-EwspManagedKubernetesPortForward $LocalRoot
+    if ($forward.Active -and $forward.Healthy) { Write-Host "Dashboard: active $($forward.Url) (PID $($forward.Process.Id))" }
+    elseif ($forward.Active) { Write-Host "Dashboard: managed process active but endpoint unhealthy (PID $($forward.Process.Id))" -ForegroundColor Yellow }
+    else { Write-Host 'Dashboard: inactive' }
+    [PSCustomObject]@{ Workloads = $snapshots; Pvcs = $pvcs; Services = $services; PortForward = $forward }
+}
+
+function Invoke-EwspKubernetesStatus {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $environment = Get-EwspKubernetesEnvironment
+    Assert-EwspKubernetesEnvironment $environment -RequireDocker | Out-Null
+    Show-EwspKubernetesStatusSnapshot $LocalRoot $environment | Out-Null
+}
+
+function Wait-EwspKubernetesPodsStopped {
+    param(
+        [int]$TimeoutSeconds = 120,
+        [scriptblock]$CommandRunner,
+        [scriptblock]$SleepAction
+    )
+    if (-not $SleepAction) { $SleepAction = { Start-Sleep -Milliseconds 500 } }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $result = Invoke-EwspKubectl @('get', 'pods', '-n', $script:EwspKubernetesNamespace, '-l', 'app.kubernetes.io/part-of=ewsp', '-o', 'json') $CommandRunner
+        if ($result.ExitCode -ne 0) { throw 'Unable to inspect EWSP Pods while stopping workloads.' }
+        try {
+            $podList = (($result.Output -join "`n") | ConvertFrom-Json)
+            $count = @($podList.items).Count
+        } catch { $count = -1 }
+        if ($count -eq 0) { return $true }
+        & $SleepAction
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for EWSP Pods to stop; $count Pod(s) remain."
+}
+
+function Invoke-EwspKubernetesStop {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $environment = Get-EwspKubernetesEnvironment
+    Assert-EwspKubernetesEnvironment $environment -RequireDocker | Out-Null
+    Stop-EwspKubernetesPortForward $LocalRoot | Out-Null
+    foreach ($target in @(
+        @{ Type = 'deployment'; Names = @('dashboard', 'backend', 'redis') },
+        @{ Type = 'statefulset'; Names = @('minio', 'postgres') }
+    )) {
+        foreach ($name in $target.Names) {
+            $result = Invoke-EwspKubectl @('get', $target.Type, $name, '-n', $script:EwspKubernetesNamespace, '-o', 'name')
+            if ($result.ExitCode -eq 0) {
+                Invoke-EwspKubectlStreaming @('scale', $target.Type, $name, '-n', $script:EwspKubernetesNamespace, '--replicas=0') "Failed to stop Kubernetes workload $name"
+            }
+        }
+    }
+    Wait-EwspKubernetesPodsStopped | Out-Null
+    $pvcs = @(Get-EwspKubernetesPvcSnapshot)
+    Write-Host 'EWSP Kubernetes workloads stopped. Services, configuration, Secret, and PVCs were preserved.' -ForegroundColor Green
+    foreach ($pvc in $pvcs) { Write-Host "  PVC $($pvc.Name): $($pvc.Status) $($pvc.Capacity)" }
+}
+
+function Invoke-EwspKubernetesUp {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $phaseNames = @(
+        'K8S_ENVIRONMENT', 'REPOSITORY_STATE', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION',
+        'MANIFEST_VALIDATION', 'INFRASTRUCTURE_APPLY', 'APPLICATION_APPLY', 'READINESS_WAIT',
+        'FINAL_VERIFICATION', 'ACCESS_SETUP'
+    )
+    $completed = New-Object System.Collections.Generic.List[string]
+    $context = @{
+        Environment = $null; Configuration = $null; EnvironmentValues = $null; Ports = $null
+        ImagePlan = $null; PreviousTagEnvironment = $null; SecretPath = $null; Rendered = $null
+        ApplyPlan = $null; States = $null; PortForward = $null; DashboardPort = $null
+        OldBackendImage = $null; OldDashboardImage = $null
+    }
+    $total = $phaseNames.Count
+
+    Invoke-EwspUpPhase 1 $total $phaseNames[0] 'Detecting Kubernetes environment' {
+        $runtime = Get-EwspRuntimeEnvironment
+        Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $runtime | Out-Null
+        $context.Environment = Get-EwspKubernetesEnvironment -RuntimeEnvironment $runtime
+        Assert-EwspKubernetesEnvironment $context.Environment -RequireDocker | Out-Null
+        Show-EwspKubernetesEnvironment $context.Environment
+    } $completed $phaseNames[1..($total - 1)] $context.Environment 'Detect kubectl, Docker Desktop Kubernetes, nodes, namespace, and storage' 'Kubernetes environment' -WorkflowName 'k8s-up' | Out-Null
+
+    Invoke-EwspUpPhase 2 $total $phaseNames[1] 'Checking repository state' {
+        if (-not (Test-Path -LiteralPath (Join-Path $LocalRoot '.env') -PathType Leaf)) {
+            throw '.env is missing. Run .\ewsp.ps1 setup first; no Kubernetes resources were changed.'
+        }
+        $context.Configuration = Get-EwspConfiguration $LocalRoot
+        $context.EnvironmentValues = Get-EwspEffectiveEnvironmentValues $LocalRoot
+        $context.Ports = @(Assert-EwspEnvironmentConfiguration $context.EnvironmentValues)
+        foreach ($repository in @($context.Configuration.Repositories | Where-Object { $_.ContainsKey('Image') })) {
+            $path = Resolve-EwspRepositoryPath $LocalRoot $repository
+            $state = Get-EwspRepositoryState $path $repository.ExpectedIdentity $repository.PrimaryBranch
+            if ($state.Classification -eq 'MISSING' -or $state.Classification -eq 'IDENTITY_MISMATCH') {
+                throw "$($repository.Name) repository state is $($state.Classification). No files were changed."
+            }
+            Assert-EwspApplicationBuildAssets $path $repository
+            Write-Host ("      {0,-14} {1} {2}" -f $repository.Name, $state.ShortCommit, $(if ($state.Dirty) { 'dirty' } else { 'clean' }))
+        }
+    } $completed $phaseNames[2..($total - 1)] $context.Environment 'Validate sibling identities, source state, Docker assets, and .env' 'EWSP repositories' -WorkflowName 'k8s-up' | Out-Null
+
+    Invoke-EwspUpPhase 3 $total $phaseNames[2] 'Resolving and preparing application images' {
+        $context.ImagePlan = New-EwspImagePlan $LocalRoot $context.Configuration $context.EnvironmentValues
+        $tagEnvironment = @{}
+        foreach ($descriptor in $context.ImagePlan.Descriptors) {
+            if ($descriptor.Tag -match ':latest$') { throw "Resolved image must not use latest: $($descriptor.Tag)" }
+            $tagEnvironment[$descriptor.EnvironmentName] = $descriptor.Tag
+            Write-Host "      resolved $($descriptor.Service): $($descriptor.Tag)"
+        }
+        $context.PreviousTagEnvironment = Set-EwspProcessEnvironment $tagEnvironment
+        Invoke-EwspImageBuilds $LocalRoot $context.Environment $context.ImagePlan.Descriptors
+    } $completed $phaseNames[3..($total - 1)] $context.Environment 'Resolve, reuse, or build source-aware local images' 'Application images' -WorkflowName 'k8s-up' | Out-Null
+
+    try {
+        Invoke-EwspUpPhase 4 $total $phaseNames[3] 'Preparing local Kubernetes Secret' {
+            $context.SecretPath = New-EwspKubernetesSecretArtifact $LocalRoot $context.EnvironmentValues
+            Write-Host '      generated ignored local Secret artifact; values hidden'
+        } $completed $phaseNames[4..($total - 1)] $context.Environment 'Generate real local Secret from .env' 'Kubernetes Secret' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 5 $total $phaseNames[4] 'Rendering and validating manifests' {
+            $backendDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'backend')[0]
+            $dashboardDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'dashboard')[0]
+            $context.Rendered = New-EwspKubernetesRenderedManifests $LocalRoot $backendDescriptor.Tag $dashboardDescriptor.Tag
+            $context.ApplyPlan = @(Get-EwspKubernetesApplyPlan $LocalRoot $context.Rendered $context.SecretPath)
+            Assert-EwspKubernetesManifestSet $LocalRoot $context.ApplyPlan $backendDescriptor.Tag $dashboardDescriptor.Tag | Out-Null
+            $dashboardPort = @($context.Ports | Where-Object Service -eq 'dashboard')[0].Port
+            $context.DashboardPort = [int]$dashboardPort
+            Assert-EwspKubernetesAccessPortAvailable $LocalRoot $context.DashboardPort | Out-Null
+            Write-Host "      strict validation passed; rendered manifests: $($context.Rendered.Root)"
+        } $completed $phaseNames[5..($total - 1)] $context.Environment 'Render exact images and run strict client validation' 'Kubernetes manifests' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 6 $total $phaseNames[5] 'Reconciling Kubernetes infrastructure' {
+            Invoke-EwspKubernetesApplyStages $context.ApplyPlan 'Infrastructure'
+            Remove-EwspKubernetesSecretArtifact $LocalRoot
+            $context.SecretPath = $null
+            Wait-EwspKubernetesInfrastructure $context.EnvironmentValues | Out-Null
+        } $completed $phaseNames[6..($total - 1)] $context.Environment 'Apply namespace, ConfigMaps, Secret, PostgreSQL, Redis, and MinIO' 'Kubernetes infrastructure' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 7 $total $phaseNames[6] 'Reconciling Kubernetes applications' {
+            $context.OldBackendImage = Get-EwspRunningKubernetesImage 'backend'
+            $context.OldDashboardImage = Get-EwspRunningKubernetesImage 'dashboard'
+            Invoke-EwspKubernetesApplyStages $context.ApplyPlan 'Application'
+            foreach ($descriptor in $context.ImagePlan.Descriptors) {
+                $old = if ($descriptor.Service -eq 'backend') { $context.OldBackendImage } else { $context.OldDashboardImage }
+                if ($old -eq $descriptor.Tag) {
+                    Write-Host "      $($descriptor.Service): reuse/reconcile $($descriptor.Tag)" -ForegroundColor Green
+                } else {
+                    Write-Host "      $($descriptor.Service): old image=$(if ($old) { $old } else { '<none>' })"
+                    Write-Host "      $($descriptor.Service): new image=$($descriptor.Tag)" -ForegroundColor Green
+                }
+            }
+        } $completed $phaseNames[7..($total - 1)] $context.Environment 'Apply exact backend and dashboard images' 'Kubernetes applications' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 8 $total $phaseNames[7] 'Waiting for Kubernetes readiness' {
+            $context.States = @(Wait-EwspKubernetesWorkloads $context.EnvironmentValues)
+        } $completed $phaseNames[8..($total - 1)] $context.Environment 'Wait for five workloads and two PVCs' 'EWSP workloads' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 9 $total $phaseNames[8] 'Verifying Kubernetes functionality' {
+            Assert-EwspKubernetesFunctionality | Out-Null
+        } $completed @($phaseNames[9]) $context.Environment 'Verify infrastructure, DNS, backend, and dashboard inside Kubernetes' 'EWSP Kubernetes services' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 10 $total $phaseNames[9] 'Preparing dashboard access' {
+            $context.PortForward = Start-EwspKubernetesPortForward $LocalRoot $context.DashboardPort
+            Assert-EwspKubernetesDashboardAccess $context.DashboardPort | Out-Null
+        } $completed @() $context.Environment 'Start or reuse managed dashboard port-forward' 'Dashboard access' -WorkflowName 'k8s-up' | Out-Null
+    } finally {
+        if ($context.SecretPath) {
+            try { Remove-EwspKubernetesSecretArtifact $LocalRoot } catch {
+                Write-Warning 'Temporary Kubernetes Secret cleanup failed. Remove .tmp\k8s\secrets.local.json manually without displaying it.'
+            }
+        }
+        if ($context.PreviousTagEnvironment) { Restore-EwspProcessEnvironment $context.PreviousTagEnvironment }
+    }
+
+    Write-Host ''
+    Write-Host 'EWSP Kubernetes is ready.' -ForegroundColor Green
+    Write-Host "Dashboard: http://localhost:$($context.DashboardPort)"
+    Write-Host 'Next: .\ewsp.ps1 k8s-status | .\ewsp.ps1 k8s-stop'
+}
+
 function Invoke-EwspStop {
     param([Parameter(Mandatory = $true)][string]$LocalRoot, $EnvironmentInfo)
     $EnvironmentInfo = Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $EnvironmentInfo
@@ -1599,11 +2693,14 @@ EWSP local orchestration
 
 Usage:
   .\ewsp.ps1 up      Safely prepare/update the workspace, build, start, verify, and summarize EWSP.
+  .\ewsp.ps1 k8s-up  Reconcile EWSP on Docker Desktop Kubernetes and open dashboard access.
   .\ewsp.ps1 setup   Verify prerequisites, clone only missing repositories, and create .env if absent.
   .\ewsp.ps1 update  Fetch and safely fast-forward clean behind-only repositories.
   .\ewsp.ps1 start   Build only required application images and start the verified Docker stack.
   .\ewsp.ps1 stop    Stop containers without deleting PostgreSQL or MinIO data.
   .\ewsp.ps1 status  Show concise Git and Docker state.
+  .\ewsp.ps1 k8s-status  Show Kubernetes workloads, storage, services, images, and dashboard access.
+  .\ewsp.ps1 k8s-stop    Stop Kubernetes workloads and managed access while preserving PVC data.
   .\ewsp.ps1 help    Show this help.
 '@
 }
@@ -1616,11 +2713,14 @@ function Invoke-EwspCommand {
     )
     switch ($Command.ToLowerInvariant()) {
         'up'     { Invoke-EwspUp $LocalRoot }
+        'k8s-up' { Invoke-EwspKubernetesUp $LocalRoot }
         'setup'  { Invoke-EwspSetup $LocalRoot }
         'update' { Invoke-EwspUpdate $LocalRoot }
         'start'  { Invoke-EwspStart $LocalRoot }
         'stop'   { Invoke-EwspStop $LocalRoot }
         'status' { Invoke-EwspStatus $LocalRoot }
+        'k8s-status' { Invoke-EwspKubernetesStatus $LocalRoot }
+        'k8s-stop' { Invoke-EwspKubernetesStop $LocalRoot }
         'help'   { Show-EwspHelp }
         default  { throw "Unknown command '$Command'. Run .\ewsp.ps1 help for usage." }
     }
@@ -1645,5 +2745,24 @@ Export-ModuleMember -Function @(
     'Format-EwspServiceReadiness',
     'Wait-EwspServices',
     'Assert-EwspEndpoints',
-    'New-EwspUpFailureException'
+    'New-EwspUpFailureException',
+    'New-EwspKubernetesException',
+    'Get-EwspKubernetesEnvironment',
+    'Assert-EwspKubernetesEnvironment',
+    'New-EwspKubernetesSecretArtifact',
+    'Remove-EwspKubernetesSecretArtifact',
+    'New-EwspKubernetesRenderedManifests',
+    'Get-EwspKubernetesApplyPlan',
+    'Assert-EwspKubernetesManifestSet',
+    'Get-EwspKubernetesPodReason',
+    'Get-EwspKubernetesWorkloadSnapshot',
+    'Get-EwspKubernetesPvcSnapshot',
+    'Get-EwspKubernetesServiceSnapshot',
+    'Resolve-EwspKubernetesPortForwardAction',
+    'Get-EwspManagedKubernetesPortForward',
+    'Stop-EwspKubernetesPortForward',
+    'Wait-EwspKubernetesPodsStopped',
+    'Invoke-EwspKubernetesUp',
+    'Invoke-EwspKubernetesStatus',
+    'Invoke-EwspKubernetesStop'
 )
