@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: ewsp
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: ewsp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+      app.kubernetes.io/part-of: ewsp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: ewsp
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: backend
+          image: ewsp-backend:replace-with-ewsp-local-tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: backend-config
+          env:
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: POSTGRES_PASSWORD
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: MINIO_ROOT_USER
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: MINIO_ROOT_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: JWT_SECRET
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              scheme: HTTP
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
