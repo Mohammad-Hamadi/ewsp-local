@@ -193,6 +193,95 @@ The existing seed is idempotent and uses `ON CONFLICT DO NOTHING`, so rerunning 
 
 The guaranteed target is the PC-dependent, single-node Docker Desktop kind cluster (verified with Kubernetes v1.36.1). Do not run Compose and Kubernetes simultaneously when both would need dashboard host port 3000; neither workflow automatically stops the other.
 
+## Continuous deployment on EWSP-PC
+
+Application CI and local CD have deliberately separate ownership:
+
+```text
+backend/dashboard source -> CI verification -> private immutable GHCR SHA image
+                                               |
+                                               v
+                                      best-effort deploy signal
+                                               |
+                                               v
+GitHub -> EWSP-PC interactive runner -> ewsp-local deploy -> Docker Desktop Kubernetes
+```
+
+The backend and dashboard workflows publish both an immutable full-commit SHA
+tag and a convenience `main` tag. CD never deploys `main` or `latest`. Every
+`deploy` invocation queries the private GitHub Actions API for the newest
+completed, successful `push` run of `ci.yml` on `main`, uses its full
+`head_sha`, verifies that exact private GHCR tag, resolves its registry and
+Linux/AMD64 runtime digests, and only then compares it with Kubernetes.
+PRs, failed runs, arbitrary branch heads, malformed SHAs, and missing images
+are ineligible.
+
+Run the explicit host setup in the stable `ewsp-local` checkout:
+
+```powershell
+.\ewsp.ps1 deploy-configure
+# Add EWSP_ADMIN_PASSWORD directly to %USERPROFILE%\.ewsp\deployment.env.
+.\ewsp.ps1 runner-setup
+.\ewsp.ps1 runner-status
+.\ewsp.ps1 deploy
+.\ewsp.ps1 deploy-status
+```
+
+`deploy-configure` preserves the repository's ignored `.env` and copies only
+approved static setting names into `%USERPROFILE%\.ewsp\deployment.env`.
+That user/SYSTEM-only file is outside Git and every Actions checkout. It holds
+the private Actions-read token, GHCR pull credential, local admin smoke-test
+credential, dashboard port, and optional Cloudflare settings. Values are never
+printed or uploaded. The non-secret, recoverable
+`%USERPROFILE%\.ewsp\deployment-state.json` records the last desired/deployed
+SHAs, digests, timestamps, result, trigger, changed components, and PVC UIDs.
+GitHub and Kubernetes remain authoritative if this state file is deleted or
+malformed.
+
+`runner-setup` validates the already registered `EWSP-PC` runner under
+`C:\actions-runner`; it does not register a runner or use the removed Windows
+service. It creates two passwordless, current-user, run-only-when-logged-on
+Scheduled Tasks:
+
+- `EWSP GitHub Actions Runner` starts `C:\actions-runner\run.cmd` at logon,
+  uses `C:\actions-runner` as its working directory, ignores duplicate task
+  instances, and has bounded restart settings.
+- `EWSP Startup Reconciliation` starts two minutes after logon and runs the
+  stable checkout's bounded reconciliation script. It retries Docker Desktop,
+  Kubernetes, GitHub, or GHCR startup unavailability with finite backoff.
+
+Interactive logon is intentional because Docker Desktop belongs to that user
+session. Both tasks run as the current user without storing a Windows password.
+The runner and GitHub use outbound connections only; CD opens no inbound
+router or Kubernetes API port and does not require Cloudflare.
+
+`.github/workflows/deploy.yml` runs on `[self-hosted, Windows, X64]` for manual,
+application-signal, and twice-hourly catch-up events. A GitHub concurrency
+group prevents overlapping workflow mutations. The workflow always calls
+`.\ewsp.ps1 deploy` and resolves desired state at execution time, so stale
+events converge to the newest approved artifacts. A machine-local exclusive
+lock also prevents overlap with logon reconciliation.
+
+If the PC is offline briefly, GitHub may retain the queued job. Jobs queued for
+a self-hosted runner expire after GitHub's queue limit, so long-outage recovery
+does not depend on that event: the logon task and recurring workflow rediscover
+current approved artifacts. Temporary startup unavailability is reported as
+`DEPLOYMENT_DEFERRED`; a current cluster reports `ALREADY_CURRENT`; successful
+replacement reports `RECONCILIATION_SUCCEEDED`.
+
+Backend and dashboard remain single-replica `Recreate` Deployments. Short
+application downtime is accepted. Only changed application Deployments are
+updated; PostgreSQL, Redis, MinIO, Secrets, Services, and PVCs remain in place.
+Dashboard readiness failure restores its prior immutable image. Backend
+failure restores its prior image only when the before/after Flyway history
+fingerprint is unchanged. If Flyway advanced or cannot be verified, code
+rollback stops and database migrations are never reversed automatically.
+
+After reconciliation, ewsp-local verifies Ready Pods, exact refs, actual image
+ID digests, infrastructure/DNS health, `/`, `/complaints`, missing-asset 404,
+`/api/health`, WebSocket upgrade, authenticated local admin login, and unchanged
+PVC UIDs. Kubernetes never clones or builds application source during CD.
+
 ### Temporary/current $0 Cloudflare Quick Tunnel
 
 The current public demo/testing path remains free: `tunnel-quick` starts the

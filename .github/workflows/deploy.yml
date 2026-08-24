@@ -1,0 +1,29 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ewsp-docker-desktop-kubernetes
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile approved immutable artifacts
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out ewsp-local without persisted credentials
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Reconcile desired deployment state
+        shell: powershell
+        run: .\ewsp.ps1 deploy

@@ -149,6 +149,28 @@ does not reset passwords or overwrite any other existing user row in a
 preserved PostgreSQL PVC. Existing persisted users may therefore retain
 credentials or other values that differ from the current ignored seed file.
 
+## Continuous deployment reconciliation
+
+`.\ewsp.ps1 deploy` is the CD-specific application path. Unlike `k8s-up`, it
+does not take desired refs from repository `.env`. It reads protected static
+machine settings from `%USERPROFILE%\.ewsp\deployment.env`, discovers the
+newest successful `push/main` `ci.yml` run for each private application,
+verifies the exact full-SHA GHCR manifest and Linux/AMD64 runtime digest, and
+updates only an outdated or unhealthy application Deployment.
+
+The command retains the exact `docker-desktop` boundary and uses one
+machine-local exclusive lock shared by GitHub Actions and Windows logon
+reconciliation. Infrastructure controllers and PVCs are never reapplied or
+deleted by an ordinary application update. Both application Deployments remain
+one-replica `Recreate`; brief downtime is intentional. Success requires Ready
+Pods, exact refs and imageID digests, route/API/WebSocket checks, authenticated
+admin login, and unchanged PVC UIDs.
+
+`%USERPROFILE%\.ewsp\deployment-state.json` contains only recoverable,
+non-secret operational history and is never an approval source. See the main
+README and `.\ewsp.ps1 help workflow cd` for runner Scheduled Tasks, offline
+catch-up, concurrency, and rollback behavior.
+
 ## Persistence and coexistence
 
 Kubernetes PostgreSQL and MinIO PVCs are independent of the Compose named

@@ -4259,6 +4259,647 @@ function Invoke-EwspKubernetesUp {
     Write-Host 'Next: .\ewsp.ps1 k8s-status | .\ewsp.ps1 k8s-stop'
 }
 
+function Get-EwspDeploymentMachinePaths {
+    param([string]$UserProfile = $env:USERPROFILE)
+    if ([string]::IsNullOrWhiteSpace($UserProfile)) {
+        throw (New-EwspKubernetesException 'USERPROFILE is unavailable; the machine-local deployment configuration cannot be resolved.' 'DEPLOYMENT_CONFIG_MISSING' 'Deployment host configuration' 'Resolve USERPROFILE')
+    }
+    $root = [IO.Path]::GetFullPath((Join-Path $UserProfile '.ewsp'))
+    [PSCustomObject]@{
+        Root = $root
+        Configuration = Join-Path $root 'deployment.env'
+        State = Join-Path $root 'deployment-state.json'
+        StateTemporary = Join-Path $root 'deployment-state.json.tmp'
+        Lock = Join-Path $root 'deployment.lock'
+        RunnerRoot = 'C:\actions-runner'
+        RunnerTaskName = 'EWSP GitHub Actions Runner'
+        ReconcileTaskName = 'EWSP Startup Reconciliation'
+    }
+}
+
+function Read-EwspKeyValueFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $values = @{}
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmed = ([string]$line).Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+        $separator = $trimmed.IndexOf('=')
+        if ($separator -lt 1) { continue }
+        $key = $trimmed.Substring(0, $separator).Trim()
+        $value = $trimmed.Substring($separator + 1).Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        $values[$key] = $value
+    }
+    $values
+}
+
+function Assert-EwspDeploymentPathAcl {
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$SkipAcl)
+    if ($SkipAcl -or (Get-EwspHostPlatform).Name -ne 'Windows') { return $true }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $allowed = @($identity.ToLowerInvariant(), 'nt authority\system')
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $unsafe = @($acl.Access | Where-Object {
+            $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            $allowed -notcontains $_.IdentityReference.Value.ToLowerInvariant()
+        })
+        if ($unsafe.Count -gt 0) {
+            $names = @($unsafe | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            throw "unexpected allowed identities: $($names -join ', ')"
+        }
+    } catch {
+        throw (New-EwspKubernetesException "Machine-local deployment configuration ACL is not restricted to the current user and SYSTEM: $Path. Values were not read or printed." 'DEPLOYMENT_CONFIG_ACL_UNSAFE' 'Deployment host configuration' 'Inspect deployment.env ACL')
+    }
+    $true
+}
+
+function Get-EwspDeploymentConfiguration {
+    param(
+        [string]$UserProfile = $env:USERPROFILE,
+        [switch]$RequireGhcr,
+        [switch]$RequireAdminLogin,
+        [switch]$SkipAcl
+    )
+    $paths = Get-EwspDeploymentMachinePaths $UserProfile
+    if (-not (Test-Path -LiteralPath $paths.Configuration -PathType Leaf)) {
+        throw (New-EwspKubernetesException "Machine-local deployment configuration is missing: $($paths.Configuration). Run .\ewsp.ps1 deploy-configure explicitly." 'DEPLOYMENT_CONFIG_MISSING' 'Deployment host configuration' 'Read deployment.env')
+    }
+    Assert-EwspDeploymentPathAcl $paths.Configuration -SkipAcl:$SkipAcl | Out-Null
+    $values = Read-EwspKeyValueFile $paths.Configuration
+    $required = @('EWSP_GITHUB_READ_TOKEN')
+    if ($RequireGhcr) { $required += @('GHCR_USERNAME', 'GHCR_TOKEN') }
+    if ($RequireAdminLogin) { $required += @('EWSP_ADMIN_PASSWORD') }
+    $missing = @($required | Where-Object { -not $values.ContainsKey($_) -or [string]::IsNullOrWhiteSpace([string]$values[$_]) })
+    if ($missing.Count) {
+        throw (New-EwspKubernetesException "Machine-local deployment configuration is missing required setting names: $($missing -join ', '). Values were not printed." 'DEPLOYMENT_CONFIG_MISSING' 'Deployment host configuration' 'Validate deployment.env')
+    }
+    [PSCustomObject]@{
+        Path = $paths.Configuration
+        Values = $values
+        GitHubToken = [string]$values.EWSP_GITHUB_READ_TOKEN
+        GhcrUsername = if ($values.ContainsKey('GHCR_USERNAME')) { [string]$values.GHCR_USERNAME } else { '' }
+        GhcrToken = if ($values.ContainsKey('GHCR_TOKEN')) { [string]$values.GHCR_TOKEN } else { '' }
+        AdminEmail = if ($values.ContainsKey('EWSP_ADMIN_EMAIL') -and $values.EWSP_ADMIN_EMAIL) { ([string]$values.EWSP_ADMIN_EMAIL).Trim().ToLowerInvariant() } else { 'admin@ewsp.local' }
+        AdminPassword = if ($values.ContainsKey('EWSP_ADMIN_PASSWORD')) { [string]$values.EWSP_ADMIN_PASSWORD } else { '' }
+        DashboardPort = if ($values.ContainsKey('DASHBOARD_HOST_PORT') -and [string]$values.DASHBOARD_HOST_PORT -match '^\d+$') { [int]$values.DASHBOARD_HOST_PORT } else { 3000 }
+    }
+}
+
+function Protect-EwspDeploymentDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $existed = Test-Path -LiteralPath $Path -PathType Container
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    if ((Get-EwspHostPlatform).Name -eq 'Windows') {
+        if ($existed) {
+            try { Assert-EwspDeploymentPathAcl $Path | Out-Null; return $Path } catch { }
+        }
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $result = Invoke-EwspNative 'icacls' @($Path, '/inheritance:r', '/grant:r', "${identity}:(OI)(CI)(F)", 'NT AUTHORITY\SYSTEM:(OI)(CI)(F)')
+        if ($result.ExitCode -ne 0) { throw 'Unable to restrict the machine-local EWSP directory ACL.' }
+    }
+    $Path
+}
+
+function Invoke-EwspDeployConfigure {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $paths = Get-EwspDeploymentMachinePaths
+    Protect-EwspDeploymentDirectory $paths.Root | Out-Null
+    $target = @{}
+    if (Test-Path -LiteralPath $paths.Configuration -PathType Leaf) {
+        Assert-EwspDeploymentPathAcl $paths.Configuration | Out-Null
+        $target = Read-EwspKeyValueFile $paths.Configuration
+    }
+    $sourcePath = Join-Path $LocalRoot '.env'
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw 'The existing ignored .env is missing; no deployment settings were copied.'
+    }
+    $source = Read-EwspKeyValueFile $sourcePath
+    $copied = @()
+    foreach ($name in @('GHCR_USERNAME','GHCR_TOKEN','CLOUDFLARE_TUNNEL_ENABLED','CLOUDFLARE_TUNNEL_TOKEN','CLOUDFLARE_PUBLIC_HOSTNAME','DASHBOARD_HOST_PORT')) {
+        if ($source.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$source[$name])) {
+            $target[$name] = [string]$source[$name]
+            $copied += $name
+        }
+    }
+    $order = @('EWSP_GITHUB_READ_TOKEN','GHCR_USERNAME','GHCR_TOKEN','EWSP_ADMIN_EMAIL','EWSP_ADMIN_PASSWORD','DASHBOARD_HOST_PORT','CLOUDFLARE_TUNNEL_ENABLED','CLOUDFLARE_TUNNEL_TOKEN','CLOUDFLARE_PUBLIC_HOSTNAME')
+    $lines = @('# EWSP deployment-host configuration. Never commit, upload, or print this file.')
+    foreach ($name in $order) { if ($target.ContainsKey($name)) { $lines += "$name=$($target[$name])" } }
+    $temporary = "$($paths.Configuration).tmp"
+    try {
+        [IO.File]::WriteAllLines($temporary, $lines, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $paths.Configuration -Force
+        Assert-EwspDeploymentPathAcl $paths.Configuration | Out-Null
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+    }
+    Write-Host "Machine deployment configuration updated at $($paths.Configuration)."
+    Write-Host "Copied setting names from ignored .env: $($copied -join ', '). Values hidden. Source .env preserved."
+    if (-not $target.ContainsKey('EWSP_ADMIN_PASSWORD')) {
+        Write-Warning 'Add EWSP_ADMIN_PASSWORD directly to deployment.env before running deploy; do not place it in chat.'
+    }
+}
+
+function Enter-EwspDeploymentLock {
+    param([string]$UserProfile = $env:USERPROFILE)
+    $paths = Get-EwspDeploymentMachinePaths $UserProfile
+    Protect-EwspDeploymentDirectory $paths.Root | Out-Null
+    try {
+        $stream = [IO.File]::Open($paths.Lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $stream.SetLength(0)
+        $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false), 1024, $true)
+        $writer.Write("pid=$PID acquired=$([DateTime]::UtcNow.ToString('o'))")
+        $writer.Flush(); $writer.Dispose()
+        [PSCustomObject]@{ Path = $paths.Lock; Stream = $stream; Acquired = $true }
+    } catch [IO.IOException] {
+        throw (New-EwspKubernetesException 'Another EWSP deployment reconciliation already holds the machine-local deployment lock. This attempt was deferred.' 'DEPLOYMENT_LOCKED' 'Deployment lock' $paths.Lock)
+    } catch {
+        throw (New-EwspKubernetesException 'The machine-local deployment lock path is unavailable to the current process.' 'DEPLOYMENT_LOCK_UNAVAILABLE' 'Deployment lock' $paths.Lock)
+    }
+}
+
+function Exit-EwspDeploymentLock {
+    param($Lock)
+    if ($Lock -and $Lock.Stream) { $Lock.Stream.Dispose() }
+}
+
+function Test-EwspDeploymentLock {
+    param([string]$UserProfile = $env:USERPROFILE)
+    try { $lock = Enter-EwspDeploymentLock $UserProfile; Exit-EwspDeploymentLock $lock; $false } catch {
+        if ($_.Exception.Data.Contains('Category') -and $_.Exception.Data['Category'] -eq 'DEPLOYMENT_LOCKED') { return $true }
+        throw
+    }
+}
+
+function Read-EwspDeploymentState {
+    param([string]$UserProfile = $env:USERPROFILE)
+    $path = (Get-EwspDeploymentMachinePaths $UserProfile).State
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try { Get-Content -Raw -LiteralPath $path | ConvertFrom-Json } catch {
+        Write-Warning 'Machine-local deployment-state.json is malformed and will be ignored; GitHub and Kubernetes remain authoritative.'
+        $null
+    }
+}
+
+function Write-EwspDeploymentState {
+    param([Parameter(Mandatory = $true)]$State, [string]$UserProfile = $env:USERPROFILE)
+    $paths = Get-EwspDeploymentMachinePaths $UserProfile
+    Protect-EwspDeploymentDirectory $paths.Root | Out-Null
+    $json = $State | ConvertTo-Json -Depth 8
+    try {
+        [IO.File]::WriteAllText($paths.StateTemporary, $json, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $paths.StateTemporary -Destination $paths.State -Force
+    } finally {
+        if (Test-Path -LiteralPath $paths.StateTemporary -PathType Leaf) { Remove-Item -LiteralPath $paths.StateTemporary -Force }
+    }
+    $paths.State
+}
+
+function Invoke-EwspGitHubApi {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$Token,
+        [scriptblock]$RequestInvoker
+    )
+    try {
+        if ($RequestInvoker) { return (& $RequestInvoker $Uri $Token) }
+        Invoke-RestMethod -Method Get -Uri $Uri -TimeoutSec 30 -Headers @{
+            Authorization = "Bearer $Token"; Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'EWSP-CD-Reconciler'
+        }
+    } catch {
+        throw (New-EwspKubernetesException 'GitHub Actions artifact discovery is unavailable or unauthorized. Credentials and response content were withheld.' 'GITHUB_API_UNAVAILABLE' 'Desired artifact discovery' 'Query GitHub Actions workflow runs')
+    }
+}
+
+function Get-EwspDesiredArtifacts {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitHubToken,
+        [scriptblock]$RequestInvoker
+    )
+    $artifacts = @()
+    foreach ($definition in @(
+        @{ Service='backend'; Repository='ewsp-backend'; Image='ghcr.io/mohammad-hamadi/ewsp-backend' },
+        @{ Service='dashboard'; Repository='ewsp-dashboard'; Image='ghcr.io/mohammad-hamadi/ewsp-dashboard' }
+    )) {
+        $uri = "https://api.github.com/repos/Mohammad-Hamadi/$($definition.Repository)/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=20"
+        $response = Invoke-EwspGitHubApi $uri $GitHubToken $RequestInvoker
+        $eligible = @($response.workflow_runs | Where-Object {
+            $_.event -eq 'push' -and $_.head_branch -eq 'main' -and $_.status -eq 'completed' -and
+            $_.conclusion -eq 'success' -and ([string]$_.head_sha) -match '^[0-9a-fA-F]{40}$'
+        } | Sort-Object {[int64]$_.run_number} -Descending | Select-Object -First 1)
+        if ($eligible.Count -ne 1) {
+            throw (New-EwspKubernetesException "No successful completed push/main ci.yml run with a full commit SHA was found for $($definition.Repository)." 'NO_APPROVED_ARTIFACT' $definition.Service 'Discover latest successful CI run')
+        }
+        $sha = ([string]$eligible[0].head_sha).ToLowerInvariant()
+        $artifacts += [PSCustomObject]@{
+            Service=$definition.Service; Repository=$definition.Repository; GitSha=$sha
+            Image="$($definition.Image):$sha"; WorkflowRunId=[int64]$eligible[0].id
+            WorkflowRunUrl=[string]$eligible[0].html_url; RunNumber=[int64]$eligible[0].run_number
+        }
+    }
+    $artifacts
+}
+
+function Get-EwspGhcrBearerToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Username,
+        [Parameter(Mandatory = $true)][string]$Token,
+        [scriptblock]$RequestInvoker
+    )
+    $scope = [Uri]::EscapeDataString("repository:mohammad-hamadi/$Repository`:pull")
+    $uri = "https://ghcr.io/token?service=ghcr.io&scope=$scope"
+    try {
+        if ($RequestInvoker) { $response = & $RequestInvoker 'TOKEN' $uri $Username $Token $null }
+        else {
+            $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${Username}:$Token"))
+            $response = Invoke-RestMethod -Method Get -Uri $uri -TimeoutSec 30 -Headers @{ Authorization="Basic $basic"; 'User-Agent'='EWSP-CD-Reconciler' }
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$response.token)) { throw 'missing bearer token' }
+        [string]$response.token
+    } catch {
+        $status = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+        $category = if ($status -in @(401,403)) { 'GHCR_AUTH_FAILED' } else { 'GHCR_UNAVAILABLE' }
+        throw (New-EwspKubernetesException "GHCR authentication endpoint failed for $Repository. Credential values and response content were withheld." $category $Repository 'Request GHCR pull token')
+    }
+}
+
+function Get-EwspGhcrManifestResponse {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Reference,
+        [Parameter(Mandatory = $true)][string]$BearerToken,
+        [scriptblock]$RequestInvoker
+    )
+    $uri = "https://ghcr.io/v2/mohammad-hamadi/$Repository/manifests/$Reference"
+    $accept = 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+    try {
+        if ($RequestInvoker) { return (& $RequestInvoker 'MANIFEST' $uri $null $BearerToken $accept) }
+        $response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $uri -TimeoutSec 45 -Headers @{ Authorization="Bearer $BearerToken"; Accept=$accept; 'User-Agent'='EWSP-CD-Reconciler' }
+        $content = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString([byte[]]$response.Content) } else { [string]$response.Content }
+        [PSCustomObject]@{ StatusCode=[int]$response.StatusCode; Headers=$response.Headers; Content=$content }
+    } catch {
+        $status = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+        $category = if ($status -eq 404) { 'GHCR_IMAGE_MISSING' } elseif ($status -in @(401,403)) { 'GHCR_AUTH_FAILED' } else { 'GHCR_UNAVAILABLE' }
+        throw (New-EwspKubernetesException "Immutable GHCR manifest is unavailable for $Repository`:$Reference. Response content was withheld." $category $Repository 'Resolve immutable GHCR manifest')
+    }
+}
+
+function Resolve-EwspGhcrArtifactDigest {
+    param(
+        [Parameter(Mandatory = $true)]$Artifact,
+        [Parameter(Mandatory = $true)][string]$Username,
+        [Parameter(Mandatory = $true)][string]$Token,
+        [scriptblock]$RequestInvoker
+    )
+    if ($Artifact.GitSha -notmatch '^[0-9a-f]{40}$' -or $Artifact.Image -cne "ghcr.io/mohammad-hamadi/ewsp-$($Artifact.Service):$($Artifact.GitSha)") {
+        throw (New-EwspKubernetesException "Desired $($Artifact.Service) artifact is not an exact immutable full-SHA GHCR reference." 'GHCR_IMAGE_INVALID' $Artifact.Service 'Validate desired artifact')
+    }
+    $repository = "ewsp-$($Artifact.Service)"
+    $bearer = Get-EwspGhcrBearerToken $repository $Username $Token $RequestInvoker
+    $manifestResponse = Get-EwspGhcrManifestResponse $repository $Artifact.GitSha $bearer $RequestInvoker
+    $tagDigest = [string]$manifestResponse.Headers['Docker-Content-Digest']
+    if ($tagDigest -notmatch '^sha256:[0-9a-f]{64}$') {
+        throw (New-EwspKubernetesException "GHCR returned no valid immutable digest for $($Artifact.Image)." 'GHCR_DIGEST_INVALID' $Artifact.Service 'Validate GHCR manifest digest')
+    }
+    try { $manifest = ([string]$manifestResponse.Content) | ConvertFrom-Json } catch {
+        throw (New-EwspKubernetesException "GHCR returned an invalid manifest document for $($Artifact.Image)." 'GHCR_DIGEST_INVALID' $Artifact.Service 'Parse GHCR manifest')
+    }
+    $runtimeDigest = $tagDigest.ToLowerInvariant()
+    if ($manifest.PSObject.Properties['manifests']) {
+        $platform = @($manifest.manifests | Where-Object { $_.platform.os -eq 'linux' -and $_.platform.architecture -eq 'amd64' } | Select-Object -First 1)
+        if ($platform.Count -ne 1 -or ([string]$platform[0].digest) -notmatch '^sha256:[0-9a-f]{64}$') {
+            throw (New-EwspKubernetesException "GHCR image index for $($Artifact.Image) has no linux/amd64 runtime manifest." 'GHCR_DIGEST_INVALID' $Artifact.Service 'Select runtime manifest digest')
+        }
+        $runtimeDigest = ([string]$platform[0].digest).ToLowerInvariant()
+    }
+    $Artifact | Add-Member -NotePropertyName TagDigest -NotePropertyValue $tagDigest.ToLowerInvariant() -Force
+    $Artifact | Add-Member -NotePropertyName RuntimeDigest -NotePropertyValue $runtimeDigest -Force
+    $Artifact
+}
+
+function Get-EwspFlywaySchemaSnapshot {
+    param([scriptblock]$CommandRunner)
+    $connection = Get-EwspKubernetesPostgresConnection $CommandRunner
+    $query = "SELECT coalesce(string_agg(coalesce(version,'') || ':' || coalesce(checksum::text,'') || ':' || success::text, ',' ORDER BY installed_rank), '') FROM flyway_schema_history;"
+    $result = Invoke-EwspKubectl @('exec','-n',$script:EwspKubernetesNamespace,'postgres-0','--','psql','-X','-U',$connection.User,'-d',$connection.Database,'-At','-c',$query) $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Unable to snapshot Flyway schema history; backend automatic rollback safety cannot be established.' 'FLYWAY_SNAPSHOT_FAILED' 'backend database migration boundary' 'Read flyway_schema_history')
+    }
+    $text = ($result.Output -join "`n").Trim()
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $fingerprint = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))) } finally { $hasher.Dispose() }
+    [PSCustomObject]@{ Fingerprint = $fingerprint; Empty = [string]::IsNullOrWhiteSpace($text) }
+}
+
+function Wait-EwspDeploymentReady {
+    param([Parameter(Mandatory = $true)][ValidateSet('backend','dashboard')][string]$Component, [scriptblock]$CommandRunner)
+    $timeout = if ($Component -eq 'backend') { '240s' } else { '120s' }
+    $result = Invoke-EwspKubectl @('rollout','status',"deployment/$Component",'-n',$script:EwspKubernetesNamespace,"--timeout=$timeout") $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+        $category = Get-EwspKubernetesFailureCategory $snapshots
+        throw (New-EwspKubernetesException "Replacement $Component Pod did not become Ready." $category $Component "kubectl rollout status deployment/$Component")
+    }
+    $snapshot = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner | Where-Object Name -eq $Component)
+    if ($snapshot.Count -ne 1 -or -not $snapshot[0].Ready) {
+        throw (New-EwspKubernetesException "Replacement $Component Pod is not Ready after rollout completion." 'KUBERNETES_READINESS_FAILURE' $Component 'Inspect replacement Pod')
+    }
+    $snapshot[0]
+}
+
+function Set-EwspDeploymentImage {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('backend','dashboard')][string]$Component,
+        [Parameter(Mandatory = $true)][string]$Image,
+        [scriptblock]$CommandRunner
+    )
+    if ($Image -notmatch "^ghcr\.io/mohammad-hamadi/ewsp-$Component`:[0-9a-f]{40}$") {
+        throw (New-EwspKubernetesException "Refusing non-immutable $Component deployment image." 'GHCR_IMAGE_INVALID' $Component 'Validate deployment image')
+    }
+    $result = Invoke-EwspKubectl @('set','image',"deployment/$Component","$Component=$Image",'-n',$script:EwspKubernetesNamespace) $CommandRunner
+    if ($result.ExitCode -ne 0) { throw (New-EwspKubernetesException "Failed to update the $Component Deployment image." 'KUBERNETES_APPLY_FAILURE' $Component "kubectl set image deployment/$Component") }
+    $true
+}
+
+function Assert-EwspArtifactRunning {
+    param([Parameter(Mandatory = $true)]$Artifact, [scriptblock]$CommandRunner)
+    $snapshot = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner | Where-Object Name -eq $Artifact.Service)
+    if ($snapshot.Count -ne 1 -or $snapshot[0].Image -cne $Artifact.Image -or -not $snapshot[0].Ready) {
+        throw (New-EwspKubernetesException "Running $($Artifact.Service) Pod does not match the desired immutable image." 'DEPLOYED_IMAGE_MISMATCH' $Artifact.Service 'Verify running Pod image')
+    }
+    $imageId = [string]$snapshot[0].ImageId
+    if ($imageId -notmatch '@(?<digest>sha256:[0-9a-f]{64})$') {
+        throw (New-EwspKubernetesException "Running $($Artifact.Service) imageID has no immutable sha256 digest." 'DEPLOYED_DIGEST_MISMATCH' $Artifact.Service 'Read Pod imageID digest')
+    }
+    $actualDigest = $Matches.digest.ToLowerInvariant()
+    $approvedDigests = @([string]$Artifact.TagDigest, [string]$Artifact.RuntimeDigest) | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique
+    if ($approvedDigests -notcontains $actualDigest) {
+        throw (New-EwspKubernetesException "Running $($Artifact.Service) imageID digest does not match the approved GHCR tag/index or runtime manifest digest." 'DEPLOYED_DIGEST_MISMATCH' $Artifact.Service 'Compare Pod imageID with GHCR digests')
+    }
+    $Artifact | Add-Member -NotePropertyName RunningDigest -NotePropertyValue $actualDigest -Force
+    $snapshot[0]
+}
+
+function Get-EwspDeploymentChangePlan {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$DesiredArtifacts,
+        [Parameter(Mandatory = $true)][hashtable]$ConfiguredImages,
+        [Parameter(Mandatory = $true)][object[]]$Snapshots
+    )
+    @($DesiredArtifacts | Where-Object {
+        $artifact = $_
+        $pod = @($Snapshots | Where-Object Name -eq $artifact.Service)
+        $ConfiguredImages[$artifact.Service] -cne $artifact.Image -or $pod.Count -ne 1 -or
+        $pod[0].Image -cne $artifact.Image -or -not $pod[0].Ready
+    })
+}
+
+function Resolve-EwspRollbackAction {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('backend','dashboard')][string]$Component,
+        [Parameter(Mandatory = $true)][string]$PreviousImage,
+        $FlywayBefore,
+        $FlywayAfter
+    )
+    if ($PreviousImage -notmatch "^ghcr\.io/mohammad-hamadi/ewsp-$Component`:[0-9a-f]{40}$") { return 'UNAVAILABLE' }
+    if ($Component -eq 'dashboard') { return 'RESTORE_PREVIOUS_IMAGE' }
+    if ($FlywayBefore -and $FlywayAfter -and $FlywayBefore.Fingerprint -eq $FlywayAfter.Fingerprint) { return 'RESTORE_PREVIOUS_IMAGE' }
+    'UNSAFE_DATABASE_ADVANCED'
+}
+
+function Get-EwspDeploymentTriggerSource {
+    if ($env:GITHUB_ACTIONS -eq 'true') { return "github-actions:$($env:GITHUB_EVENT_NAME)" }
+    if ($env:EWSP_STARTUP_RECONCILIATION -eq 'true') { return 'windows-logon' }
+    'manual'
+}
+
+function Invoke-EwspDeploy {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $lock = $null
+    $started = [DateTime]::UtcNow
+    $trigger = Get-EwspDeploymentTriggerSource
+    $previousState = Read-EwspDeploymentState
+    $state = [ordered]@{
+        LastAttemptUtc=$started.ToString('o')
+        LastSuccessUtc=if($previousState){$previousState.LastSuccessUtc}else{$null}
+        Status='IN_PROGRESS'
+        Trigger=$trigger
+    }
+    foreach ($name in @('DeployedBackendSha','DeployedDashboardSha','BackendRunningDigest','DashboardRunningDigest','PvcUids')) {
+        if ($previousState -and $previousState.PSObject.Properties[$name]) { $state[$name] = $previousState.$name }
+    }
+    try {
+        $lock = Enter-EwspDeploymentLock
+        $configuration = Get-EwspDeploymentConfiguration -RequireGhcr -RequireAdminLogin
+        try {
+            $environment = Get-EwspKubernetesEnvironment
+            Assert-EwspKubernetesEnvironment $environment | Out-Null
+            if (-not $environment.Kubernetes.NamespaceExists) { throw (New-EwspKubernetesException 'The ewsp namespace is unavailable.' 'KUBERNETES_API_UNREACHABLE' 'Kubernetes namespace' 'kubectl get namespace ewsp') }
+        } catch {
+            $category = if ($_.Exception.Data.Contains('Category')) { [string]$_.Exception.Data['Category'] } else { 'KUBERNETES_API_UNREACHABLE' }
+            if ($category -in @('KUBECTL_MISSING','KUBERNETES_API_UNREACHABLE','KUBERNETES_NODE_NOT_READY','KUBERNETES_STORAGE_UNAVAILABLE','DOCKER_ENGINE_UNREACHABLE')) {
+                $state.Status='DEPLOYMENT_DEFERRED'; $state.FailureCategory=$category; Write-EwspDeploymentState ([PSCustomObject]$state) | Out-Null
+                Write-Host "EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=$category" -ForegroundColor Yellow
+            }
+            throw
+        }
+        $desired = @(Get-EwspDesiredArtifacts $configuration.GitHubToken)
+        for ($i=0; $i -lt $desired.Count; $i++) { $desired[$i] = Resolve-EwspGhcrArtifactDigest $desired[$i] $configuration.GhcrUsername $configuration.GhcrToken }
+        $backend = @($desired | Where-Object Service -eq 'backend')[0]
+        $dashboard = @($desired | Where-Object Service -eq 'dashboard')[0]
+        $state.DesiredBackendSha=$backend.GitSha; $state.DesiredDashboardSha=$dashboard.GitSha
+        $state.BackendTagDigest=$backend.TagDigest; $state.DashboardTagDigest=$dashboard.TagDigest
+        $state.BackendRuntimeDigest=$backend.RuntimeDigest; $state.DashboardRuntimeDigest=$dashboard.RuntimeDigest
+        $state.BackendWorkflowRunId=$backend.WorkflowRunId; $state.DashboardWorkflowRunId=$dashboard.WorkflowRunId
+
+        $beforePvcs = @(Get-EwspKubernetesPvcSnapshot)
+        $beforeSnapshots = @(Get-EwspKubernetesWorkloadSnapshot)
+        $oldImages = @{ backend=(Get-EwspRunningKubernetesImage 'backend'); dashboard=(Get-EwspRunningKubernetesImage 'dashboard') }
+        $changes = @(Get-EwspDeploymentChangePlan $desired $oldImages $beforeSnapshots)
+        $ghcr = [PSCustomObject]@{ BackendImage=$backend.Image; DashboardImage=$dashboard.Image; Username=$configuration.GhcrUsername; Token=$configuration.GhcrToken; Images=$desired }
+        $secretPath = $null
+        try {
+            $secretPath = New-EwspGhcrPullSecretArtifact $LocalRoot $ghcr
+            Invoke-EwspKubectlStreaming @('apply','-f',$secretPath) 'Failed to reconcile private GHCR pull Secret'
+        } finally {
+            if ($secretPath) { Remove-EwspGhcrPullSecretArtifact $LocalRoot }
+        }
+
+        if ($changes.Count -eq 0) {
+            Write-Host 'Backend and dashboard are already current; no Deployment image update or rollout was requested.' -ForegroundColor Green
+        } else {
+            foreach ($artifact in @($desired | Where-Object { $changes.Service -contains $_.Service })) {
+                $previous = [string]$oldImages[$artifact.Service]
+                $flywayBefore = if ($artifact.Service -eq 'backend') { Get-EwspFlywaySchemaSnapshot } else { $null }
+                Write-Host "$($artifact.Service): $previous -> $($artifact.Image)"
+                try {
+                    if ($previous -cne $artifact.Image) { Set-EwspDeploymentImage $artifact.Service $artifact.Image | Out-Null }
+                    Wait-EwspDeploymentReady $artifact.Service | Out-Null
+                    Assert-EwspArtifactRunning $artifact | Out-Null
+                } catch {
+                    $deploymentFailure = $_
+                    $flywayAfter = $null
+                    if ($artifact.Service -eq 'backend') {
+                        try { $flywayAfter = Get-EwspFlywaySchemaSnapshot } catch { }
+                    }
+                    $rollbackAction = Resolve-EwspRollbackAction $artifact.Service $previous $flywayBefore $flywayAfter
+                    if ($rollbackAction -eq 'RESTORE_PREVIOUS_IMAGE') {
+                        Write-Host "Restoring previous $($artifact.Service) image $previous ..." -ForegroundColor Yellow
+                        try {
+                            Set-EwspDeploymentImage $artifact.Service $previous | Out-Null
+                            $restored = Wait-EwspDeploymentReady $artifact.Service
+                            if ($restored.Image -cne $previous) {
+                                throw "Restored $($artifact.Service) Pod does not run the previous immutable image."
+                            }
+                            Assert-EwspKubernetesFunctionality | Out-Null
+                            Start-EwspKubernetesPortForward $LocalRoot $configuration.DashboardPort | Out-Null
+                            Assert-EwspKubernetesDashboardAccess $configuration.DashboardPort | Out-Null
+                            Test-EwspKubernetesAdminLogin $configuration.AdminPassword | Out-Null
+                            $deploymentFailure.Exception.Data['Rollback'] = 'RESTORED_PREVIOUS_IMAGE_AND_VERIFIED'
+                        } catch {
+                            $deploymentFailure.Exception.Data['Rollback'] = 'RESTORE_OR_VERIFICATION_FAILED'
+                            $deploymentFailure.Exception.Data['RollbackFailureCategory'] = if ($_.Exception.Data.Contains('Category')) { [string]$_.Exception.Data['Category'] } else { 'ROLLBACK_VERIFICATION_FAILED' }
+                        }
+                    } elseif ($rollbackAction -eq 'UNSAFE_DATABASE_ADVANCED') {
+                        Write-Host 'Backend rollback blocked: Flyway schema history changed or could not be re-read. Database migrations were not rolled back.' -ForegroundColor Red
+                        $deploymentFailure.Exception.Data['Rollback'] = 'UNSAFE_DATABASE_ADVANCED'
+                    }
+                    throw $deploymentFailure
+                }
+            }
+        }
+
+        $snapshots = @(Get-EwspKubernetesWorkloadSnapshot)
+        foreach ($artifact in $desired) { Assert-EwspArtifactRunning $artifact | Out-Null }
+        $state.BackendRunningDigest=$backend.RunningDigest; $state.DashboardRunningDigest=$dashboard.RunningDigest
+        Assert-EwspKubernetesFunctionality | Out-Null
+        $forward = Start-EwspKubernetesPortForward $LocalRoot $configuration.DashboardPort
+        Assert-EwspKubernetesDashboardAccess $configuration.DashboardPort | Out-Null
+        if ($configuration.AdminEmail -ne 'admin@ewsp.local') {
+            throw (New-EwspKubernetesException 'EWSP_ADMIN_EMAIL must be admin@ewsp.local for the current verified login contract.' 'DEPLOYMENT_CONFIG_INVALID' 'Authenticated smoke check' 'Validate deployment.env')
+        }
+        Test-EwspKubernetesAdminLogin $configuration.AdminPassword | Out-Null
+        $afterPvcs = @(Get-EwspKubernetesPvcSnapshot)
+        foreach ($before in $beforePvcs) {
+            $after = @($afterPvcs | Where-Object Name -eq $before.Name)
+            if ($after.Count -ne 1 -or $after[0].Uid -ne $before.Uid) { throw (New-EwspKubernetesException "PVC identity changed unexpectedly for $($before.Name)." 'PVC_IDENTITY_CHANGED' 'Persistent storage' 'Compare PVC UIDs') }
+        }
+        $state.DeployedBackendSha=$backend.GitSha; $state.DeployedDashboardSha=$dashboard.GitSha
+        $state.Status=if($changes.Count){'RECONCILIATION_SUCCEEDED'}else{'ALREADY_CURRENT'}
+        $state.LastSuccessUtc=[DateTime]::UtcNow.ToString('o'); $state.ChangedComponents=@($changes | ForEach-Object Service)
+        $state.PvcUids=@($afterPvcs | ForEach-Object { [ordered]@{ Name=$_.Name; Uid=$_.Uid } })
+        Write-EwspDeploymentState ([PSCustomObject]$state) | Out-Null
+        Write-Host "EWSP_DEPLOY_RESULT=$($state.Status)" -ForegroundColor Green
+        Write-Host "backend sha=$($backend.GitSha) image=$($backend.Image) tagDigest=$($backend.TagDigest) runtimeDigest=$($backend.RuntimeDigest) runningDigest=$($backend.RunningDigest)"
+        Write-Host "dashboard sha=$($dashboard.GitSha) image=$($dashboard.Image) tagDigest=$($dashboard.TagDigest) runtimeDigest=$($dashboard.RuntimeDigest) runningDigest=$($dashboard.RunningDigest)"
+        [PSCustomObject]@{ Status=$state.Status; Desired=$desired; ChangedComponents=@($changes | ForEach-Object Service); Pvcs=$afterPvcs; PortForward=$forward }
+    } catch {
+        $failureCategory = if($_.Exception.Data.Contains('Category')){[string]$_.Exception.Data['Category']}else{'DEPLOYMENT_FAILED'}
+        if ($failureCategory -in @('GITHUB_API_UNAVAILABLE','GHCR_UNAVAILABLE','DEPLOYMENT_LOCKED')) {
+            $state.Status='DEPLOYMENT_DEFERRED'; $state.FailureCategory=$failureCategory
+            if ($lock) { try { Write-EwspDeploymentState ([PSCustomObject]$state) | Out-Null } catch { } }
+            Write-Host "EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=$failureCategory" -ForegroundColor Yellow
+        }
+        if ($state.Status -notin @('DEPLOYMENT_DEFERRED','ALREADY_CURRENT','RECONCILIATION_SUCCEEDED')) {
+            $state.Status='FAILED'; $state.FailureCategory=$failureCategory
+            if ($lock) { try { Write-EwspDeploymentState ([PSCustomObject]$state) | Out-Null } catch { } }
+        }
+        throw
+    } finally { Exit-EwspDeploymentLock $lock }
+}
+
+function Get-EwspScheduledTaskSafe {
+    param([Parameter(Mandatory = $true)][string]$TaskName)
+    if ((Get-EwspHostPlatform).Name -ne 'Windows') { return $null }
+    try { Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch { $null }
+}
+
+function Get-EwspRunnerRegistration {
+    param([string]$RunnerRoot = 'C:\actions-runner')
+    $runnerPath = Join-Path $RunnerRoot '.runner'
+    $credentialsPath = Join-Path $RunnerRoot '.credentials'
+    $commandPath = Join-Path $RunnerRoot 'run.cmd'
+    if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf) -or -not (Test-Path -LiteralPath $credentialsPath -PathType Leaf) -or -not (Test-Path -LiteralPath $commandPath -PathType Leaf)) {
+        throw (New-EwspKubernetesException "The existing GitHub runner registration is incomplete under $RunnerRoot. The setup command will not register or repair it." 'RUNNER_NOT_CONFIGURED' 'EWSP-PC runner' 'Validate .runner, .credentials, and run.cmd')
+    }
+    try { $runner = Get-Content -Raw -LiteralPath $runnerPath | ConvertFrom-Json } catch { throw 'The existing runner .runner metadata is invalid.' }
+    if ($runner.agentName -ne 'EWSP-PC' -or $runner.gitHubUrl -ne 'https://github.com/Mohammad-Hamadi/ewsp-local') {
+        throw (New-EwspKubernetesException 'The configured runner identity does not match EWSP-PC for Mohammad-Hamadi/ewsp-local.' 'RUNNER_IDENTITY_INVALID' 'EWSP-PC runner' 'Inspect safe .runner metadata')
+    }
+    [PSCustomObject]@{ Root=$RunnerRoot; Command=$commandPath; Name=$runner.agentName; Url=$runner.gitHubUrl; WorkFolder=$runner.workFolder; StaleServicePointer=(Test-Path -LiteralPath (Join-Path $RunnerRoot '.service') -PathType Leaf) }
+}
+
+function Invoke-EwspRunnerSetup {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    if ((Get-EwspHostPlatform).Name -ne 'Windows') { throw 'runner-setup is supported only on Windows.' }
+    $registration = Get-EwspRunnerRegistration
+    $paths = Get-EwspDeploymentMachinePaths
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $runnerAction = New-ScheduledTaskAction -Execute 'C:\Windows\System32\cmd.exe' -Argument '/d /c ""C:\actions-runner\run.cmd""' -WorkingDirectory $registration.Root
+    $runnerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3) -StartWhenAvailable
+    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $paths.RunnerTaskName -Action $runnerAction -Trigger $runnerTrigger -Settings $settings -Principal $principal -Description 'Starts the pre-registered EWSP-PC GitHub Actions runner after interactive user logon.' -Force | Out-Null
+
+    $startupScript = Join-Path $LocalRoot 'scripts\Invoke-EwspStartupReconciliation.ps1'
+    if (-not (Test-Path -LiteralPath $startupScript -PathType Leaf)) { throw "Startup reconciliation script is missing: $startupScript" }
+    $quotedScript = '"' + $startupScript.Replace('"','""') + '"'
+    $quotedRoot = '"' + $LocalRoot.Replace('"','""') + '"'
+    $reconcileAction = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File $quotedScript -LocalRoot $quotedRoot" -WorkingDirectory $LocalRoot
+    $reconcileTrigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+    $reconcileTrigger.Delay = 'PT2M'
+    $reconcileSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -StartWhenAvailable
+    Register-ScheduledTask -TaskName $paths.ReconcileTaskName -Action $reconcileAction -Trigger $reconcileTrigger -Settings $reconcileSettings -Principal $principal -Description 'Runs bounded EWSP deployment reconciliation after logon and Docker Desktop startup.' -Force | Out-Null
+    Write-Host "Scheduled Task configured: $($paths.RunnerTaskName) (interactive logon, $($registration.Command))"
+    Write-Host "Scheduled Task configured: $($paths.ReconcileTaskName) (2-minute delay, bounded readiness retries)"
+    if ($registration.StaleServicePointer) { Write-Host 'Stale runner .service pointer detected and safely ignored; no Windows service dependency was created.' }
+}
+
+function Invoke-EwspRunnerStatus {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $registration = Get-EwspRunnerRegistration
+    $paths = Get-EwspDeploymentMachinePaths
+    $runnerTask = Get-EwspScheduledTaskSafe $paths.RunnerTaskName
+    $reconcileTask = Get-EwspScheduledTaskSafe $paths.ReconcileTaskName
+    $listeners = @(Get-Process -Name 'Runner.Listener' -ErrorAction SilentlyContinue)
+    Write-Host "Runner: $($registration.Name) [$($registration.Url)]"
+    Write-Host "Registration: $($registration.Root)"
+    Write-Host "Listener processes: $($listeners.Count)"
+    Write-Host "Runner task: $(if($runnerTask){$runnerTask.State}else{'Missing'})"
+    Write-Host "Startup reconciliation task: $(if($reconcileTask){$reconcileTask.State}else{'Missing'})"
+    Write-Host "Windows service dependency: none$(if($registration.StaleServicePointer){' (stale pointer ignored)'}else{''})"
+}
+
+function Invoke-EwspDeployStatus {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $paths = Get-EwspDeploymentMachinePaths
+    $state = Read-EwspDeploymentState
+    $lockState = try { if(Test-EwspDeploymentLock){'held'}else{'available'} } catch { 'unavailable' }
+    Write-Host "Machine configuration: $(if(Test-Path -LiteralPath $paths.Configuration){$paths.Configuration}else{'Missing'})"
+    Write-Host "Deployment lock: $lockState"
+    if ($state) {
+        Write-Host "Last attempt: $($state.LastAttemptUtc)"
+        Write-Host "Last success: $(if($state.LastSuccessUtc){$state.LastSuccessUtc}else{'<none>'})"
+        Write-Host "Last result: $($state.Status)"
+        Write-Host "Trigger: $($state.Trigger)"
+    } else { Write-Host 'Last deployment: <none or recoverable state file absent>' }
+    try {
+        $configuration = Get-EwspDeploymentConfiguration
+        $desired = @(Get-EwspDesiredArtifacts $configuration.GitHubToken)
+        $snapshots = @(Get-EwspKubernetesWorkloadSnapshot)
+        foreach($artifact in $desired){
+            $running = @($snapshots | Where-Object Name -eq $artifact.Service)
+            $runningSha = if($running.Count -and $running[0].Image -match ':([0-9a-f]{40})$'){$Matches[1]}else{'<none>'}
+            Write-Host "$($artifact.Service): desired=$($artifact.GitSha) running=$runningSha state=$(if($runningSha -eq $artifact.GitSha){'current'}else{'outdated'}) imageID=$(if($running.Count){$running[0].ImageId}else{'<none>'})"
+        }
+    } catch { Write-Warning "Live desired/running comparison unavailable: $($_.Exception.Message)" }
+    Invoke-EwspRunnerStatus $LocalRoot | Out-Null
+}
+
 function Invoke-EwspStop {
     param([Parameter(Mandatory = $true)][string]$LocalRoot, $EnvironmentInfo)
     $EnvironmentInfo = Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $EnvironmentInfo
@@ -4274,6 +4915,11 @@ function Get-EwspCommandRegistry {
         [PSCustomObject]@{ Name='start'; Category='local'; Handler='Invoke-EwspStart'; Aliases=@(); ShortDescription='Build and start the verified Compose stack'; Usage='.\ewsp.ps1 start'; LongDescription='Builds required application images, starts five services, waits for readiness, and verifies endpoints.'; Prerequisites=@('Docker Engine and Compose','Configured sibling repositories and .env'); Examples=@('.\ewsp.ps1 start'); SideEffects=@('Builds images and starts containers'); SafetyNotes=@('Does not update Git repositories'); RelatedCommands=@('status','stop','up'); Keywords=@('compose','docker','build','run') }
         [PSCustomObject]@{ Name='stop'; Category='local'; Handler='Invoke-EwspStop'; Aliases=@(); ShortDescription='Stop the local Compose environment'; Usage='.\ewsp.ps1 stop'; LongDescription='Stops and removes project containers and networks.'; Prerequisites=@('Docker Engine and Compose'); Examples=@('.\ewsp.ps1 stop'); SideEffects=@('Stops local EWSP containers'); SafetyNotes=@('Preserves PostgreSQL and MinIO named volumes'); RelatedCommands=@('up','start','status'); Keywords=@('compose','docker','shutdown','storage') }
         [PSCustomObject]@{ Name='status'; Category='local'; Handler='Invoke-EwspStatus'; Aliases=@(); ShortDescription='Show local repository and Compose state'; Usage='.\ewsp.ps1 status'; LongDescription='Reports safe Git classifications, configuration presence, and concise container health.'; Prerequisites=@('Git and Docker for complete runtime status'); Examples=@('.\ewsp.ps1 status'); SideEffects=@('May fetch Git remote metadata; does not mutate runtime state'); SafetyNotes=@('Secret values are redacted'); RelatedCommands=@('up','stop','k8s-status'); Keywords=@('diagnostics','compose','docker','git','troubleshoot') }
+        [PSCustomObject]@{ Name='deploy-configure'; Category='cd'; Handler='Invoke-EwspDeployConfigure'; Aliases=@(); ShortDescription='Explicitly migrate static deployment-host settings'; Usage='.\ewsp.ps1 deploy-configure'; LongDescription='Copies approved setting names from the ignored repository .env into the protected user-profile deployment.env while preserving both files.'; Prerequisites=@('Existing ignored .env','Protected %USERPROFILE%\.ewsp directory'); Examples=@('.\ewsp.ps1 deploy-configure'); SideEffects=@('Copies selected static settings; never deletes or moves .env'); SafetyNotes=@('Values are never printed','Dynamic desired state is not stored in deployment.env'); RelatedCommands=@('deploy','deploy-status'); Keywords=@('deployment','config','credential','machine','migrate') }
+        [PSCustomObject]@{ Name='deploy'; Category='cd'; Handler='Invoke-EwspDeploy'; Aliases=@(); ShortDescription='Reconcile latest CI-approved immutable application images'; Usage='.\ewsp.ps1 deploy'; LongDescription='Discovers the newest successful push/main artifacts, verifies their GHCR digests, and updates only outdated Kubernetes application Deployments.'; Prerequisites=@('Protected machine deployment.env','Docker Desktop Kubernetes on context docker-desktop','Private GitHub Actions read and GHCR pull credentials'); Examples=@('.\ewsp.ps1 deploy','.\ewsp.ps1 deploy-status'); SideEffects=@('May replace backend and/or dashboard Pods','Reconciles ghcr-pull and performs smoke/login checks'); SafetyNotes=@('No local image build or application checkout','Uses one machine lock and preserves PVCs','Backend rollback stops when Flyway history advances'); RelatedCommands=@('deploy-status','runner-status','k8s-status'); Keywords=@('cd','deploy','reconcile','immutable','github','ghcr','offline') }
+        [PSCustomObject]@{ Name='deploy-status'; Category='cd'; Handler='Invoke-EwspDeployStatus'; Aliases=@(); ShortDescription='Show desired/running CD and deployment-host state'; Usage='.\ewsp.ps1 deploy-status'; LongDescription='Reports recoverable last state, desired and running SHAs, image IDs, lock state, runner registration, and Scheduled Tasks.'; Prerequisites=@('Machine config and Kubernetes for complete live status'); Examples=@('.\ewsp.ps1 deploy-status'); SideEffects=@('Read-only GitHub, Kubernetes, runner, and local-state inspection'); SafetyNotes=@('Never displays credential values'); RelatedCommands=@('deploy','runner-status','k8s-status'); Keywords=@('cd','deployment','status','desired','running','digest','lock') }
+        [PSCustomObject]@{ Name='runner-setup'; Category='cd'; Handler='Invoke-EwspRunnerSetup'; Aliases=@(); ShortDescription='Configure interactive-logon runner and reconciliation tasks'; Usage='.\ewsp.ps1 runner-setup'; LongDescription='Validates the existing EWSP-PC registration and creates current-user Scheduled Tasks for run.cmd and bounded startup reconciliation.'; Prerequisites=@('Windows interactive deployment user','Pre-registered C:\actions-runner EWSP-PC runner'); Examples=@('.\ewsp.ps1 runner-setup','.\ewsp.ps1 runner-status'); SideEffects=@('Creates or updates two current-user Scheduled Tasks'); SafetyNotes=@('Does not re-register the runner or store a Windows password','Does not use the removed runner service'); RelatedCommands=@('runner-status','deploy'); Keywords=@('runner','scheduled task','windows','logon','startup','offline') }
+        [PSCustomObject]@{ Name='runner-status'; Category='cd'; Handler='Invoke-EwspRunnerStatus'; Aliases=@(); ShortDescription='Show local runner registration and task state'; Usage='.\ewsp.ps1 runner-status'; LongDescription='Safely reports EWSP-PC metadata, listener count, Scheduled Tasks, and absence of a service dependency.'; Prerequisites=@('Windows and existing C:\actions-runner registration'); Examples=@('.\ewsp.ps1 runner-status'); SideEffects=@('Read-only local inspection'); SafetyNotes=@('Never reads or prints runner credentials or registration tokens'); RelatedCommands=@('runner-setup','deploy-status'); Keywords=@('runner','status','scheduled task','windows','listener') }
         [PSCustomObject]@{ Name='k8s-up'; Category='kubernetes'; Handler='Invoke-EwspKubernetesUp'; Aliases=@(); ShortDescription='Reconcile EWSP on Docker Desktop Kubernetes'; Usage='.\ewsp.ps1 k8s-up'; LongDescription='Deploys configured immutable GHCR images, infrastructure, policies, and managed dashboard access.'; Prerequisites=@('Docker Desktop Kubernetes on context docker-desktop','kubectl, .env, and private GHCR configuration'); Examples=@('.\ewsp.ps1 k8s-up','.\ewsp.ps1 k8s-status'); SideEffects=@('Applies Kubernetes resources and starts/reconciles workloads','Starts or reuses a localhost dashboard port-forward'); SafetyNotes=@('Accepts only Docker Desktop Kubernetes; preserves persistent storage'); RelatedCommands=@('k8s-status','k8s-seed','k8s-stop'); Keywords=@('k8s','kubernetes','ghcr','deploy','cluster') }
         [PSCustomObject]@{ Name='k8s-status'; Category='kubernetes'; Handler='Invoke-EwspKubernetesStatus'; Aliases=@(); ShortDescription='Show Kubernetes workloads, storage, and access state'; Usage='.\ewsp.ps1 k8s-status'; LongDescription='Reports workload readiness, images, PVCs, services, proxy trust, tunnels, and dashboard access.'; Prerequisites=@('kubectl and Docker Desktop Kubernetes'); Examples=@('.\ewsp.ps1 k8s-status'); SideEffects=@('Read-only cluster inspection'); SafetyNotes=@('Does not display Kubernetes Secret values'); RelatedCommands=@('k8s-up','k8s-stop','tunnel-status'); Keywords=@('k8s','kubernetes','diagnostics','pvc','storage','ghcr') }
         [PSCustomObject]@{ Name='k8s-stop'; Category='kubernetes'; Handler='Invoke-EwspKubernetesStop'; Aliases=@(); ShortDescription='Stop Kubernetes workloads while preserving state'; Usage='.\ewsp.ps1 k8s-stop'; LongDescription='Stops managed access and scales EWSP application/infrastructure controllers down safely.'; Prerequisites=@('kubectl and Docker Desktop Kubernetes'); Examples=@('.\ewsp.ps1 k8s-stop'); SideEffects=@('Stops workloads and managed port-forward/tunnel processes'); SafetyNotes=@('PostgreSQL and MinIO PVCs, data, and Kubernetes resources are preserved'); RelatedCommands=@('k8s-up','k8s-status'); Keywords=@('k8s','kubernetes','shutdown','pvc','storage') }
@@ -4290,6 +4936,7 @@ function Get-EwspHelpCategories {
     @(
         [PSCustomObject]@{ Id='local'; Name='Local / Compose'; Synonyms=@('local','compose','docker'); Description='Build and run the editable sibling workspace with Docker Compose.'; Commands=@('up','setup','update','start','status','stop'); Workflow='local' }
         [PSCustomObject]@{ Id='kubernetes'; Name='Kubernetes'; Synonyms=@('k8s','kubernetes','ghcr'); Description='Deploy immutable GHCR images to the local Docker Desktop Kubernetes cluster.'; Commands=@('k8s-up','k8s-status','k8s-seed','k8s-reset-admin','k8s-stop'); Workflow='kubernetes' }
+        [PSCustomObject]@{ Id='cd'; Name='Continuous deployment'; Synonyms=@('cd','deployment','runner'); Description='Discover approved immutable artifacts and operate the interactive Windows deployment host.'; Commands=@('deploy-configure','deploy','deploy-status','runner-setup','runner-status'); Workflow='cd' }
         [PSCustomObject]@{ Id='data'; Name='Data / Seed'; Synonyms=@('data','seed','database','postgres','password'); Description='Create missing local users or explicitly reconcile the seeded admin credential.'; Commands=@('k8s-seed','k8s-reset-admin'); Workflow='kubernetes' }
         [PSCustomObject]@{ Id='public'; Name='Public access'; Synonyms=@('public','tunnel','cloudflare','demo'); Description='Manage temporary Quick Tunnel public access; permanent Cloudflare configuration is reconciled by k8s-up.'; Commands=@('tunnel-quick','tunnel-status','tunnel-stop'); Workflow='public-demo' }
         [PSCustomObject]@{ Id='diagnostics'; Name='Diagnostics'; Synonyms=@('diagnostics','troubleshooting','troubleshoot'); Description='Inspect local, Kubernetes, and tunnel state or discover CLI usage.'; Commands=@('status','k8s-status','tunnel-status','help'); Workflow=$null }
@@ -4302,6 +4949,7 @@ function Get-EwspHelpWorkflows {
         [PSCustomObject]@{ Name='kubernetes'; Aliases=@('k8s'); Title='KUBERNETES'; Description='Reconcile the local cluster, seed once when needed, inspect it, and stop safely.'; Steps=@('1. Configure .env with immutable GHCR image references','2. .\ewsp.ps1 k8s-up','3. .\ewsp.ps1 k8s-seed        # first/local database setup','4. .\ewsp.ps1 k8s-status','5. .\ewsp.ps1 k8s-stop'); Commands=@('k8s-up','k8s-seed','k8s-status','k8s-stop') }
         [PSCustomObject]@{ Name='public-demo'; Aliases=@('public','tunnel'); Title='PUBLIC DEMO'; Description='Expose a healthy local Kubernetes dashboard through a temporary random URL.'; Steps=@('1. .\ewsp.ps1 k8s-up','2. .\ewsp.ps1 tunnel-quick','3. .\ewsp.ps1 tunnel-status','4. .\ewsp.ps1 tunnel-stop'); Commands=@('k8s-up','tunnel-quick','tunnel-status','tunnel-stop') }
         [PSCustomObject]@{ Name='ghcr'; Aliases=@(); Title='PRIVATE GHCR DEPLOYMENT'; Description='Configure exact immutable private image references, then reconcile Kubernetes.'; Steps=@('1. Configure EWSP_BACKEND_IMAGE and EWSP_DASHBOARD_IMAGE with exact GHCR SHA tags','2. Configure GHCR_USERNAME and GHCR_TOKEN locally','3. .\ewsp.ps1 k8s-up','4. .\ewsp.ps1 k8s-status'); Commands=@('k8s-up','k8s-status') }
+        [PSCustomObject]@{ Name='cd'; Aliases=@('deployment'); Title='CONTINUOUS DEPLOYMENT'; Description='Run the interactive EWSP-PC host, discover current approved artifacts, and reconcile Kubernetes without source builds.'; Steps=@('1. .\ewsp.ps1 deploy-configure','2. Add EWSP_ADMIN_PASSWORD directly to protected deployment.env','3. .\ewsp.ps1 runner-setup','4. .\ewsp.ps1 deploy','5. .\ewsp.ps1 deploy-status'); Commands=@('deploy-configure','runner-setup','deploy','deploy-status','runner-status') }
     )
 }
 
@@ -4315,11 +4963,12 @@ Usage:
 Common workflows:
     Local development       help workflow local
     Kubernetes deployment   help workflow kubernetes
+    Continuous deployment   help workflow cd
     Public demo             help workflow public-demo
     Status / troubleshooting help diagnostics
 
 Command categories:
-    Local / Compose   Kubernetes   Data / Seed   Public access   Diagnostics
+    Local / Compose   Kubernetes   Continuous deployment   Data / Seed   Public access   Diagnostics
 
 Examples:
     .\ewsp.ps1 up
@@ -4500,6 +5149,33 @@ function Invoke-EwspCommand {
 
 Export-ModuleMember -Function @(
     'Invoke-EwspCommand',
+    'Get-EwspDeploymentMachinePaths',
+    'Read-EwspKeyValueFile',
+    'Assert-EwspDeploymentPathAcl',
+    'Get-EwspDeploymentConfiguration',
+    'Protect-EwspDeploymentDirectory',
+    'Invoke-EwspDeployConfigure',
+    'Enter-EwspDeploymentLock',
+    'Exit-EwspDeploymentLock',
+    'Test-EwspDeploymentLock',
+    'Read-EwspDeploymentState',
+    'Write-EwspDeploymentState',
+    'Invoke-EwspGitHubApi',
+    'Get-EwspDesiredArtifacts',
+    'Get-EwspGhcrBearerToken',
+    'Get-EwspGhcrManifestResponse',
+    'Resolve-EwspGhcrArtifactDigest',
+    'Get-EwspFlywaySchemaSnapshot',
+    'Wait-EwspDeploymentReady',
+    'Set-EwspDeploymentImage',
+    'Assert-EwspArtifactRunning',
+    'Get-EwspDeploymentChangePlan',
+    'Resolve-EwspRollbackAction',
+    'Invoke-EwspDeploy',
+    'Get-EwspRunnerRegistration',
+    'Invoke-EwspRunnerSetup',
+    'Invoke-EwspRunnerStatus',
+    'Invoke-EwspDeployStatus',
     'ConvertTo-EwspRemoteIdentity',
     'Test-EwspRepositoryIdentity',
     'Get-EwspRepositoryState',

@@ -1087,11 +1087,176 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     $badLoginProbe = { param($payload) [PSCustomObject]@{ StatusCode=401; Body='{}' } }
     Assert-ThrowsCategory { Test-EwspKubernetesAdminLogin $fakePassword $badLoginProbe $loginProbe | Out-Null } 'ADMIN_RESET_VERIFICATION_FAILED' 'admin reset rejects unsuccessful real login proof'
 
+    $machineProfile = Join-Path $testRoot 'machine-profile'
+    $machinePaths = Get-EwspDeploymentMachinePaths $machineProfile
+    Assert-Equal $machinePaths.Configuration (Join-Path $machineProfile '.ewsp\deployment.env') 'CD config path is user-profile relative and outside a checkout'
+    Assert-Equal $machinePaths.State (Join-Path $machineProfile '.ewsp\deployment-state.json') 'dynamic deployment state is separate from static configuration'
+    Assert-Equal $machinePaths.Lock (Join-Path $machineProfile '.ewsp\deployment.lock') 'GitHub and startup reconciliation share one machine lock path'
+    Assert-ThrowsCategory { Get-EwspDeploymentConfiguration -UserProfile $machineProfile -SkipAcl | Out-Null } 'DEPLOYMENT_CONFIG_MISSING' 'missing machine deployment config fails by setting name'
+    New-Item -ItemType Directory -Path $machinePaths.Root -Force | Out-Null
+    @('EWSP_GITHUB_READ_TOKEN=read-token-test','GHCR_USERNAME=test-user','GHCR_TOKEN=ghcr-token-test','EWSP_ADMIN_PASSWORD=admin-password-test') | Set-Content -LiteralPath $machinePaths.Configuration
+    $machineConfiguration = Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireGhcr -RequireAdminLogin -SkipAcl
+    Assert-Equal $machineConfiguration.AdminEmail 'admin@ewsp.local' 'CD login uses the fixed verified local admin identity by default'
+    Assert-Equal $machineConfiguration.DashboardPort 3000 'CD dashboard smoke checks use the safe default port'
+    $configOutput = (& { Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireGhcr -RequireAdminLogin -SkipAcl | Out-Null } 6>&1 | Out-String)
+    Assert-NotContains $configOutput 'read-token-test' 'machine config validation never prints GitHub read token'
+    Assert-NotContains $configOutput 'ghcr-token-test' 'machine config validation never prints GHCR token'
+    Assert-NotContains $configOutput 'admin-password-test' 'machine config validation never prints admin password'
+
+    $backendApprovedSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    $dashboardApprovedSha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    $discoveryInvoker = {
+        param($uri,$token)
+        if ($token -ne 'read-token-test') { throw 'unexpected token' }
+        $sha = if ($uri -match 'ewsp-backend') { $backendApprovedSha } else { $dashboardApprovedSha }
+        [PSCustomObject]@{ workflow_runs=@(
+            [PSCustomObject]@{ id=91; run_number=91; event='pull_request'; head_branch='main'; status='completed'; conclusion='success'; head_sha=('c' * 40); html_url='pr' },
+            [PSCustomObject]@{ id=92; run_number=92; event='push'; head_branch='main'; status='completed'; conclusion='failure'; head_sha=('d' * 40); html_url='failed' },
+            [PSCustomObject]@{ id=93; run_number=93; event='push'; head_branch='main'; status='completed'; conclusion='success'; head_sha=$sha; html_url='approved' },
+            [PSCustomObject]@{ id=90; run_number=90; event='push'; head_branch='main'; status='completed'; conclusion='success'; head_sha=('e' * 40); html_url='stale' }
+        ) }
+    }.GetNewClosure()
+    $desiredArtifacts = @(Get-EwspDesiredArtifacts 'read-token-test' $discoveryInvoker)
+    Assert-Equal $desiredArtifacts.Count 2 'desired discovery returns exactly backend and dashboard'
+    Assert-Equal @($desiredArtifacts | Where-Object Service -eq 'backend')[0].GitSha $backendApprovedSha 'backend discovery selects newest successful push/main CI SHA'
+    Assert-Equal @($desiredArtifacts | Where-Object Service -eq 'dashboard')[0].GitSha $dashboardApprovedSha 'dashboard discovery selects newest successful push/main CI SHA'
+    Assert-Contains @($desiredArtifacts | Where-Object Service -eq 'backend')[0].Image ":$backendApprovedSha" 'desired backend image uses the full immutable SHA tag'
+    Assert-Equal (@($desiredArtifacts | Where-Object WorkflowRunId -eq 92).Count) 0 'failed CI is never deployment eligible'
+    Assert-Equal (@($desiredArtifacts | Where-Object WorkflowRunId -eq 91).Count) 0 'PR CI is never deployment eligible'
+    $noApprovedInvoker = { param($uri,$token) [PSCustomObject]@{ workflow_runs=@([PSCustomObject]@{ id=1;run_number=1;event='push';head_branch='main';status='completed';conclusion='failure';head_sha=('f' * 40) }) } }
+    Assert-ThrowsCategory { Get-EwspDesiredArtifacts 'read-token-test' $noApprovedInvoker | Out-Null } 'NO_APPROVED_ARTIFACT' 'absence of successful artifact-producing CI fails closed'
+    $badShaInvoker = { param($uri,$token) [PSCustomObject]@{ workflow_runs=@([PSCustomObject]@{ id=1;run_number=1;event='push';head_branch='main';status='completed';conclusion='success';head_sha='main' }) } }
+    Assert-ThrowsCategory { Get-EwspDesiredArtifacts 'read-token-test' $badShaInvoker | Out-Null } 'NO_APPROVED_ARTIFACT' 'successful run with invalid SHA is rejected'
+    $githubUnavailableInvoker = { param($uri,$token) throw 'simulated private GitHub API outage' }
+    Assert-ThrowsCategory { Get-EwspDesiredArtifacts 'read-token-test' $githubUnavailableInvoker | Out-Null } 'GITHUB_API_UNAVAILABLE' 'private GitHub API outage is classified without exposing its response'
+
+    $ghcrUnauthorizedInvoker = {
+        param($mode,$uri,$username,$token,$accept)
+        $failure = [Exception]::new('simulated registry response content')
+        $failure | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{StatusCode=401})
+        throw $failure
+    }
+    Assert-ThrowsCategory { Get-EwspGhcrBearerToken 'ewsp-backend' 'u' 't' $ghcrUnauthorizedInvoker | Out-Null } 'GHCR_AUTH_FAILED' 'GHCR authentication failure is classified without exposing registry content'
+    $ghcrMissingInvoker = {
+        param($mode,$uri,$username,$token,$accept)
+        $failure = [Exception]::new('simulated registry response content')
+        $failure | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{StatusCode=404})
+        throw $failure
+    }
+    Assert-ThrowsCategory { Get-EwspGhcrManifestResponse 'ewsp-backend' $backendApprovedSha 'bearer-test' $ghcrMissingInvoker | Out-Null } 'GHCR_IMAGE_MISSING' 'nonexistent immutable GHCR tag fails closed without exposing registry content'
+
+    $tagDigest = 'sha256:' + ('1' * 64)
+    $runtimeDigest = 'sha256:' + ('2' * 64)
+    $manifestInvoker = {
+        param($mode,$uri,$username,$token,$accept)
+        if ($mode -eq 'TOKEN') { return [PSCustomObject]@{ token='registry-bearer-test' } }
+        [PSCustomObject]@{
+            StatusCode=200; Headers=@{ 'Docker-Content-Digest'=$tagDigest }
+            Content=(@{ mediaType='application/vnd.oci.image.index.v1+json'; manifests=@(
+                @{ digest=('sha256:' + ('3' * 64)); platform=@{os='unknown';architecture='unknown'} },
+                @{ digest=$runtimeDigest; platform=@{os='linux';architecture='amd64'} }
+            ) } | ConvertTo-Json -Depth 6 -Compress)
+        }
+    }.GetNewClosure()
+    $resolvedArtifact = Resolve-EwspGhcrArtifactDigest @($desiredArtifacts | Where-Object Service -eq 'backend')[0] 'user-test' 'token-test' $manifestInvoker
+    Assert-Equal $resolvedArtifact.TagDigest $tagDigest 'GHCR discovery records immutable tag/index digest'
+    Assert-Equal $resolvedArtifact.RuntimeDigest $runtimeDigest 'GHCR discovery selects linux/amd64 runtime digest for Pod verification'
+    $badDigestInvoker = { param($mode,$uri,$username,$token,$accept) if($mode -eq 'TOKEN'){[PSCustomObject]@{token='x'}}else{[PSCustomObject]@{Headers=@{'Docker-Content-Digest'='latest'};Content='{}'}} }
+    Assert-ThrowsCategory { Resolve-EwspGhcrArtifactDigest @($desiredArtifacts | Where-Object Service -eq 'backend')[0] 'u' 't' $badDigestInvoker | Out-Null } 'GHCR_DIGEST_INVALID' 'invalid GHCR digest is rejected'
+    $wrongImageArtifact = [PSCustomObject]@{Service='backend';GitSha=$backendApprovedSha;Image='ghcr.io/mohammad-hamadi/ewsp-backend:latest'}
+    Assert-ThrowsCategory { Resolve-EwspGhcrArtifactDigest $wrongImageArtifact 'u' 't' $manifestInvoker | Out-Null } 'GHCR_IMAGE_INVALID' 'moving GHCR tag is never accepted as desired state'
+
+    $desiredByService = @{}
+    foreach($artifact in $desiredArtifacts){$desiredByService[$artifact.Service]=$artifact.Image}
+    $currentSnapshots = @(
+        [PSCustomObject]@{Name='backend';Image=$desiredByService.backend;Ready=$true},
+        [PSCustomObject]@{Name='dashboard';Image=$desiredByService.dashboard;Ready=$true}
+    )
+    Assert-Equal @(Get-EwspDeploymentChangePlan $desiredArtifacts $desiredByService $currentSnapshots).Count 0 'no-op plan changes no application when configured and running refs are current'
+    $backendOld = $desiredByService.Clone(); $backendOld.backend="ghcr.io/mohammad-hamadi/ewsp-backend:$('1' * 40)"
+    $backendOnly = @(Get-EwspDeploymentChangePlan $desiredArtifacts $backendOld $currentSnapshots)
+    Assert-Equal $backendOnly.Count 1 'backend-only plan changes exactly one component'
+    Assert-Equal $backendOnly[0].Service 'backend' 'backend-only plan leaves dashboard untouched'
+    $dashboardOld = $desiredByService.Clone(); $dashboardOld.dashboard="ghcr.io/mohammad-hamadi/ewsp-dashboard:$('2' * 40)"
+    $dashboardOnly = @(Get-EwspDeploymentChangePlan $desiredArtifacts $dashboardOld $currentSnapshots)
+    Assert-Equal $dashboardOnly.Count 1 'dashboard-only plan changes exactly one component'
+    Assert-Equal $dashboardOnly[0].Service 'dashboard' 'dashboard-only plan leaves backend untouched'
+    $bothOld = $backendOld.Clone(); $bothOld.dashboard=$dashboardOld.dashboard
+    Assert-Equal @(Get-EwspDeploymentChangePlan $desiredArtifacts $bothOld $currentSnapshots).Count 2 'both-component plan reconciles both applications deterministically'
+    $stalePodSnapshots = @([PSCustomObject]@{Name='backend';Image=$backendOld.backend;Ready=$true},$currentSnapshots[1])
+    Assert-Equal @(Get-EwspDeploymentChangePlan $desiredArtifacts $desiredByService $stalePodSnapshots).Count 1 'stale running Pod is not misclassified as no-op when Deployment spec is current'
+    $oldBackendImage="ghcr.io/mohammad-hamadi/ewsp-backend:$('3' * 40)"
+    $oldDashboardImage="ghcr.io/mohammad-hamadi/ewsp-dashboard:$('4' * 40)"
+    Assert-Equal (Resolve-EwspRollbackAction dashboard $oldDashboardImage $null $null) 'RESTORE_PREVIOUS_IMAGE' 'dashboard failure restores previous immutable image'
+    Assert-Equal (Resolve-EwspRollbackAction backend $oldBackendImage ([PSCustomObject]@{Fingerprint='same'}) ([PSCustomObject]@{Fingerprint='same'})) 'RESTORE_PREVIOUS_IMAGE' 'backend failure restores code only when Flyway history is unchanged'
+    Assert-Equal (Resolve-EwspRollbackAction backend $oldBackendImage ([PSCustomObject]@{Fingerprint='before'}) ([PSCustomObject]@{Fingerprint='after'})) 'UNSAFE_DATABASE_ADVANCED' 'backend rollback stops when Flyway history advances'
+    Assert-Equal (Resolve-EwspRollbackAction backend 'backend:latest' $null $null) 'UNAVAILABLE' 'rollback never restores a non-immutable previous image'
+
+    $firstLock = Enter-EwspDeploymentLock $machineProfile
+    Assert-Equal $firstLock.Acquired $true 'first deployment reconciliation acquires the machine lock'
+    Assert-ThrowsCategory { Enter-EwspDeploymentLock $machineProfile | Out-Null } 'DEPLOYMENT_LOCKED' 'concurrent local deployment is cleanly rejected'
+    Exit-EwspDeploymentLock $firstLock
+    Assert-Equal (Test-EwspDeploymentLock $machineProfile) $false 'deployment lock becomes available after reconciliation exits'
+    $stateObject = [PSCustomObject]@{Status='ALREADY_CURRENT';DesiredBackendSha=$backendApprovedSha;DesiredDashboardSha=$dashboardApprovedSha;Trigger='test'}
+    Write-EwspDeploymentState $stateObject $machineProfile | Out-Null
+    Assert-Equal (Read-EwspDeploymentState $machineProfile).Status 'ALREADY_CURRENT' 'non-secret deployment state survives process restart'
+    Set-Content -LiteralPath $machinePaths.State -Value '{broken'
+    $malformedStateOutput = (& { $script:malformedState = Read-EwspDeploymentState $machineProfile } 3>&1 | Out-String)
+    Assert-Equal $script:malformedState $null 'malformed deployment state is ignored because it is not authoritative'
+    Assert-Contains $malformedStateOutput 'malformed' 'malformed deployment state reports recoverable diagnostics'
+    Remove-Item -LiteralPath $machinePaths.State -Force
+    Assert-Equal (Read-EwspDeploymentState $machineProfile) $null 'deleted deployment state recovers as absent without affecting desired discovery'
+
+    $setImageCalls = New-Object Collections.Generic.List[string]
+    $setImageRunner = { param($file,$arguments) $setImageCalls.Add(($arguments -join ' ')); [PSCustomObject]@{ ExitCode=0; Output=@('deployment.apps/backend image updated') } }.GetNewClosure()
+    Set-EwspDeploymentImage backend "ghcr.io/mohammad-hamadi/ewsp-backend:$backendApprovedSha" $setImageRunner | Out-Null
+    Assert-Contains $setImageCalls[0] "set image deployment/backend backend=ghcr.io/mohammad-hamadi/ewsp-backend:$backendApprovedSha" 'backend-only deployment targets only backend Deployment'
+    Assert-ThrowsCategory { Set-EwspDeploymentImage dashboard 'ghcr.io/mohammad-hamadi/ewsp-dashboard:main' $setImageRunner | Out-Null } 'GHCR_IMAGE_INVALID' 'component deployment rejects moving tags before kubectl mutation'
+
+    $deployWorkflow = Get-Content -Raw (Join-Path $localRoot '.github\workflows\deploy.yml')
+    Assert-Contains $deployWorkflow 'runs-on: [self-hosted, Windows, X64]' 'CD workflow mutates Kubernetes only on the proven Windows runner'
+    Assert-Contains $deployWorkflow 'group: ewsp-docker-desktop-kubernetes' 'CD workflow declares one environment concurrency group'
+    Assert-Contains $deployWorkflow 'cancel-in-progress: false' 'active deployment is never cancelled mid-mutation'
+    Assert-Contains $deployWorkflow '.\ewsp.ps1 deploy' 'every CD event performs current desired-state reconciliation'
+    Assert-Contains $deployWorkflow 'persist-credentials: false' 'CD checkout does not persist GitHub credentials'
+    Assert-NotContains $deployWorkflow 'EWSP_BACKEND_IMAGE' 'stale triggering SHA is not passed as deployment source of truth'
+    $startupScriptText = Get-Content -Raw (Join-Path $localRoot 'scripts\Invoke-EwspStartupReconciliation.ps1')
+    Assert-Contains $startupScriptText '$delays = @(0, 15, 30, 60, 120, 180)' 'startup reconciliation uses bounded backoff'
+    Assert-NotContains $startupScriptText 'while ($true)' 'startup reconciliation has no infinite busy loop'
+    Assert-Contains $startupScriptText 'EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED' 'startup reconciliation distinguishes transient host unavailability'
+    Assert-Contains $startupScriptText '& powershell.exe -NoProfile -File $entryPoint deploy' 'startup reconciliation invokes authoritative desired-state discovery instead of replaying an event SHA'
+    $missedEventPlan = @(Get-EwspDeploymentChangePlan $desiredArtifacts $bothOld @(
+        [PSCustomObject]@{Name='backend';Image=$bothOld.backend;Ready=$true},
+        [PSCustomObject]@{Name='dashboard';Image=$bothOld.dashboard;Ready=$true}
+    ))
+    Assert-Equal $missedEventPlan.Count 2 'long-offline recovery discovers and reconciles both newer approved artifacts without a queued event'
+    Assert-Equal (($missedEventPlan | ForEach-Object Service) -join ',') 'backend,dashboard' 'long-offline recovery remains deterministic and component-specific'
+
+    $cdModuleText = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
+    Assert-Contains $cdModuleText "New-ScheduledTaskPrincipal -UserId `$identity -LogonType Interactive -RunLevel Limited" 'runner tasks use the current interactive Docker Desktop user without a stored password'
+    Assert-Contains $cdModuleText "New-ScheduledTaskTrigger -AtLogOn -User `$identity" 'runner and reconciliation tasks trigger at logon for the detected user'
+    Assert-Contains $cdModuleText '-MultipleInstances IgnoreNew' 'scheduled startup cannot create duplicate runner or reconciliation instances'
+    Assert-Contains $cdModuleText "-RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)" 'runner task restarts a failed runner with bounded Task Scheduler policy'
+    Assert-Contains $cdModuleText "-RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5)" 'startup reconciliation has bounded Task Scheduler retries'
+    Assert-Contains $cdModuleText "Join-Path `$RunnerRoot '.service'" 'stale runner service metadata is detected without recreating the deleted service wrapper'
+    Assert-NotContains $cdModuleText 'Register-ScheduledTask.*-Password' 'runner setup never persists a Windows password'
+    Assert-Contains $cdModuleText 'RESTORED_PREVIOUS_IMAGE_AND_VERIFIED' 'automatic code rollback is not reported restored until application verification passes'
+    Assert-Contains $cdModuleText "Test-EwspKubernetesAdminLogin `$configuration.AdminPassword" 'automatic rollback verification includes authenticated admin login'
+    Assert-Contains $cdModuleText "foreach (`$name in @('DeployedBackendSha','DeployedDashboardSha','BackendRunningDigest','DashboardRunningDigest','PvcUids'))" 'a failed attempt preserves the previous successful non-secret deployment record'
+    foreach($application in @('ewsp-backend','ewsp-dashboard')){
+        $ciText = Get-Content -Raw (Join-Path (Split-Path $localRoot -Parent) "$application\.github\workflows\ci.yml")
+        Assert-Contains $ciText 'EWSP_LOCAL_DEPLOY_TRIGGER_TOKEN' "$application uses the dedicated cross-repository trigger token"
+        Assert-Contains $ciText 'continue-on-error: true' "$application deployment signal is best-effort"
+        Assert-Contains $ciText "workflow_id: 'deploy.yml'" "$application signals only the ewsp-local deploy workflow"
+        Assert-NotContains $ciText 'kubectl' "$application never mutates the user Kubernetes cluster"
+    }
+
     $commandRegistry = @(Get-EwspCommandRegistry)
     $canonicalNames = @($commandRegistry | ForEach-Object Name)
-    Assert-Equal $canonicalNames.Count 15 'help registry contains every canonical public command including admin reset'
+    Assert-Equal $canonicalNames.Count 20 'help registry contains every canonical public command including CD host operations'
     Assert-Equal @($canonicalNames | Sort-Object -Unique).Count $canonicalNames.Count 'help registry has no duplicate canonical commands'
     Assert-Equal ($canonicalNames -contains 'k8s-reset-admin') $true 'help registry exposes k8s-reset-admin'
+    foreach($cdCommand in @('deploy-configure','deploy','deploy-status','runner-setup','runner-status')) { Assert-Equal ($canonicalNames -contains $cdCommand) $true "help registry exposes $cdCommand" }
     foreach ($commandMetadata in $commandRegistry) {
         Assert-Equal ([string]::IsNullOrWhiteSpace($commandMetadata.ShortDescription)) $false "help metadata describes $($commandMetadata.Name)"
         Assert-Equal ([string]::IsNullOrWhiteSpace($commandMetadata.Usage)) $false "help metadata provides usage for $($commandMetadata.Name)"
