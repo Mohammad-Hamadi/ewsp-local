@@ -4,6 +4,14 @@
 
 This topology is for local development and integration testing. It is not the EWSP production deployment design.
 
+New here? The quickest way to discover the CLI is:
+
+```powershell
+.\ewsp.ps1 help
+```
+
+The built-in help covers commands, categories, search, and common workflows without requiring Docker, Kubernetes, `.env`, or any sibling repository. This README remains the detailed architecture and operational reference.
+
 ## Workspace layout
 
 Keep the repositories as siblings:
@@ -88,7 +96,7 @@ Stop the stack while preserving data:
 .\ewsp.ps1 stop
 ```
 
-Run `.\ewsp.ps1 help` for a compact command summary.
+Run `.\ewsp.ps1 help` for command discovery, searchable topics, and workflow guides.
 
 ## Environment configuration
 
@@ -169,7 +177,15 @@ Kubernetes PostgreSQL starts with its own PVC. Flyway applies the database schem
 .\ewsp.ps1 k8s-seed
 ```
 
-`k8s-seed` is local-development/demo tooling restricted permanently to the exact `docker-desktop` context and `ewsp` namespace. It requires the existing sibling `ewsp-backend/local-dev/seed-dashboard-users.sql` file to be present, untracked, and ignored through the backend repository's local Git exclusions. The command streams that file directly to `psql` in the Ready `postgres-0` Pod with SQL error stopping enabled; it does not copy SQL into a Pod, ConfigMap, Secret, image, or tracked manifest. Output contains only safe user counts and identity/role/status/verification fields.
+`k8s-seed` is local-development/demo tooling restricted permanently to the exact `docker-desktop` context and `ewsp` namespace. It requires the existing sibling `ewsp-backend/local-dev/seed-dashboard-users.sql` file to be present, untracked, and ignored through the backend repository's local Git exclusions. The command streams that file directly to `psql` in the Ready `postgres-0` Pod with SQL error stopping enabled; it does not copy SQL into a Pod, ConfigMap, Secret, image, or tracked manifest. Output contains only safe user counts and identity/role/status/verification fields. It creates missing seed-defined users with `ON CONFLICT DO NOTHING`; rerunning it deliberately does not overwrite any existing user.
+
+If the persistent local database contains an older password hash for the seeded admin, reconcile that one credential explicitly:
+
+```powershell
+.\ewsp.ps1 k8s-reset-admin
+```
+
+`k8s-reset-admin` is local/demo recovery tooling, not production password management. It has no force bypass: it requires the exact Docker Desktop context, namespace `ewsp`, a Ready PostgreSQL StatefulSet/Pod and Bound PVC, and the same untracked ignored backend seed file. It verifies the one existing active, verified ADMIN employee and expected local user counts, updates only `password_hash` in a transaction, verifies UUID/state/count preservation and seed-hash equality without displaying hashes, then proves the credential through the running application. Those real logins create the backend's normal login audit/session records, but returned tokens are discarded without being printed or persisted by the CLI. The command never deletes or reinserts the user and never deletes storage. Invocation is always explicit; neither `k8s-up` nor `k8s-seed` performs this reconciliation.
 
 The existing seed is idempotent and uses `ON CONFLICT DO NOTHING`, so rerunning the command adds missing local identities without duplicates. It does not reset passwords or overwrite any other existing user row in a preserved PostgreSQL PVC. Persisted users can therefore retain credentials or other values that differ from the current ignored seed file. The seed is not invoked by `k8s-up` or `tunnel-quick`, has no context override, and must never be converted into a production Flyway migration. Production deployments must provision real employee accounts through an explicitly controlled operational process and must not receive local/demo users or credentials.
 

@@ -952,6 +952,10 @@ try {
 
     $seedTestBackend = Join-Path $testRoot 'seed-backend'
     New-Item -ItemType Directory -Path (Join-Path $seedTestBackend 'local-dev') -Force | Out-Null
+    $missingBackendLocalRoot = Join-Path $testRoot 'missing-backend-local'
+    New-Item -ItemType Directory -Path (Join-Path $missingBackendLocalRoot 'config') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $missingBackendLocalRoot 'config\repositories.psd1') -Value "@{ Repositories = @(@{ Name='ewsp-backend'; Directory='absent-backend'; ExpectedIdentity='github.com/example/absent'; CloneUrl='https://github.com/example/absent'; PrimaryBranch='main' }) }"
+    Assert-ThrowsCategory { Resolve-EwspKubernetesSeedFile $missingBackendLocalRoot | Out-Null } 'SEED_FILE_MISSING' 'Kubernetes admin seed safety rejects a missing backend sibling repository'
     Assert-ThrowsCategory { Resolve-EwspKubernetesSeedFile $localRoot -BackendRepositoryPath $seedTestBackend -GitRunner { } | Out-Null } 'SEED_FILE_MISSING' 'Kubernetes local seed rejects a missing seed file'
     $seedTestPath = Join-Path $seedTestBackend 'local-dev\seed-dashboard-users.sql'
     Set-Content -LiteralPath $seedTestPath -Value "-- local test only`nselect 1;"
@@ -961,6 +965,11 @@ try {
         else { [PSCustomObject]@{ ExitCode = 0; Output = @() } }
     }
     Assert-ThrowsCategory { Resolve-EwspKubernetesSeedFile $localRoot -BackendRepositoryPath $seedTestBackend -GitRunner $trackedSeedGit | Out-Null } 'SEED_FILE_TRACKED' 'Kubernetes local seed rejects a tracked seed file'
+    $nonIgnoredSeedGit = {
+        param($repositoryPath, $arguments)
+        [PSCustomObject]@{ ExitCode = 1; Output = @() }
+    }
+    Assert-ThrowsCategory { Resolve-EwspKubernetesSeedFile $localRoot -BackendRepositoryPath $seedTestBackend -GitRunner $nonIgnoredSeedGit | Out-Null } 'SEED_FILE_NOT_IGNORED' 'Kubernetes local seed rejects an untracked but non-ignored seed file'
     $ignoredSeedGit = {
         param($repositoryPath, $arguments)
         if ($arguments[0] -eq 'ls-files') { [PSCustomObject]@{ ExitCode = 1; Output = @() } }
@@ -1009,6 +1018,156 @@ try {
     $invalidSeedVerification = [PSCustomObject]@{ TotalUsers = 1; EmployeeUsers = 1; AdminEmployees = 0; Accounts = @([PSCustomObject]@{ Email = 'admin@ewsp.local'; AccountType = 'EMPLOYEE'; Role = 'VIEWER'; Status = 'ACTIVE'; Verified = $true; PasswordHashPresent = $true }) }
     Assert-ThrowsCategory { Assert-EwspKubernetesSeedVerification $invalidSeedVerification @('admin@ewsp.local') | Out-Null } 'SEED_VERIFICATION_FAILED' 'Kubernetes local seed rejects invalid admin verification state'
 
+    $fakeHash = '$2a$10$' + ('A' * 53)
+    $fakePassword = 'unit-' + [Guid]::NewGuid().ToString('N')
+    $adminSeedText = @"
+-- Dev-only password for all users: $fakePassword
+WITH employee_users(id, email, phone, role_name, status, verified) AS (
+  VALUES ('10000000-0000-4000-8000-000000000004'::uuid, 'admin@ewsp.local', '70000004', 'ADMIN', 'ACTIVE', TRUE)
+)
+INSERT INTO users (id,email,password_hash,phone,account_type,role_id,status,verified,created_at,updated_at)
+SELECT employee_users.id, employee_users.email, '$fakeHash', employee_users.phone, 'EMPLOYEE', roles.id,
+       employee_users.status, employee_users.verified, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLICT (email) DO NOTHING;
+"@
+    Set-Content -LiteralPath $seedTestPath -Value $adminSeedText
+    $adminContract = Resolve-EwspKubernetesAdminSeedContract $seedTestPath
+    Assert-Equal $adminContract.Email 'admin@ewsp.local' 'admin reset resolves the exact seeded admin identity'
+    Assert-Equal ($adminContract.PasswordHash -eq $fakeHash) $true 'admin reset safely resolves the seed-defined BCrypt hash'
+    Assert-Equal ($adminContract.PlaintextPassword -eq $fakePassword) $true 'admin reset resolves the local login proof credential without output'
+    Set-Content -LiteralPath $seedTestPath -Value ($adminSeedText.Replace("'$fakeHash'", "'not-a-bcrypt-hash'"))
+    Assert-ThrowsCategory { Resolve-EwspKubernetesAdminSeedContract $seedTestPath | Out-Null } 'ADMIN_SEED_RESOLUTION_FAILED' 'admin reset rejects an incompatible seed credential contract'
+    Set-Content -LiteralPath $seedTestPath -Value $adminSeedText
+
+    $adminId = [Guid]'10000000-0000-4000-8000-000000000004'
+    $validAdminSnapshot = [PSCustomObject]@{
+        TotalUsers = 9; EmployeeUsers = 9; AdminEmployees = 1
+        Accounts = @([PSCustomObject]@{ Id=$adminId; Email='admin@ewsp.local'; AccountType='EMPLOYEE'; Role='ADMIN'; Status='ACTIVE'; Verified=$true })
+    }
+    Assert-Equal (Assert-EwspKubernetesAdminSnapshot $validAdminSnapshot) $true 'admin reset accepts exactly one active verified ADMIN employee with 9/9/1 counts'
+    $absentAdminSnapshot = [PSCustomObject]@{ TotalUsers=8; EmployeeUsers=8; AdminEmployees=0; Accounts=@() }
+    Assert-ThrowsCategory { Assert-EwspKubernetesAdminSnapshot $absentAdminSnapshot | Out-Null } 'ADMIN_NOT_FOUND' 'admin reset rejects an absent admin before mutation'
+    $ambiguousAdminSnapshot = [PSCustomObject]@{ TotalUsers=9; EmployeeUsers=9; AdminEmployees=1; Accounts=@($validAdminSnapshot.Accounts[0],$validAdminSnapshot.Accounts[0]) }
+    Assert-ThrowsCategory { Assert-EwspKubernetesAdminSnapshot $ambiguousAdminSnapshot | Out-Null } 'ADMIN_STATE_INVALID' 'admin reset rejects ambiguous admin matches before mutation'
+    $invalidRoleSnapshot = [PSCustomObject]@{ TotalUsers=9; EmployeeUsers=9; AdminEmployees=0; Accounts=@([PSCustomObject]@{ Id=$adminId; Email='admin@ewsp.local'; AccountType='EMPLOYEE'; Role='VIEWER'; Status='ACTIVE'; Verified=$true }) }
+    Assert-ThrowsCategory { Assert-EwspKubernetesAdminSnapshot $invalidRoleSnapshot | Out-Null } 'ADMIN_STATE_INVALID' 'admin reset rejects an invalid admin role before mutation'
+
+    $capturedResetSql = New-Object Collections.Generic.List[string]
+    $successfulResetExecutor = {
+        param($sql)
+        $capturedResetSql.Add($sql) | Out-Null
+        [PSCustomObject]@{ ExitCode=0; Output=@("RESULT|$adminId|9|9|1|true") }
+    }.GetNewClosure()
+    $resetResult = Invoke-EwspKubernetesAdminCredentialUpdate $validAdminSnapshot $fakeHash $successfulResetExecutor
+    Assert-Equal $resetResult.AdminId $adminId 'admin reset preserves the admin UUID'
+    Assert-Equal "$($resetResult.TotalUsers)/$($resetResult.EmployeeUsers)/$($resetResult.AdminEmployees)" '9/9/1' 'admin reset preserves user employee and admin counts'
+    Assert-Contains $capturedResetSql[0] 'BEGIN;' 'admin reset uses an explicit transaction'
+    Assert-Contains $capturedResetSql[0] '\set ON_ERROR_STOP on' 'admin reset SQL is executed with fail-on-error semantics'
+    Assert-Contains $capturedResetSql[0] 'UPDATE users SET password_hash=' 'admin reset updates the password_hash credential field'
+    foreach ($unrelatedSet in @('SET email=','SET role_id=','SET account_type=','SET status=','SET verified=','SET created_at=','SET updated_at=')) {
+        Assert-NotContains $capturedResetSql[0] $unrelatedSet "admin reset does not mutate unrelated field $unrelatedSet"
+    }
+    $firstResetSqlCount = $capturedResetSql.Count
+    $secondResetResult = Invoke-EwspKubernetesAdminCredentialUpdate $validAdminSnapshot $fakeHash $successfulResetExecutor
+    Assert-Equal $capturedResetSql.Count ($firstResetSqlCount + 1) 'second admin reset executes safely and explicitly'
+    Assert-Equal $secondResetResult.AdminId $adminId 'second admin reset remains UUID-idempotent'
+    $failedResetExecutor = { param($sql) [PSCustomObject]@{ ExitCode=7; Output=@($sql) } }
+    $failedResetText = $null
+    try { Invoke-EwspKubernetesAdminCredentialUpdate $validAdminSnapshot $fakeHash $failedResetExecutor | Out-Null } catch { $failedResetText = $_.Exception.Message; $failedResetCategory = $_.Exception.Data['Category'] }
+    Assert-Equal $failedResetCategory 'ADMIN_RESET_FAILED' 'admin reset classifies transactional SQL failure'
+    Assert-NotContains $failedResetText $fakeHash 'admin reset failure output withholds the password hash'
+
+    $safeLoginBody = @{ accessToken='x'; refreshToken='y'; user=@{ email='admin@ewsp.local'; accountType='EMPLOYEE'; role='ADMIN' } } | ConvertTo-Json -Depth 4 -Compress
+    $loginProbe = { param($payload) [PSCustomObject]@{ StatusCode=200; Body=$safeLoginBody } }.GetNewClosure()
+    $loginProofOutput = (& { $script:loginProofResult = Test-EwspKubernetesAdminLogin $fakePassword $loginProbe $loginProbe } 6>&1 | Out-String)
+    Assert-Equal $script:loginProofResult.DirectStatus 200 'admin reset login proof accepts HTTP 200 from the real API contract'
+    Assert-Equal $script:loginProofResult.DashboardStatus 200 'admin reset login proof accepts HTTP 200 through the dashboard proxy contract'
+    Assert-NotContains $loginProofOutput $fakePassword 'admin reset login proof never prints the plaintext credential'
+    Assert-NotContains $loginProofOutput 'accessToken' 'admin reset login proof never prints token response content'
+    $badLoginProbe = { param($payload) [PSCustomObject]@{ StatusCode=401; Body='{}' } }
+    Assert-ThrowsCategory { Test-EwspKubernetesAdminLogin $fakePassword $badLoginProbe $loginProbe | Out-Null } 'ADMIN_RESET_VERIFICATION_FAILED' 'admin reset rejects unsuccessful real login proof'
+
+    $commandRegistry = @(Get-EwspCommandRegistry)
+    $canonicalNames = @($commandRegistry | ForEach-Object Name)
+    Assert-Equal $canonicalNames.Count 15 'help registry contains every canonical public command including admin reset'
+    Assert-Equal @($canonicalNames | Sort-Object -Unique).Count $canonicalNames.Count 'help registry has no duplicate canonical commands'
+    Assert-Equal ($canonicalNames -contains 'k8s-reset-admin') $true 'help registry exposes k8s-reset-admin'
+    foreach ($commandMetadata in $commandRegistry) {
+        Assert-Equal ([string]::IsNullOrWhiteSpace($commandMetadata.ShortDescription)) $false "help metadata describes $($commandMetadata.Name)"
+        Assert-Equal ([string]::IsNullOrWhiteSpace($commandMetadata.Usage)) $false "help metadata provides usage for $($commandMetadata.Name)"
+        if ($commandMetadata.Name -ne 'help') {
+            $handlerExists = & $module { param($handler) [bool](Get-Command $handler -CommandType Function -ErrorAction SilentlyContinue) } $commandMetadata.Handler
+            Assert-Equal $handlerExists $true "documented command $($commandMetadata.Name) resolves to a real handler"
+        }
+        $commandHelpOutput = (& { Invoke-EwspCommand -Command $commandMetadata.Name -Arguments @('--help') -LocalRoot (Join-Path $testRoot 'missing-runtime') } 6>&1 | Out-String)
+        Assert-Contains $commandHelpOutput $commandMetadata.Usage "--help documents $($commandMetadata.Name) without executing it"
+        $shortHelpOutput = (& { Invoke-EwspCommand -Command $commandMetadata.Name -Arguments @('-h') -LocalRoot (Join-Path $testRoot 'missing-runtime') } 6>&1 | Out-String)
+        Assert-Contains $shortHelpOutput $commandMetadata.Usage "-h documents $($commandMetadata.Name) without executing it"
+    }
+
+    $topHelpOutput = (& { Invoke-EwspCommand -Command help -LocalRoot (Join-Path $testRoot 'no-env-or-runtime') } 6>&1 | Out-String)
+    Assert-Contains $topHelpOutput 'EWSP Local' 'top-level help works without .env or runtime prerequisites'
+    Assert-Contains $topHelpOutput '.\ewsp.ps1 help commands' 'top-level help explains command discovery'
+    $topLongAliasOutput = (& { Invoke-EwspCommand -Command '--help' -LocalRoot $testRoot } 6>&1 | Out-String)
+    Assert-Contains $topLongAliasOutput 'EWSP Local' 'top-level --help alias works'
+    $topShortAliasOutput = (& { Invoke-EwspCommand -Command '-h' -LocalRoot $testRoot } 6>&1 | Out-String)
+    Assert-Contains $topShortAliasOutput 'EWSP Local' 'top-level -h alias works'
+    $catalogOutput = (& { Invoke-EwspCommand -Command help -Arguments @('commands') -LocalRoot $testRoot } 6>&1 | Out-String)
+    foreach ($canonicalName in $canonicalNames) { Assert-Contains $catalogOutput $canonicalName "help commands catalogs $canonicalName" }
+
+    $categories = @(Get-EwspHelpCategories)
+    $allAliases = New-Object Collections.Generic.List[string]
+    foreach ($commandMetadata in $commandRegistry) { foreach ($alias in @($commandMetadata.Aliases)) { $allAliases.Add($alias) } }
+    Assert-Equal @($allAliases | Sort-Object -Unique).Count $allAliases.Count 'help command aliases are unique'
+    foreach ($category in $categories) {
+        foreach ($referencedCommand in $category.Commands) {
+            Assert-Equal ($canonicalNames -contains $referencedCommand) $true "help category $($category.Id) references real command $referencedCommand"
+        }
+        foreach ($synonym in $category.Synonyms) {
+            $categoryOutput = (& { Invoke-EwspCommand -Command help -Arguments @($synonym) -LocalRoot $testRoot } 6>&1 | Out-String)
+            Assert-Contains $categoryOutput $category.Name.ToUpperInvariant() "help category synonym $synonym resolves"
+        }
+    }
+    $searchOutput = (& { Invoke-EwspCommand -Command help -Arguments @('find','password') -LocalRoot $testRoot } 6>&1 | Out-String)
+    Assert-Contains $searchOutput 'k8s-reset-admin' 'help find searches credential-related keywords'
+    $noSearchOutput = (& { Invoke-EwspCommand -Command help -Arguments @('find','no-such-help-topic-xyz') -LocalRoot $testRoot } 6>&1 | Out-String)
+    Assert-Contains $noSearchOutput '.\ewsp.ps1 help commands' 'help find no-result points to the command catalog'
+
+    $workflows = @(Get-EwspHelpWorkflows)
+    Assert-Equal ($workflows.Name -contains 'local') $true 'workflow help includes local development'
+    Assert-Equal ($workflows.Name -contains 'kubernetes') $true 'workflow help includes Kubernetes deployment'
+    Assert-Equal ($workflows.Name -contains 'public-demo') $true 'workflow help includes public demo'
+    Assert-Equal ($workflows.Name -contains 'ghcr') $true 'workflow help includes private GHCR deployment'
+    foreach ($workflow in $workflows) {
+        foreach ($referencedCommand in $workflow.Commands) {
+            Assert-Equal ($canonicalNames -contains $referencedCommand) $true "workflow $($workflow.Name) references real command $referencedCommand"
+        }
+        $workflowOutput = (& { Invoke-EwspCommand -Command help -Arguments @('workflow',$workflow.Name) -LocalRoot $testRoot } 6>&1 | Out-String)
+        Assert-Contains $workflowOutput $workflow.Title "workflow help renders $($workflow.Name)"
+    }
+    Assert-Equal @(Get-EwspCommandSuggestions 'k8-up')[0] 'k8s-up' 'unknown k8-up suggests k8s-up deterministically'
+    Assert-Equal @(Get-EwspCommandSuggestions 'tunel-quick')[0] 'tunnel-quick' 'unknown tunel-quick suggests tunnel-quick deterministically'
+    Assert-Equal @(Get-EwspCommandSuggestions 'k8s-stats')[0] 'k8s-status' 'unknown k8s-stats suggests k8s-status deterministically'
+    Assert-ThrowsContains { Invoke-EwspCommand -Command 'tunel-quick' -LocalRoot $testRoot } 'Did you mean:' 'unknown command returns useful suggestions'
+
+    $wrapperPath = Join-Path $localRoot 'ewsp.ps1'
+    $wrapperHelpOutput = @(& powershell.exe -NoProfile -File $wrapperPath --help 2>&1) -join "`n"
+    $wrapperHelpExit = $LASTEXITCODE
+    Assert-Equal $wrapperHelpExit 0 'ewsp.ps1 --help exits successfully without prerequisites'
+    Assert-Contains $wrapperHelpOutput 'EWSP Local' 'ewsp.ps1 --help renders top-level help'
+    $wrapperCommandHelpOutput = @(& powershell.exe -NoProfile -File $wrapperPath k8s-up -h 2>&1) -join "`n"
+    $wrapperCommandHelpExit = $LASTEXITCODE
+    Assert-Equal $wrapperCommandHelpExit 0 'ewsp.ps1 command -h exits successfully without executing the command'
+    Assert-Contains $wrapperCommandHelpOutput '.\ewsp.ps1 k8s-up' 'ewsp.ps1 command -h renders command help'
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $wrapperUnknownOutput = @(& powershell.exe -NoProfile -File $wrapperPath tunel-quick 2>&1) -join "`n"
+        $wrapperUnknownExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    Assert-Equal ($wrapperUnknownExit -ne 0) $true 'actual unknown command returns a non-zero exit code'
+    Assert-Contains $wrapperUnknownOutput 'tunnel-quick' 'actual unknown command prints deterministic suggestion'
+
     $stoppedRunner = {
         param($filePath, $arguments)
         [PSCustomObject]@{ ExitCode = 0; Output = @('{"items":[]}') }
@@ -1035,13 +1194,9 @@ try {
     }
     Assert-NotContains $moduleText "@('delete', 'namespace'" 'Kubernetes orchestration does not delete its namespace'
     Assert-NotContains $moduleText "@('delete', 'pvc'" 'Kubernetes orchestration does not delete PVCs'
-    Assert-Contains $moduleText "'k8s-up' { Invoke-EwspKubernetesUp" 'command router exposes k8s-up'
-    Assert-Contains $moduleText "'k8s-status' { Invoke-EwspKubernetesStatus" 'command router exposes k8s-status'
-    Assert-Contains $moduleText "'k8s-stop' { Invoke-EwspKubernetesStop" 'command router exposes k8s-stop'
-    Assert-Contains $moduleText "'k8s-seed' { Invoke-EwspKubernetesSeed" 'command router exposes explicit k8s-seed'
-    Assert-Contains $moduleText "'tunnel-quick' { Invoke-EwspQuickTunnelStart" 'command router exposes tunnel-quick'
-    Assert-Contains $moduleText "'tunnel-status' { Invoke-EwspQuickTunnelStatus" 'command router exposes tunnel-status'
-    Assert-Contains $moduleText "'tunnel-stop' { Invoke-EwspQuickTunnelStop" 'command router exposes tunnel-stop'
+    Assert-Contains $moduleText "Name='k8s-up'; Category='kubernetes'; Handler='Invoke-EwspKubernetesUp'" 'central command registry routes k8s-up'
+    Assert-Contains $moduleText "Name='k8s-reset-admin'; Category='data'; Handler='Invoke-EwspKubernetesResetAdmin'" 'central command registry routes k8s-reset-admin'
+    Assert-Contains $moduleText '& $metadata[0].Handler $LocalRoot' 'command dispatcher executes handlers from central metadata'
     Assert-NotContains $moduleText '10\.244\.0\.24|127' 'Quick Tunnel implementation does not hardcode the example Pod IP'
     Assert-NotContains $moduleText '*.trycloudflare.com' 'Quick Tunnel implementation never configures wildcard trycloudflare origin'
     Assert-NotContains $moduleText "Stop-Process -Name cloudflared" 'Quick Tunnel never kills arbitrary cloudflared processes by name'

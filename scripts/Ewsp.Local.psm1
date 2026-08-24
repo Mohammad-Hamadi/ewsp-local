@@ -2463,6 +2463,287 @@ function Invoke-EwspKubernetesSeed {
     Write-Host "PostgreSQL PVC: $($context.Target.PvcName) Bound (UID $($context.Target.PvcUid))"
 }
 
+function Resolve-EwspKubernetesAdminSeedContract {
+    param([Parameter(Mandatory = $true)][string]$SeedPath)
+    try { $text = Get-Content -Raw -LiteralPath $SeedPath } catch {
+        throw (New-EwspKubernetesException 'The local admin seed contract could not be read.' 'ADMIN_SEED_RESOLUTION_FAILED' 'dashboard admin seed contract' 'Inspect the ignored seed file locally')
+    }
+    $adminPattern = "(?im)\(\s*'(?<id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})'::uuid\s*,\s*'admin@ewsp\.local'\s*,\s*'[^']*'\s*,\s*'ADMIN'\s*,\s*'ACTIVE'\s*,\s*TRUE\s*\)"
+    $adminMatches = @([regex]::Matches($text, $adminPattern))
+    $hashMatches = @([regex]::Matches($text, "(?im)employee_users\.email\s*,\s*'(?<hash>\`$2[aby]\`$[0-9]{2}\`$[./A-Za-z0-9]{53})'\s*,\s*employee_users\.phone"))
+    $passwordMatches = @([regex]::Matches($text, '(?im)^--\s*Dev-only password for all users:\s*(?<password>\S(?:.*\S)?)\s*$'))
+    if ($adminMatches.Count -ne 1 -or $hashMatches.Count -ne 1 -or $passwordMatches.Count -ne 1) {
+        throw (New-EwspKubernetesException 'The ignored seed does not contain one unambiguous admin identity, BCrypt credential, and local login contract.' 'ADMIN_SEED_RESOLUTION_FAILED' 'dashboard admin seed contract' 'Inspect the ignored seed structure without displaying credentials')
+    }
+    [PSCustomObject]@{
+        Email = 'admin@ewsp.local'
+        SeedId = [Guid]$adminMatches[0].Groups['id'].Value
+        PasswordHash = $hashMatches[0].Groups['hash'].Value
+        PlaintextPassword = $passwordMatches[0].Groups['password'].Value
+    }
+}
+
+function Get-EwspKubernetesPostgresConnection {
+    param([scriptblock]$CommandRunner)
+    $userResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'printenv', 'POSTGRES_USER') $CommandRunner
+    $databaseResult = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'printenv', 'POSTGRES_DB') $CommandRunner
+    if ($userResult.ExitCode -ne 0 -or $databaseResult.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Unable to resolve PostgreSQL connection names from postgres-0.' 'POSTGRES_NOT_READY' 'Kubernetes PostgreSQL' 'Read postgres-0 environment names')
+    }
+    $databaseUser = ($userResult.Output -join '').Trim()
+    $databaseName = ($databaseResult.Output -join '').Trim()
+    if (-not $databaseUser -or -not $databaseName) {
+        throw (New-EwspKubernetesException 'PostgreSQL connection names from postgres-0 were empty.' 'POSTGRES_NOT_READY' 'Kubernetes PostgreSQL' 'Inspect postgres-0 environment names')
+    }
+    [PSCustomObject]@{ User = $databaseUser; Database = $databaseName }
+}
+
+function Invoke-EwspSensitiveProcessInput {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$InputText
+    )
+    $quotedArguments = @($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ([string]$_).Replace('"', '\"') + '"' } else { [string]$_ }
+    })
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $quotedArguments -join ' '
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw 'sensitive child process did not start' }
+        $process.StandardInput.Write($InputText)
+        $process.StandardInput.Close()
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $standardError = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        [PSCustomObject]@{ ExitCode = $process.ExitCode; Output = @($standardOutput, $standardError) }
+    } finally { $process.Dispose() }
+}
+
+function Get-EwspKubernetesAdminSnapshot {
+    param([scriptblock]$CommandRunner)
+    $connection = Get-EwspKubernetesPostgresConnection $CommandRunner
+    $sql = @"
+select 'COUNTS|' || (select count(*) from users) || '|' ||
+       (select count(*) from users where account_type='EMPLOYEE') || '|' ||
+       (select count(*) from users u join roles r on r.id=u.role_id where u.account_type='EMPLOYEE' and r.name='ADMIN')
+union all
+select 'ACCOUNT|' || u.id || '|' || lower(u.email) || '|' || u.account_type || '|' || r.name || '|' || u.status || '|' || u.verified
+from users u join roles r on r.id=u.role_id where lower(u.email)='admin@ewsp.local';
+"@
+    $result = Invoke-EwspKubectl @('exec', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', $connection.User, '-d', $connection.Database, '-At', '-c', $sql) $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Safe admin verification query failed; database output was withheld.' 'ADMIN_RESET_FAILED' 'Kubernetes PostgreSQL' 'Run non-sensitive admin verification queries')
+    }
+    try {
+        $lines = @($result.Output | ForEach-Object { @(([string]$_) -split "`r?`n") } | Where-Object { $_ })
+        $countLines = @($lines | Where-Object { $_.StartsWith('COUNTS|') })
+        $accountLines = @($lines | Where-Object { $_.StartsWith('ACCOUNT|') })
+        if ($countLines.Count -ne 1) { throw 'unexpected count result' }
+        $counts = @($countLines[0] -split '\|')
+        if ($counts.Count -ne 4) { throw 'unexpected count shape' }
+        $accounts = @($accountLines | ForEach-Object {
+            $parts = @($_ -split '\|')
+            if ($parts.Count -ne 7) { throw 'unexpected account shape' }
+            [PSCustomObject]@{ Id = [Guid]$parts[1]; Email = $parts[2]; AccountType = $parts[3]; Role = $parts[4]; Status = $parts[5]; Verified = $parts[6] -in @('t','true') }
+        })
+        [PSCustomObject]@{ TotalUsers = [int]$counts[1]; EmployeeUsers = [int]$counts[2]; AdminEmployees = [int]$counts[3]; Accounts = $accounts }
+    } catch {
+        throw (New-EwspKubernetesException 'Safe admin verification returned an unexpected result shape.' 'ADMIN_RESET_FAILED' 'Kubernetes PostgreSQL' 'Inspect schema compatibility without selecting password hashes')
+    }
+}
+
+function Assert-EwspKubernetesAdminSnapshot {
+    param([Parameter(Mandatory = $true)]$Snapshot)
+    $admin = @($Snapshot.Accounts)
+    if ($admin.Count -eq 0) {
+        throw (New-EwspKubernetesException 'The expected local admin account was not found.' 'ADMIN_NOT_FOUND' 'admin@ewsp.local' 'Run k8s-seed first, then retry')
+    }
+    if ($admin.Count -ne 1 -or $admin[0].Email -ne 'admin@ewsp.local' -or $admin[0].AccountType -ne 'EMPLOYEE' -or
+        $admin[0].Role -ne 'ADMIN' -or $admin[0].Status -ne 'ACTIVE' -or -not $admin[0].Verified -or
+        $Snapshot.TotalUsers -ne 9 -or $Snapshot.EmployeeUsers -ne 9 -or $Snapshot.AdminEmployees -ne 1) {
+        throw (New-EwspKubernetesException 'The local admin identity, state, or expected 9/9/1 user counts are invalid; no credential was changed.' 'ADMIN_STATE_INVALID' 'admin@ewsp.local' 'Inspect local seed and database state without displaying credentials')
+    }
+    $true
+}
+
+function Invoke-EwspKubernetesAdminCredentialUpdate {
+    param(
+        [Parameter(Mandatory = $true)]$Before,
+        [Parameter(Mandatory = $true)][string]$ExpectedPasswordHash,
+        [scriptblock]$SqlExecutor,
+        [scriptblock]$CommandRunner
+    )
+    if ($ExpectedPasswordHash -notmatch '^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$') {
+        throw (New-EwspKubernetesException 'The seed-defined credential is not a supported BCrypt value.' 'ADMIN_SEED_RESOLUTION_FAILED' 'dashboard admin seed contract' 'Preserve the backend BCrypt password encoding contract')
+    }
+    $adminId = [string]$Before.Accounts[0].Id
+    $sql = @"
+\set ON_ERROR_STOP on
+BEGIN;
+LOCK TABLE users IN ROW EXCLUSIVE MODE;
+DO `$ewsp`$
+DECLARE target_count integer; affected integer;
+BEGIN
+  SELECT count(*) INTO target_count FROM users WHERE lower(email)='admin@ewsp.local';
+  IF target_count <> 1 THEN RAISE EXCEPTION 'admin target changed'; END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM users u JOIN roles r ON r.id=u.role_id
+    WHERE u.id='$adminId'::uuid AND lower(u.email)='admin@ewsp.local' AND u.account_type='EMPLOYEE'
+      AND r.name='ADMIN' AND u.status='ACTIVE' AND u.verified
+  ) THEN RAISE EXCEPTION 'admin state changed'; END IF;
+  IF (SELECT count(*) FROM users) <> 9 OR
+     (SELECT count(*) FROM users WHERE account_type='EMPLOYEE') <> 9 OR
+     (SELECT count(*) FROM users u JOIN roles r ON r.id=u.role_id WHERE u.account_type='EMPLOYEE' AND r.name='ADMIN') <> 1
+  THEN RAISE EXCEPTION 'user counts changed'; END IF;
+  UPDATE users SET password_hash='$ExpectedPasswordHash' WHERE id='$adminId'::uuid;
+  GET DIAGNOSTICS affected = ROW_COUNT;
+  IF affected <> 1 THEN RAISE EXCEPTION 'credential update affected unexpected rows'; END IF;
+END
+`$ewsp`$;
+SELECT 'RESULT|' || u.id || '|' ||
+       (SELECT count(*) FROM users) || '|' ||
+       (SELECT count(*) FROM users WHERE account_type='EMPLOYEE') || '|' ||
+       (SELECT count(*) FROM users x JOIN roles y ON y.id=x.role_id WHERE x.account_type='EMPLOYEE' AND y.name='ADMIN') || '|' ||
+       (u.password_hash='$ExpectedPasswordHash')
+FROM users u WHERE u.id='$adminId'::uuid;
+COMMIT;
+"@
+    if ($SqlExecutor) {
+        $result = & $SqlExecutor $sql
+    } else {
+        $connection = Get-EwspKubernetesPostgresConnection $CommandRunner
+        $kubectl = Get-Command kubectl -ErrorAction Stop
+        $arguments = @('exec', '-i', '-n', $script:EwspKubernetesNamespace, 'postgres-0', '--', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', $connection.User, '-d', $connection.Database, '-At')
+        $result = Invoke-EwspSensitiveProcessInput $kubectl.Source $arguments $sql
+    }
+    if ($result.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Transactional admin credential reconciliation failed; SQL and database output were withheld and PostgreSQL rolled back the transaction.' 'ADMIN_RESET_FAILED' 'admin@ewsp.local credential' 'Inspect PostgreSQL readiness and schema compatibility')
+    }
+    try {
+        $lines = @($result.Output | ForEach-Object { @(([string]$_) -split "`r?`n") } | Where-Object { $_.StartsWith('RESULT|') })
+        if ($lines.Count -ne 1) { throw 'missing result' }
+        $parts = @($lines[0] -split '\|')
+        if ($parts.Count -ne 6 -or $parts[1] -ne $adminId -or [int]$parts[2] -ne 9 -or [int]$parts[3] -ne 9 -or [int]$parts[4] -ne 1 -or $parts[5] -notin @('t','true')) { throw 'invalid result' }
+        [PSCustomObject]@{ AdminId = [Guid]$parts[1]; TotalUsers = [int]$parts[2]; EmployeeUsers = [int]$parts[3]; AdminEmployees = [int]$parts[4]; CredentialMatches = $true }
+    } catch {
+        throw (New-EwspKubernetesException 'Transactional admin reset did not return the expected safe verification result.' 'ADMIN_RESET_VERIFICATION_FAILED' 'admin@ewsp.local credential' 'Inspect database state without selecting password hashes')
+    }
+}
+
+function Assert-EwspAdminLoginResponse {
+    param([Parameter(Mandatory = $true)]$Response, [Parameter(Mandatory = $true)][string]$Route)
+    try {
+        $body = if ($Response -is [string]) { $Response | ConvertFrom-Json } elseif ($Response.PSObject.Properties['Body']) { $Response.Body | ConvertFrom-Json } else { $Response }
+        $statusCode = if ($Response.PSObject.Properties['StatusCode']) { [int]$Response.StatusCode } else { 200 }
+        if ($statusCode -ne 200 -or $body.user.email -ne 'admin@ewsp.local' -or $body.user.accountType -ne 'EMPLOYEE' -or $body.user.role -ne 'ADMIN') { throw 'unexpected login response' }
+    } catch {
+        throw (New-EwspKubernetesException "$Route login verification did not return the active admin contract." 'ADMIN_RESET_VERIFICATION_FAILED' 'running EWSP authentication' 'Check backend and dashboard readiness')
+    }
+    $true
+}
+
+function Test-EwspKubernetesAdminLogin {
+    param(
+        [Parameter(Mandatory = $true)][string]$PlaintextPassword,
+        [scriptblock]$DirectProbe,
+        [scriptblock]$DashboardProbe
+    )
+    $payload = @{ email = 'admin@ewsp.local'; password = $PlaintextPassword } | ConvertTo-Json -Compress
+    try {
+        if ($DirectProbe) {
+            $directResponse = & $DirectProbe $payload
+        } else {
+            $kubectl = Get-Command kubectl -ErrorAction Stop
+            $dashboardPod = Get-EwspReadyDashboardPod
+            $curlArguments = @('exec', '-i', '-n', $script:EwspKubernetesNamespace, $dashboardPod.Name, '--',
+                'curl', '--silent', '--show-error', '--request', 'POST', '--header', 'Content-Type: application/json',
+                '--data-binary', '@-', '--write-out', "`nEWSP_HTTP_STATUS:%{http_code}", 'http://backend:8080/api/auth/login')
+            $directResult = Invoke-EwspSensitiveProcessInput $kubectl.Source $curlArguments $payload
+            if ($directResult.ExitCode -ne 0) { throw 'direct login request failed' }
+            $directText = $directResult.Output -join "`n"
+            $statusMatch = [regex]::Match($directText, '(?m)EWSP_HTTP_STATUS:(?<status>[0-9]{3})\s*$')
+            if (-not $statusMatch.Success) { throw 'direct login status was unavailable' }
+            $directResponse = [PSCustomObject]@{ StatusCode=[int]$statusMatch.Groups['status'].Value; Body=$directText.Substring(0, $statusMatch.Index).Trim() }
+        }
+        Assert-EwspAdminLoginResponse $directResponse 'Direct Kubernetes service' | Out-Null
+        $dashboardVerified = $false
+        try {
+            if ($DashboardProbe) {
+                $dashboardResponse = & $DashboardProbe $payload
+            } else {
+                $webResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri 'http://localhost:3000/api/auth/login' -ContentType 'application/json' -Body $payload -TimeoutSec 15
+                $dashboardResponse = [PSCustomObject]@{ StatusCode = [int]$webResponse.StatusCode; Body = [string]$webResponse.Content }
+            }
+            Assert-EwspAdminLoginResponse $dashboardResponse 'Same-origin dashboard proxy' | Out-Null
+            $dashboardVerified = $true
+        } catch {
+            if ($DashboardProbe) { throw }
+            Write-Warning 'Direct login succeeded, but the optional localhost:3000 dashboard proxy proof was unavailable.'
+        }
+        [PSCustomObject]@{ DirectStatus = 200; DashboardStatus = if ($dashboardVerified) { 200 } else { $null } }
+    } catch {
+        if ($_.Exception.Data.Contains('Category') -and $_.Exception.Data['Category'] -eq 'ADMIN_RESET_VERIFICATION_FAILED') { throw }
+        throw (New-EwspKubernetesException 'The real application login proof failed; response content was withheld.' 'ADMIN_RESET_VERIFICATION_FAILED' 'running EWSP authentication' 'Check backend and dashboard readiness')
+    } finally {
+        $payload = $null
+    }
+}
+
+function Invoke-EwspKubernetesResetAdmin {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $phases = @('K8S_ENVIRONMENT', 'SEED_FILE_SAFETY', 'POSTGRES_PREFLIGHT', 'ADMIN_PREFLIGHT', 'CREDENTIAL_UPDATE', 'SAFE_VERIFICATION', 'LOGIN_PROOF')
+    $completed = New-Object Collections.Generic.List[string]
+    $context = @{ Environment = $null; Seed = $null; Contract = $null; Target = $null; Before = $null; Update = $null; After = $null; Login = $null }
+    Invoke-EwspUpPhase 1 7 $phases[0] 'Verifying local Kubernetes safety boundary' {
+        $context.Environment = Get-EwspKubernetesEnvironment
+        Assert-EwspKubernetesSeedContext $context.Environment.Kubernetes.Context | Out-Null
+        Assert-EwspKubernetesEnvironment $context.Environment | Out-Null
+        if (-not $context.Environment.Kubernetes.NamespaceExists) { throw (New-EwspKubernetesException "Required namespace '$script:EwspKubernetesNamespace' does not exist." 'K8S_NOT_READY' 'Kubernetes namespace' 'kubectl get namespace ewsp') }
+    } $completed @($phases[1..6]) $context.Environment 'Verify docker-desktop Kubernetes and namespace ewsp' 'Kubernetes environment' -WorkflowName 'k8s-reset-admin' | Out-Null
+    Invoke-EwspUpPhase 2 7 $phases[1] 'Resolving ignored local admin seed contract' {
+        $context.Seed = Resolve-EwspKubernetesSeedFile $LocalRoot
+        $context.Contract = Resolve-EwspKubernetesAdminSeedContract $context.Seed.Path
+        Write-Host '      one ignored seed-defined admin credential resolved; credential hidden'
+    } $completed @($phases[2..6]) $context.Environment 'Validate untracked ignored seed and admin credential contract' 'dashboard admin seed contract' -WorkflowName 'k8s-reset-admin' | Out-Null
+    Invoke-EwspUpPhase 3 7 $phases[2] 'Checking Kubernetes PostgreSQL readiness' {
+        $context.Target = Get-EwspKubernetesPostgresSeedTarget
+    } $completed @($phases[3..6]) $context.Environment 'Verify StatefulSet, postgres-0, and bound PVC' 'Kubernetes PostgreSQL' -WorkflowName 'k8s-reset-admin' | Out-Null
+    Invoke-EwspUpPhase 4 7 $phases[3] 'Verifying the existing admin and user counts' {
+        $context.Before = Get-EwspKubernetesAdminSnapshot
+        Assert-EwspKubernetesAdminSnapshot $context.Before | Out-Null
+        Write-Host "      admin UUID $($context.Before.Accounts[0].Id); users 9, employees 9, admins 1"
+    } $completed @($phases[4..6]) $context.Environment 'Verify one active verified ADMIN employee and 9/9/1 counts' 'admin@ewsp.local' -WorkflowName 'k8s-reset-admin' | Out-Null
+    Invoke-EwspUpPhase 5 7 $phases[4] 'Reconciling only the admin credential' {
+        $context.Update = Invoke-EwspKubernetesAdminCredentialUpdate $context.Before $context.Contract.PasswordHash
+        Write-Host '      transactional password_hash update completed; credential hidden'
+    } $completed @($phases[5..6]) $context.Environment 'Update only password_hash in a fail-on-error transaction' 'admin@ewsp.local credential' -WorkflowName 'k8s-reset-admin' | Out-Null
+    Invoke-EwspUpPhase 6 7 $phases[5] 'Verifying identity, state, counts, and credential match' {
+        $context.After = Get-EwspKubernetesAdminSnapshot
+        Assert-EwspKubernetesAdminSnapshot $context.After | Out-Null
+        if ($context.After.Accounts[0].Id -ne $context.Before.Accounts[0].Id -or -not $context.Update.CredentialMatches) { throw (New-EwspKubernetesException 'Admin identity or credential verification changed unexpectedly.' 'ADMIN_RESET_VERIFICATION_FAILED' 'admin@ewsp.local' 'Inspect database state without selecting password hashes') }
+    } $completed @($phases[6]) $context.Environment 'Verify UUID, account contract, counts, and hash equality safely' 'admin@ewsp.local' -WorkflowName 'k8s-reset-admin' | Out-Null
+    Invoke-EwspUpPhase 7 7 $phases[6] 'Proving the seed-defined credential through the running app' {
+        $context.Login = Test-EwspKubernetesAdminLogin $context.Contract.PlaintextPassword
+        Write-Host '      direct API login HTTP 200; tokens and credential hidden'
+        if ($context.Login.DashboardStatus -eq 200) { Write-Host '      dashboard same-origin proxy login HTTP 200' }
+    } $completed @() $context.Environment 'POST /api/auth/login without printing credentials or tokens' 'running EWSP authentication' -WorkflowName 'k8s-reset-admin' | Out-Null
+    $context.Contract = $null
+    Write-Host ''
+    Write-Host 'EWSP Kubernetes local admin credential is reconciled.' -ForegroundColor Green
+    Write-Host "Admin UUID: $($context.After.Accounts[0].Id)"
+    Write-Host 'Users: total=9, employees=9, admins=1'
+    Write-Host "PostgreSQL PVC: $($context.Target.PvcName) Bound (UID $($context.Target.PvcUid))"
+}
+
 function Assert-EwspSafeTemporaryPath {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
@@ -3985,51 +4266,236 @@ function Invoke-EwspStop {
     Write-Host 'EWSP stopped. PostgreSQL and MinIO named volumes were preserved.' -ForegroundColor Green
 }
 
-function Show-EwspHelp {
+function Get-EwspCommandRegistry {
+    @(
+        [PSCustomObject]@{ Name='up'; Category='local'; Handler='Invoke-EwspUp'; Aliases=@(); ShortDescription='Prepare, update, build, start, and verify local Compose'; Usage='.\ewsp.ps1 up'; LongDescription='Runs the complete safe local-development workflow.'; Prerequisites=@('Git, Docker Engine, and Docker Compose','Sibling repositories or permission to clone them'); Examples=@('.\ewsp.ps1 up'); SideEffects=@('May clone or fast-forward safe sibling repositories','Builds images and starts Compose services'); SafetyNotes=@('Preserves dirty or divergent repositories and existing .env'); RelatedCommands=@('status','stop','setup'); Keywords=@('local','compose','docker','build','deploy') }
+        [PSCustomObject]@{ Name='setup'; Category='local'; Handler='Invoke-EwspSetup'; Aliases=@(); ShortDescription='Bootstrap sibling repositories and local configuration'; Usage='.\ewsp.ps1 setup'; LongDescription='Checks prerequisites, clones only missing repositories, and creates .env only when absent.'; Prerequisites=@('Git','Docker CLI'); Examples=@('.\ewsp.ps1 setup'); SideEffects=@('May clone missing repositories','May create .env from .env.example'); SafetyNotes=@('Does not overwrite repositories or an existing .env'); RelatedCommands=@('update','start','up'); Keywords=@('bootstrap','clone','environment','local') }
+        [PSCustomObject]@{ Name='update'; Category='local'; Handler='Invoke-EwspUpdate'; Aliases=@(); ShortDescription='Safely fast-forward eligible sibling repositories'; Usage='.\ewsp.ps1 update'; LongDescription='Fetches and updates only verified clean behind-only branches.'; Prerequisites=@('Git','Existing sibling repositories'); Examples=@('.\ewsp.ps1 update'); SideEffects=@('Fetches remotes and may perform fast-forward merges'); SafetyNotes=@('Skips dirty, ahead, diverged, detached, or unexpected repositories'); RelatedCommands=@('status','setup','up'); Keywords=@('git','fetch','repository','upgrade') }
+        [PSCustomObject]@{ Name='start'; Category='local'; Handler='Invoke-EwspStart'; Aliases=@(); ShortDescription='Build and start the verified Compose stack'; Usage='.\ewsp.ps1 start'; LongDescription='Builds required application images, starts five services, waits for readiness, and verifies endpoints.'; Prerequisites=@('Docker Engine and Compose','Configured sibling repositories and .env'); Examples=@('.\ewsp.ps1 start'); SideEffects=@('Builds images and starts containers'); SafetyNotes=@('Does not update Git repositories'); RelatedCommands=@('status','stop','up'); Keywords=@('compose','docker','build','run') }
+        [PSCustomObject]@{ Name='stop'; Category='local'; Handler='Invoke-EwspStop'; Aliases=@(); ShortDescription='Stop the local Compose environment'; Usage='.\ewsp.ps1 stop'; LongDescription='Stops and removes project containers and networks.'; Prerequisites=@('Docker Engine and Compose'); Examples=@('.\ewsp.ps1 stop'); SideEffects=@('Stops local EWSP containers'); SafetyNotes=@('Preserves PostgreSQL and MinIO named volumes'); RelatedCommands=@('up','start','status'); Keywords=@('compose','docker','shutdown','storage') }
+        [PSCustomObject]@{ Name='status'; Category='local'; Handler='Invoke-EwspStatus'; Aliases=@(); ShortDescription='Show local repository and Compose state'; Usage='.\ewsp.ps1 status'; LongDescription='Reports safe Git classifications, configuration presence, and concise container health.'; Prerequisites=@('Git and Docker for complete runtime status'); Examples=@('.\ewsp.ps1 status'); SideEffects=@('May fetch Git remote metadata; does not mutate runtime state'); SafetyNotes=@('Secret values are redacted'); RelatedCommands=@('up','stop','k8s-status'); Keywords=@('diagnostics','compose','docker','git','troubleshoot') }
+        [PSCustomObject]@{ Name='k8s-up'; Category='kubernetes'; Handler='Invoke-EwspKubernetesUp'; Aliases=@(); ShortDescription='Reconcile EWSP on Docker Desktop Kubernetes'; Usage='.\ewsp.ps1 k8s-up'; LongDescription='Deploys configured immutable GHCR images, infrastructure, policies, and managed dashboard access.'; Prerequisites=@('Docker Desktop Kubernetes on context docker-desktop','kubectl, .env, and private GHCR configuration'); Examples=@('.\ewsp.ps1 k8s-up','.\ewsp.ps1 k8s-status'); SideEffects=@('Applies Kubernetes resources and starts/reconciles workloads','Starts or reuses a localhost dashboard port-forward'); SafetyNotes=@('Accepts only Docker Desktop Kubernetes; preserves persistent storage'); RelatedCommands=@('k8s-status','k8s-seed','k8s-stop'); Keywords=@('k8s','kubernetes','ghcr','deploy','cluster') }
+        [PSCustomObject]@{ Name='k8s-status'; Category='kubernetes'; Handler='Invoke-EwspKubernetesStatus'; Aliases=@(); ShortDescription='Show Kubernetes workloads, storage, and access state'; Usage='.\ewsp.ps1 k8s-status'; LongDescription='Reports workload readiness, images, PVCs, services, proxy trust, tunnels, and dashboard access.'; Prerequisites=@('kubectl and Docker Desktop Kubernetes'); Examples=@('.\ewsp.ps1 k8s-status'); SideEffects=@('Read-only cluster inspection'); SafetyNotes=@('Does not display Kubernetes Secret values'); RelatedCommands=@('k8s-up','k8s-stop','tunnel-status'); Keywords=@('k8s','kubernetes','diagnostics','pvc','storage','ghcr') }
+        [PSCustomObject]@{ Name='k8s-stop'; Category='kubernetes'; Handler='Invoke-EwspKubernetesStop'; Aliases=@(); ShortDescription='Stop Kubernetes workloads while preserving state'; Usage='.\ewsp.ps1 k8s-stop'; LongDescription='Stops managed access and scales EWSP application/infrastructure controllers down safely.'; Prerequisites=@('kubectl and Docker Desktop Kubernetes'); Examples=@('.\ewsp.ps1 k8s-stop'); SideEffects=@('Stops workloads and managed port-forward/tunnel processes'); SafetyNotes=@('PostgreSQL and MinIO PVCs, data, and Kubernetes resources are preserved'); RelatedCommands=@('k8s-up','k8s-status'); Keywords=@('k8s','kubernetes','shutdown','pvc','storage') }
+        [PSCustomObject]@{ Name='k8s-seed'; Category='data'; Handler='Invoke-EwspKubernetesSeed'; Aliases=@(); ShortDescription='Create missing local dashboard users'; Usage='.\ewsp.ps1 k8s-seed'; LongDescription='Streams the ignored backend local seed into Ready Docker Desktop Kubernetes PostgreSQL.'; Prerequisites=@('Context exactly docker-desktop and namespace ewsp','Ready postgres-0 with Bound PVC','Untracked and ignored ewsp-backend local seed file'); Examples=@('.\ewsp.ps1 k8s-seed'); SideEffects=@('Creates seed-defined users that are missing'); SafetyNotes=@('Uses ON CONFLICT DO NOTHING and never overwrites existing users','Local/demo use only'); RelatedCommands=@('k8s-reset-admin','k8s-status','k8s-up'); Keywords=@('seed','database','postgres','users','password') }
+        [PSCustomObject]@{ Name='k8s-reset-admin'; Category='data'; Handler='Invoke-EwspKubernetesResetAdmin'; Aliases=@(); ShortDescription='Reconcile the local Kubernetes admin credential'; Usage='.\ewsp.ps1 k8s-reset-admin'; LongDescription='Explicitly updates the existing seeded admin password_hash to the current ignored local seed definition and proves real login.'; Prerequisites=@('Context exactly docker-desktop and namespace ewsp','Ready postgres-0 with Bound PVC','Untracked and ignored ewsp-backend local seed file','Existing active verified ADMIN employee with expected local counts'); Examples=@('.\ewsp.ps1 k8s-reset-admin'); SideEffects=@('Intentionally changes only admin@ewsp.local password_hash','Performs real logins, which create normal backend login audit/session records; returned tokens are discarded'); SafetyNotes=@('Local/demo recovery only; not production password management','No force bypass and no PVC or user deletion'); RelatedCommands=@('k8s-seed','k8s-status','k8s-up'); Keywords=@('password','credential','admin','reset','reconcile','database','seed') }
+        [PSCustomObject]@{ Name='tunnel-quick'; Category='public'; Handler='Invoke-EwspQuickTunnelStart'; Aliases=@(); ShortDescription='Start a temporary Cloudflare Quick Tunnel'; Usage='.\ewsp.ps1 tunnel-quick'; LongDescription='Starts or reuses a managed public proof using a random trycloudflare.com URL; no domain is required.'; Prerequisites=@('Healthy Docker Desktop Kubernetes deployment','cloudflared installed'); Examples=@('.\ewsp.ps1 tunnel-quick','.\ewsp.ps1 tunnel-status'); SideEffects=@('Temporarily adjusts backend proxy trust and starts cloudflared','Publicly exposes the dashboard until tunnel-stop'); SafetyNotes=@('Temporary random URL; public exposure ends with tunnel-stop'); RelatedCommands=@('tunnel-status','tunnel-stop','k8s-up'); Keywords=@('tunnel','cloudflare','public','demo','trycloudflare') }
+        [PSCustomObject]@{ Name='tunnel-status'; Category='public'; Handler='Invoke-EwspQuickTunnelStatus'; Aliases=@(); ShortDescription='Show managed Quick Tunnel state'; Usage='.\ewsp.ps1 tunnel-status'; LongDescription='Reports the managed tunnel, proxy boundary, backend readiness, and access state.'; Prerequisites=@('kubectl; cloudflared only when a tunnel is active'); Examples=@('.\ewsp.ps1 tunnel-status'); SideEffects=@('Read-only inspection'); SafetyNotes=@('Does not display tokens or other credentials'); RelatedCommands=@('tunnel-quick','tunnel-stop','k8s-status'); Keywords=@('tunnel','cloudflare','public','diagnostics') }
+        [PSCustomObject]@{ Name='tunnel-stop'; Category='public'; Handler='Invoke-EwspQuickTunnelStop'; Aliases=@(); ShortDescription='Stop the managed Quick Tunnel'; Usage='.\ewsp.ps1 tunnel-stop'; LongDescription='Stops only the EWSP-managed cloudflared process and restores the prior backend proxy configuration.'; Prerequisites=@('kubectl for backend configuration restoration'); Examples=@('.\ewsp.ps1 tunnel-stop'); SideEffects=@('Ends public exposure and reconciles backend proxy settings'); SafetyNotes=@('Does not stop unrelated cloudflared processes or delete PVCs'); RelatedCommands=@('tunnel-quick','tunnel-status'); Keywords=@('tunnel','cloudflare','public','stop') }
+        [PSCustomObject]@{ Name='help'; Category='diagnostics'; Handler=$null; Aliases=@('-h','--help'); ShortDescription='Discover commands, categories, search, and workflows'; Usage='.\ewsp.ps1 help [commands|<command>|<category>|find <term>|workflow <topic>]'; LongDescription='Displays CLI guidance without loading runtime configuration or probing external tools.'; Prerequisites=@('None'); Examples=@('.\ewsp.ps1 help','.\ewsp.ps1 help commands','.\ewsp.ps1 help find database'); SideEffects=@('None'); SafetyNotes=@('Never executes orchestration commands'); RelatedCommands=@(); Keywords=@('commands','discover','usage','workflow') }
+    )
+}
+
+function Get-EwspHelpCategories {
+    @(
+        [PSCustomObject]@{ Id='local'; Name='Local / Compose'; Synonyms=@('local','compose','docker'); Description='Build and run the editable sibling workspace with Docker Compose.'; Commands=@('up','setup','update','start','status','stop'); Workflow='local' }
+        [PSCustomObject]@{ Id='kubernetes'; Name='Kubernetes'; Synonyms=@('k8s','kubernetes','ghcr'); Description='Deploy immutable GHCR images to the local Docker Desktop Kubernetes cluster.'; Commands=@('k8s-up','k8s-status','k8s-seed','k8s-reset-admin','k8s-stop'); Workflow='kubernetes' }
+        [PSCustomObject]@{ Id='data'; Name='Data / Seed'; Synonyms=@('data','seed','database','postgres','password'); Description='Create missing local users or explicitly reconcile the seeded admin credential.'; Commands=@('k8s-seed','k8s-reset-admin'); Workflow='kubernetes' }
+        [PSCustomObject]@{ Id='public'; Name='Public access'; Synonyms=@('public','tunnel','cloudflare','demo'); Description='Manage temporary Quick Tunnel public access; permanent Cloudflare configuration is reconciled by k8s-up.'; Commands=@('tunnel-quick','tunnel-status','tunnel-stop'); Workflow='public-demo' }
+        [PSCustomObject]@{ Id='diagnostics'; Name='Diagnostics'; Synonyms=@('diagnostics','troubleshooting','troubleshoot'); Description='Inspect local, Kubernetes, and tunnel state or discover CLI usage.'; Commands=@('status','k8s-status','tunnel-status','help'); Workflow=$null }
+    )
+}
+
+function Get-EwspHelpWorkflows {
+    @(
+        [PSCustomObject]@{ Name='local'; Aliases=@('compose'); Title='LOCAL DEVELOPMENT'; Description='Bootstrap and run the sibling source repositories with Compose.'; Steps=@('1. .\ewsp.ps1 up','2. .\ewsp.ps1 status','3. .\ewsp.ps1 stop'); Commands=@('up','status','stop') }
+        [PSCustomObject]@{ Name='kubernetes'; Aliases=@('k8s'); Title='KUBERNETES'; Description='Reconcile the local cluster, seed once when needed, inspect it, and stop safely.'; Steps=@('1. Configure .env with immutable GHCR image references','2. .\ewsp.ps1 k8s-up','3. .\ewsp.ps1 k8s-seed        # first/local database setup','4. .\ewsp.ps1 k8s-status','5. .\ewsp.ps1 k8s-stop'); Commands=@('k8s-up','k8s-seed','k8s-status','k8s-stop') }
+        [PSCustomObject]@{ Name='public-demo'; Aliases=@('public','tunnel'); Title='PUBLIC DEMO'; Description='Expose a healthy local Kubernetes dashboard through a temporary random URL.'; Steps=@('1. .\ewsp.ps1 k8s-up','2. .\ewsp.ps1 tunnel-quick','3. .\ewsp.ps1 tunnel-status','4. .\ewsp.ps1 tunnel-stop'); Commands=@('k8s-up','tunnel-quick','tunnel-status','tunnel-stop') }
+        [PSCustomObject]@{ Name='ghcr'; Aliases=@(); Title='PRIVATE GHCR DEPLOYMENT'; Description='Configure exact immutable private image references, then reconcile Kubernetes.'; Steps=@('1. Configure EWSP_BACKEND_IMAGE and EWSP_DASHBOARD_IMAGE with exact GHCR SHA tags','2. Configure GHCR_USERNAME and GHCR_TOKEN locally','3. .\ewsp.ps1 k8s-up','4. .\ewsp.ps1 k8s-status'); Commands=@('k8s-up','k8s-status') }
+    )
+}
+
+function Show-EwspTopLevelHelp {
     Write-Host @'
-EWSP local orchestration
+EWSP Local
 
 Usage:
-  .\ewsp.ps1 up      Safely prepare/update the workspace, build, start, verify, and summarize EWSP.
-  .\ewsp.ps1 k8s-up  Reconcile EWSP on Docker Desktop Kubernetes and open dashboard access.
-  .\ewsp.ps1 setup   Verify prerequisites, clone only missing repositories, and create .env if absent.
-  .\ewsp.ps1 update  Fetch and safely fast-forward clean behind-only repositories.
-  .\ewsp.ps1 start   Build only required application images and start the verified Docker stack.
-  .\ewsp.ps1 stop    Stop containers without deleting PostgreSQL or MinIO data.
-  .\ewsp.ps1 status  Show concise Git and Docker state.
-  .\ewsp.ps1 k8s-status  Show Kubernetes workloads, storage, services, images, and dashboard access.
-  .\ewsp.ps1 k8s-stop    Stop Kubernetes workloads and managed access while preserving PVC data.
-  .\ewsp.ps1 k8s-seed    Explicitly seed local dashboard users into Docker Desktop Kubernetes PostgreSQL.
-  .\ewsp.ps1 tunnel-quick  Start/reuse a temporary Cloudflare Quick Tunnel proof.
-  .\ewsp.ps1 tunnel-status Show Quick Tunnel, proxy boundary, readiness, and managed access state.
-  .\ewsp.ps1 tunnel-stop   Stop only the managed Quick Tunnel and restore backend configuration.
-  .\ewsp.ps1 help    Show this help.
+    .\ewsp.ps1 <command>
+
+Common workflows:
+    Local development       help workflow local
+    Kubernetes deployment   help workflow kubernetes
+    Public demo             help workflow public-demo
+    Status / troubleshooting help diagnostics
+
+Command categories:
+    Local / Compose   Kubernetes   Data / Seed   Public access   Diagnostics
+
+Examples:
+    .\ewsp.ps1 up
+    .\ewsp.ps1 k8s-up
+    .\ewsp.ps1 tunnel-quick
+
+Discover:
+    .\ewsp.ps1 help commands
+    .\ewsp.ps1 help <command>
+    .\ewsp.ps1 help <category>
+    .\ewsp.ps1 help find <term>
+    .\ewsp.ps1 help workflow <topic>
 '@
+}
+
+function Show-EwspCommandCatalog {
+    $registry = @(Get-EwspCommandRegistry)
+    foreach ($category in @(Get-EwspHelpCategories)) {
+        Write-Host ($category.Name.ToUpperInvariant())
+        foreach ($command in @($registry | Where-Object Category -eq $category.Id)) {
+            Write-Host ('    {0,-17} {1}' -f $command.Name, $command.ShortDescription)
+        }
+        Write-Host ''
+    }
+}
+
+function Show-EwspCommandHelp {
+    param([Parameter(Mandatory = $true)]$Metadata)
+    Write-Host $Metadata.Name.ToUpperInvariant()
+    Write-Host "    $($Metadata.ShortDescription)"
+    Write-Host ''
+    Write-Host 'Usage:'
+    Write-Host "    $($Metadata.Usage)"
+    Write-Host ''
+    Write-Host 'Purpose:'
+    Write-Host "    $($Metadata.LongDescription)"
+    foreach ($section in @(@('Prerequisites',$Metadata.Prerequisites),@('Important behavior / side effects',$Metadata.SideEffects),@('Safety notes',$Metadata.SafetyNotes),@('Examples',$Metadata.Examples),@('Related commands',$Metadata.RelatedCommands))) {
+        if (@($section[1]).Count -gt 0) {
+            Write-Host ''
+            Write-Host "$($section[0]):"
+            foreach ($line in @($section[1])) { Write-Host "    $line" }
+        }
+    }
+}
+
+function Show-EwspCategoryHelp {
+    param([Parameter(Mandatory = $true)]$Category)
+    $registry = @(Get-EwspCommandRegistry)
+    Write-Host $Category.Name.ToUpperInvariant()
+    Write-Host "    $($Category.Description)"
+    Write-Host ''
+    Write-Host 'Commands:'
+    foreach ($name in $Category.Commands) {
+        $command = @($registry | Where-Object Name -eq $name)[0]
+        Write-Host ('    {0,-17} {1}' -f $command.Name, $command.ShortDescription)
+    }
+    if ($Category.Workflow) {
+        Write-Host ''
+        Write-Host 'Common workflow:'
+        Write-Host "    .\ewsp.ps1 help workflow $($Category.Workflow)"
+    }
+}
+
+function Show-EwspWorkflowHelp {
+    param([Parameter(Mandatory = $true)]$Workflow)
+    Write-Host $Workflow.Title
+    Write-Host "    $($Workflow.Description)"
+    Write-Host ''
+    foreach ($step in $Workflow.Steps) { Write-Host "    $step" }
+    if ($Workflow.Name -eq 'kubernetes') {
+        Write-Host ''
+        Write-Host 'Credential recovery (explicit, when needed):'
+        Write-Host '    .\ewsp.ps1 k8s-reset-admin'
+    }
+}
+
+function Get-EwspEditDistance {
+    param([Parameter(Mandatory = $true)][string]$Left, [Parameter(Mandatory = $true)][string]$Right)
+    $leftLength = $Left.Length; $rightLength = $Right.Length
+    $matrix = New-Object 'int[,]' ($leftLength + 1), ($rightLength + 1)
+    for ($i = 0; $i -le $leftLength; $i++) { $matrix[$i,0] = $i }
+    for ($j = 0; $j -le $rightLength; $j++) { $matrix[0,$j] = $j }
+    for ($i = 1; $i -le $leftLength; $i++) {
+        for ($j = 1; $j -le $rightLength; $j++) {
+            $cost = if ($Left[$i - 1] -eq $Right[$j - 1]) { 0 } else { 1 }
+            $deletion = $matrix[($i - 1),$j] + 1
+            $insertion = $matrix[$i,($j - 1)] + 1
+            $substitution = $matrix[($i - 1),($j - 1)] + $cost
+            $matrix[$i,$j] = [Math]::Min([Math]::Min($deletion, $insertion), $substitution)
+        }
+    }
+    $matrix[$leftLength,$rightLength]
+}
+
+function Get-EwspCommandSuggestions {
+    param([Parameter(Mandatory = $true)][string]$InputName)
+    $needle = $InputName.ToLowerInvariant()
+    @(Get-EwspCommandRegistry | ForEach-Object {
+        $distance = Get-EwspEditDistance $needle $_.Name
+        [PSCustomObject]@{ Name=$_.Name; Distance=$distance; Prefix=if ($_.Name.StartsWith(($needle -split '-')[0])) { 0 } else { 1 } }
+    } | Where-Object { $_.Distance -le [Math]::Max(3, [Math]::Floor($needle.Length / 2)) } | Sort-Object Distance,Prefix,Name | Select-Object -First 3 | ForEach-Object Name)
+}
+
+function Show-EwspHelpSearch {
+    param([Parameter(Mandatory = $true)][string]$Term)
+    $needle = $Term.Trim().ToLowerInvariant()
+    $matches = @(Get-EwspCommandRegistry | ForEach-Object {
+        $command = $_
+        $fields = @($command.Name) + @($command.Aliases) + @($command.Category,$command.ShortDescription,$command.LongDescription) + @($command.Keywords)
+        $score = 0
+        foreach ($field in $fields) {
+            $value = ([string]$field).ToLowerInvariant()
+            if ($value -eq $needle) { $score += 20 } elseif ($value.StartsWith($needle)) { $score += 10 } elseif ($value.Contains($needle)) { $score += 4 }
+        }
+        if ($score -gt 0) { [PSCustomObject]@{ Command=$command; Score=$score } }
+    } | Sort-Object @{Expression='Score';Descending=$true}, @{Expression={$_.Command.Name};Descending=$false})
+    if ($matches.Count -eq 0) {
+        Write-Host "No help matches for '$Term'."
+        Write-Host 'Run: .\ewsp.ps1 help commands'
+        return
+    }
+    Write-Host "HELP MATCHES FOR '$Term'"
+    foreach ($match in $matches) { Write-Host ('    {0,-17} {1}' -f $match.Command.Name, $match.Command.ShortDescription) }
+}
+
+function Show-EwspHelp {
+    param([string[]]$Arguments = @())
+    if ($Arguments.Count -eq 0) { Show-EwspTopLevelHelp; return }
+    $topic = $Arguments[0].ToLowerInvariant()
+    if ($topic -eq 'commands') { Show-EwspCommandCatalog; return }
+    if ($topic -eq 'find') {
+        if ($Arguments.Count -lt 2) { throw 'Help search requires a term. Usage: .\ewsp.ps1 help find <term>' }
+        Show-EwspHelpSearch (($Arguments[1..($Arguments.Count - 1)]) -join ' '); return
+    }
+    if ($topic -eq 'workflow') {
+        if ($Arguments.Count -lt 2) {
+            Write-Host 'WORKFLOWS'; foreach ($item in @(Get-EwspHelpWorkflows)) { Write-Host "    $($item.Name)" }; return
+        }
+        $workflowTopic = $Arguments[1].ToLowerInvariant()
+        $workflow = @(Get-EwspHelpWorkflows | Where-Object { $_.Name -eq $workflowTopic -or $_.Aliases -contains $workflowTopic })
+        if ($workflow.Count -ne 1) { throw "Unknown help workflow '$workflowTopic'. Run .\ewsp.ps1 help workflow." }
+        Show-EwspWorkflowHelp $workflow[0]; return
+    }
+    $command = @(Get-EwspCommandRegistry | Where-Object { $_.Name -eq $topic -or $_.Aliases -contains $topic })
+    if ($command.Count -eq 1) { Show-EwspCommandHelp $command[0]; return }
+    $category = @(Get-EwspHelpCategories | Where-Object { $_.Id -eq $topic -or $_.Synonyms -contains $topic })
+    if ($category.Count -eq 1) { Show-EwspCategoryHelp $category[0]; return }
+    throw "Unknown help topic '$topic'. Run .\ewsp.ps1 help commands or .\ewsp.ps1 help find <term>."
 }
 
 function Invoke-EwspCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Command,
+        [string[]]$Arguments = @(),
         [Parameter(Mandatory = $true)][string]$LocalRoot
     )
-    switch ($Command.ToLowerInvariant()) {
-        'up'     { Invoke-EwspUp $LocalRoot }
-        'k8s-up' { Invoke-EwspKubernetesUp $LocalRoot }
-        'setup'  { Invoke-EwspSetup $LocalRoot }
-        'update' { Invoke-EwspUpdate $LocalRoot }
-        'start'  { Invoke-EwspStart $LocalRoot }
-        'stop'   { Invoke-EwspStop $LocalRoot }
-        'status' { Invoke-EwspStatus $LocalRoot }
-        'k8s-status' { Invoke-EwspKubernetesStatus $LocalRoot }
-        'k8s-stop' { Invoke-EwspKubernetesStop $LocalRoot }
-        'k8s-seed' { Invoke-EwspKubernetesSeed $LocalRoot }
-        'tunnel-quick' { Invoke-EwspQuickTunnelStart $LocalRoot }
-        'tunnel-status' { Invoke-EwspQuickTunnelStatus $LocalRoot }
-        'tunnel-stop' { Invoke-EwspQuickTunnelStop $LocalRoot }
-        'help'   { Show-EwspHelp }
-        default  { throw "Unknown command '$Command'. Run .\ewsp.ps1 help for usage." }
+    $normalized = $Command.ToLowerInvariant()
+    if ($normalized -eq '-h' -or $normalized -eq '--help') { Show-EwspTopLevelHelp; return }
+    $metadata = @(Get-EwspCommandRegistry | Where-Object { $_.Name -eq $normalized })
+    if ($metadata.Count -ne 1) {
+        $suggestions = @(Get-EwspCommandSuggestions $normalized)
+        $message = "Unknown command: $Command"
+        if ($suggestions.Count) { $message += "`n`nDid you mean:`n" + (($suggestions | ForEach-Object { "    $_" }) -join "`n") }
+        $message += "`n`nRun:`n    .\ewsp.ps1 help`n    .\ewsp.ps1 help commands"
+        throw $message
     }
+    if ($Arguments.Count -eq 1 -and ($Arguments[0] -eq '--help' -or $Arguments[0] -eq '-h')) {
+        Show-EwspCommandHelp $metadata[0]
+        return
+    }
+    if ($normalized -eq 'help') { Show-EwspHelp $Arguments; return }
+    if ($Arguments.Count -gt 0) {
+        throw "Command '$normalized' does not accept arguments. Run .\ewsp.ps1 help $normalized."
+    }
+    & $metadata[0].Handler $LocalRoot
 }
 
 Export-ModuleMember -Function @(
@@ -4090,6 +4556,18 @@ Export-ModuleMember -Function @(
     'Get-EwspKubernetesSeedVerification',
     'Assert-EwspKubernetesSeedVerification',
     'Invoke-EwspKubernetesSeed',
+    'Resolve-EwspKubernetesAdminSeedContract',
+    'Get-EwspKubernetesAdminSnapshot',
+    'Assert-EwspKubernetesAdminSnapshot',
+    'Invoke-EwspKubernetesAdminCredentialUpdate',
+    'Assert-EwspAdminLoginResponse',
+    'Test-EwspKubernetesAdminLogin',
+    'Invoke-EwspKubernetesResetAdmin',
+    'Get-EwspCommandRegistry',
+    'Get-EwspHelpCategories',
+    'Get-EwspHelpWorkflows',
+    'Get-EwspCommandSuggestions',
+    'Show-EwspHelp',
     'Get-EwspCloudflaredInfo',
     'Assert-EwspCloudflaredAvailable',
     'ConvertTo-EwspLiteralIpv4Regex',
