@@ -23,6 +23,8 @@ spec:
         app.kubernetes.io/part-of: ewsp
     spec:
       terminationGracePeriodSeconds: 45
+      imagePullSecrets:
+        - name: ghcr-pull
       containers:
         - name: backend
           image: ewsp-backend:replace-with-ewsp-local-tag

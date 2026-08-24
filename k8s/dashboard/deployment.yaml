@@ -22,6 +22,8 @@ spec:
         app.kubernetes.io/component: web
         app.kubernetes.io/part-of: ewsp
     spec:
+      imagePullSecrets:
+        - name: ghcr-pull
       containers:
         - name: dashboard
           image: ewsp-dashboard:replace-with-ewsp-local-tag

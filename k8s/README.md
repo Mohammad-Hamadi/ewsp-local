@@ -16,8 +16,8 @@ The supported Docker Desktop Kubernetes workflow is:
 ```
 
 `k8s-up` requires the current context to be exactly `docker-desktop` and verifies
-the reachable single-node Docker Desktop kind cluster, Ready node, Docker Engine,
-and default `standard` local-path StorageClass. It does not switch context or
+the reachable single-node Docker Desktop kind cluster, Ready node/container runtime,
+and default `standard` local-path StorageClass. It does not require Docker Engine for application builds, switch context, or
 reset the cluster. Resources are reconciled in dependency order and readiness is
 observed rather than delayed with fixed sleeps.
 
@@ -95,14 +95,14 @@ may reach backend TCP 8080, and only cloudflared Pods may reach dashboard TCP
 empirically on the installed CNI after policy changes; policy-object presence
 alone is not reported as proof of enforcement.
 
-Backend and dashboard image tags use the existing source-aware EWSP image
-identity. An exact clean image already in Docker Desktop is reused; a missing
-image is built from the application repository's own Dockerfile; dirty source
-gets a unique session tag. The checked-in non-`latest` image placeholders are
-never rewritten. Exact Deployments are rendered under ignored
+Backend and dashboard images come only from explicit `EWSP_BACKEND_IMAGE` and
+`EWSP_DASHBOARD_IMAGE` values in ignored `.env`. Each ref must name its expected
+private GHCR repository with a full 40-character Git SHA tag. `main`, `latest`,
+wrong repositories, and malformed refs fail before apply. The checked-in image
+placeholders are never rewritten. Exact Deployments are rendered under ignored
 `.tmp/k8s/rendered/`, validated, and applied with `imagePullPolicy:
-IfNotPresent`. Docker Desktop's local image mirror supplies the images to the
-kind node; the workflow does not push them.
+IfNotPresent`. Kubernetes pulls a missing artifact from GHCR; `k8s-up` does not
+inspect sibling source or invoke a local application build.
 
 On success, an EWSP-managed `kubectl port-forward` exposes only the dashboard at
 `http://localhost:3000`. Its state is recorded under ignored `.tmp/k8s/` so a
@@ -129,8 +129,25 @@ creates a restrictive ignored temporary Secret artifact, applies
 application. Values are not printed. The required keys are `POSTGRES_USER`,
 `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, and `JWT_SECRET`.
 
+Private application pulls use `GHCR_USERNAME` plus a local `GHCR_TOKEN` with
+package-read permission only. `k8s-up` generates a separate ACL-restricted,
+ignored `kubernetes.io/dockerconfigjson` artifact, reconciles Secret `ghcr-pull`,
+and removes the artifact after apply. The credential is never stored in tracked
+YAML, a ConfigMap, application environment, container image, or logs. Do not use
+the Actions `GITHUB_TOKEN` locally.
+
 Bucket initialization is deliberately omitted: the application retains its
 existing lazy bucket-creation behavior.
+
+## Explicit local user seed
+
+`./ewsp.ps1 k8s-seed` is an explicit local-development command restricted to
+the exact `docker-desktop` context and `ewsp` namespace. Neither `k8s-up` nor
+the tunnel workflows invoke it automatically. The ignored sibling backend seed
+is idempotent and uses `ON CONFLICT DO NOTHING`: it adds missing local users but
+does not reset passwords or overwrite any other existing user row in a
+preserved PostgreSQL PVC. Existing persisted users may therefore retain
+credentials or other values that differ from the current ignored seed file.
 
 ## Persistence and coexistence
 

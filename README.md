@@ -98,7 +98,11 @@ The dashboard uses same-origin API and WebSocket paths. Its image does not accep
 
 ## Image identity and builds
 
-The ownership flow is application source repository to repository-owned Dockerfile to Docker image to `ewsp-local` Compose or Kubernetes orchestration.
+The image flows are intentionally separate:
+
+- CI: application source -> tests -> private GHCR image tagged with the full Git SHA.
+- Kubernetes: configured immutable GHCR SHA image -> `ghcr-pull` -> Pod.
+- Compose: sibling application source -> repository-owned Dockerfile -> local image -> local container.
 
 Clean backend and dashboard images are tagged from the application source commit plus a hash of any orchestration-supplied build-time inputs. Neither application currently has such an input, so API and WebSocket URLs do not affect dashboard image identity. The dashboard application commit identifies its tracked Dockerfile, `.dockerignore`, and Nginx proxy configuration. An existing matching clean image is reused. A dirty source repository receives a session-specific `dirty-...` tag and is never falsely represented as its clean commit.
 
@@ -140,7 +144,11 @@ Docker Compose remains the convenient local development and full-stack path driv
 
 `k8s-up` requires Docker Desktop Kubernetes, refuses any context other than `docker-desktop`, verifies the single Ready Docker Desktop kind node and default local-path StorageClass, and reconciles resources without deleting persistent data. It applies resources in dependency order, waits for infrastructure before applications, verifies all five workloads and their internal DNS/service contracts, then starts or reuses an EWSP-managed dashboard port-forward. Browser access is through `http://localhost:3000`; dashboard Nginx keeps `/api` and `/ws` on that same origin and forwards them to `backend:8080`. If port 3000 belongs to an external process, Kubernetes startup reports the conflict and does not stop that process.
 
-Application images use the same source-aware identity and reuse/build logic as Compose. Clean images are reused when present; a missing exact image is built from the sibling repository's own Dockerfile; dirty repositories retain their unique non-reusable session tags. Checked-in placeholders remain unchanged while exact non-`latest` images are rendered under ignored `.tmp/k8s/rendered/` files for validation and application. Docker Desktop supplies those local images to its kind cluster through its local registry mirror; nothing is pushed.
+Kubernetes never builds the backend or dashboard locally. It requires `EWSP_BACKEND_IMAGE` and `EWSP_DASHBOARD_IMAGE` in ignored `.env`; each must use its expected `ghcr.io/mohammad-hamadi/...` repository and a full 40-character Git SHA tag. `main`, `latest`, malformed refs, and wrong repositories are refused rather than rewritten. Checked-in placeholders remain environment-independent while the exact refs are rendered under ignored `.tmp/k8s/rendered/` files with `imagePullPolicy: IfNotPresent`.
+
+Both GHCR packages are private. Put `GHCR_USERNAME` and `GHCR_TOKEN` directly in ignored `.env`; the token needs package-read permission only and does not need repository write permission. Never use a GitHub Actions `GITHUB_TOKEN` locally or paste the token into chat. `k8s-up` creates/reconciles the `kubernetes.io/dockerconfigjson` Secret `ghcr-pull`, applies it without printing values, and removes its ACL-restricted ignored temporary artifact. The backend and dashboard Pod specs reference that Secret through `imagePullSecrets`.
+
+`k8s-up` therefore does not require the backend or dashboard sibling checkout merely to deploy. Repository discovery remains part of Compose/setup/update/status. `k8s-seed` intentionally still requires the sibling backend repository for its ignored local seed SQL file.
 
 The real `ewsp-infrastructure-secrets` Secret is generated from the current ignored `.env`, applied without displaying its values, and its temporary ignored file is removed after application. `k8s/config/secrets.example.yaml` remains placeholder-only and is never applied by the command.
 
@@ -163,9 +171,9 @@ Kubernetes PostgreSQL starts with its own PVC. Flyway applies the database schem
 
 `k8s-seed` is local-development/demo tooling restricted permanently to the exact `docker-desktop` context and `ewsp` namespace. It requires the existing sibling `ewsp-backend/local-dev/seed-dashboard-users.sql` file to be present, untracked, and ignored through the backend repository's local Git exclusions. The command streams that file directly to `psql` in the Ready `postgres-0` Pod with SQL error stopping enabled; it does not copy SQL into a Pod, ConfigMap, Secret, image, or tracked manifest. Output contains only safe user counts and identity/role/status/verification fields.
 
-The existing seed is idempotent, so rerunning the command reconciles the same local identities without duplicates. It is not invoked by `k8s-up` or `tunnel-quick`, has no context override, and must never be converted into a production Flyway migration. Production deployments must provision real employee accounts through an explicitly controlled operational process and must not receive local/demo users or credentials.
+The existing seed is idempotent and uses `ON CONFLICT DO NOTHING`, so rerunning the command adds missing local identities without duplicates. It does not reset passwords or overwrite any other existing user row in a preserved PostgreSQL PVC. Persisted users can therefore retain credentials or other values that differ from the current ignored seed file. The seed is not invoked by `k8s-up` or `tunnel-quick`, has no context override, and must never be converted into a production Flyway migration. Production deployments must provision real employee accounts through an explicitly controlled operational process and must not receive local/demo users or credentials.
 
-`k8s-status` reports the guarded environment, controllers, Pods, readiness, restarts, images, expected Services, PVCs, and dashboard access without exposing secrets. `k8s-stop` stops only the managed dashboard port-forward and scales EWSP Deployments and StatefulSets to zero. It preserves the namespace, Services, ConfigMaps, Secret, PVCs, PVs, Docker images, and all Compose resources; the next `k8s-up` restores every workload to one replica.
+`k8s-status` reports configured and running image refs, Pod image IDs/digests, agreement, controllers, readiness, restarts, expected Services, PVC UIDs, and dashboard access without exposing secrets. `k8s-stop` stops only the managed dashboard port-forward and scales EWSP Deployments and StatefulSets to zero. It preserves the namespace, Services, ConfigMaps, Secrets, PVCs, PVs, cached images, and all Compose resources; the next `k8s-up` restores every workload to one replica with the same configured GHCR refs.
 
 The guaranteed target is the PC-dependent, single-node Docker Desktop kind cluster (verified with Kubernetes v1.36.1). Do not run Compose and Kubernetes simultaneously when both would need dashboard host port 3000; neither workflow automatically stops the other.
 

@@ -50,7 +50,7 @@ services:
       start_period: 10s
 
   backend:
-    image: ${EWSP_BACKEND_IMAGE:-ewsp-backend:local}
+    image: ${EWSP_COMPOSE_BACKEND_IMAGE:-ewsp-backend:local}
     build:
       context: ../ewsp-backend
       dockerfile: Dockerfile
@@ -84,7 +84,7 @@ services:
       start_period: 60s
 
   dashboard:
-    image: ${EWSP_DASHBOARD_IMAGE:-ewsp-dashboard:local}
+    image: ${EWSP_COMPOSE_DASHBOARD_IMAGE:-ewsp-dashboard:local}
     build:
       context: ../ewsp-dashboard
       dockerfile: Dockerfile

@@ -415,6 +415,10 @@ try {
     $composeConfiguration = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'compose.yml')
     Assert-Contains $composeConfiguration 'context: ../ewsp-backend' 'backend uses its sibling repository build context'
     Assert-Contains $composeConfiguration 'context: ../ewsp-dashboard' 'dashboard uses its sibling repository build context'
+    Assert-Contains $composeConfiguration '${EWSP_COMPOSE_BACKEND_IMAGE:-ewsp-backend:local}' 'Compose backend tag is isolated from Kubernetes GHCR configuration'
+    Assert-Contains $composeConfiguration '${EWSP_COMPOSE_DASHBOARD_IMAGE:-ewsp-dashboard:local}' 'Compose dashboard tag is isolated from Kubernetes GHCR configuration'
+    Assert-NotContains $composeConfiguration '${EWSP_BACKEND_IMAGE' 'Compose does not consume Kubernetes backend image configuration'
+    Assert-NotContains $composeConfiguration '${EWSP_DASHBOARD_IMAGE' 'Compose does not consume Kubernetes dashboard image configuration'
     Assert-Equal ([regex]::Matches($composeConfiguration, '(?m)^\s+dockerfile: Dockerfile\s*$').Count) 2 'both applications use their repository Dockerfile'
     Assert-NotContains $composeConfiguration 'additional_contexts:' 'dashboard has no orchestration additional build context'
     Assert-NotContains $composeConfiguration 'VITE_API_BASE_URL' 'Compose does not pass the obsolete dashboard API build argument'
@@ -673,6 +677,34 @@ try {
     Assert-Equal $cloudflareSecretObject.metadata.name 'cloudflared-tunnel-token' 'Cloudflare Secret uses the stable runtime name'
     Assert-Equal (@($cloudflareSecretObject.data.PSObject.Properties.Name) -join ',') 'token' 'Cloudflare Secret has only the token key'
 
+    $backendGhcrImage = 'ghcr.io/mohammad-hamadi/ewsp-backend:8d21240124744909af65a5b535c52e5b4b064931'
+    $dashboardGhcrImage = 'ghcr.io/mohammad-hamadi/ewsp-dashboard:b7fb4e7b83b3b07737fd2d7bb7ca07a7df1edd6c'
+    $ghcrValues = @{ EWSP_BACKEND_IMAGE = $backendGhcrImage; EWSP_DASHBOARD_IMAGE = $dashboardGhcrImage; GHCR_USERNAME = 'test-user'; GHCR_TOKEN = 'opaque-ghcr-token' }
+    $ghcr = Get-EwspGhcrConfiguration $ghcrValues -RequireCredentials
+    Assert-Equal $ghcr.BackendImage $backendGhcrImage 'backend immutable GHCR image configuration is accepted'
+    Assert-Equal $ghcr.DashboardImage $dashboardGhcrImage 'dashboard immutable GHCR image configuration is accepted'
+    foreach ($invalid in @(
+        @{ Values = @{ EWSP_DASHBOARD_IMAGE = $dashboardGhcrImage }; Category = 'GHCR_CONFIGURATION_MISSING'; Label = 'missing backend image config' },
+        @{ Values = @{ EWSP_BACKEND_IMAGE = $backendGhcrImage }; Category = 'GHCR_CONFIGURATION_MISSING'; Label = 'missing dashboard image config' },
+        @{ Values = @{ EWSP_BACKEND_IMAGE = 'ghcr.io/mohammad-hamadi/ewsp-backend:latest'; EWSP_DASHBOARD_IMAGE = $dashboardGhcrImage }; Category = 'GHCR_IMAGE_INVALID'; Label = 'latest tag' },
+        @{ Values = @{ EWSP_BACKEND_IMAGE = $backendGhcrImage; EWSP_DASHBOARD_IMAGE = 'ghcr.io/mohammad-hamadi/ewsp-dashboard:main' }; Category = 'GHCR_IMAGE_INVALID'; Label = 'main tag' },
+        @{ Values = @{ EWSP_BACKEND_IMAGE = 'docker.io/mohammad-hamadi/ewsp-backend:8d21240124744909af65a5b535c52e5b4b064931'; EWSP_DASHBOARD_IMAGE = $dashboardGhcrImage }; Category = 'GHCR_IMAGE_INVALID'; Label = 'wrong registry' },
+        @{ Values = @{ EWSP_BACKEND_IMAGE = 'ghcr.io/mohammad-hamadi/not-backend:8d21240124744909af65a5b535c52e5b4b064931'; EWSP_DASHBOARD_IMAGE = $dashboardGhcrImage }; Category = 'GHCR_IMAGE_INVALID'; Label = 'wrong repository' },
+        @{ Values = @{ EWSP_BACKEND_IMAGE = 'malformed'; EWSP_DASHBOARD_IMAGE = $dashboardGhcrImage }; Category = 'GHCR_IMAGE_INVALID'; Label = 'malformed image' }
+    )) { Assert-ThrowsCategory { Get-EwspGhcrConfiguration $invalid.Values | Out-Null } $invalid.Category "$($invalid.Label) is rejected" }
+    $missingUsername = $ghcrValues.Clone(); $missingUsername.Remove('GHCR_USERNAME')
+    Assert-ThrowsCategory { Get-EwspGhcrConfiguration $missingUsername -RequireCredentials | Out-Null } 'GHCR_CREDENTIALS_MISSING' 'missing GHCR username is rejected'
+    $missingToken = $ghcrValues.Clone(); $missingToken.Remove('GHCR_TOKEN')
+    Assert-ThrowsCategory { Get-EwspGhcrConfiguration $missingToken -RequireCredentials | Out-Null } 'GHCR_CREDENTIALS_MISSING' 'missing GHCR token is rejected'
+    $ghcrSecretOutput = @(& { New-EwspGhcrPullSecretArtifact $localRoot $ghcr -SkipAcl } *>&1)
+    $ghcrSecretPath = [string]$ghcrSecretOutput[-1]
+    $ghcrSecretText = Get-Content -Raw -LiteralPath $ghcrSecretPath
+    Assert-NotContains $ghcrSecretText 'opaque-ghcr-token' 'temporary GHCR Secret stores no plaintext token'
+    Assert-NotContains ($ghcrSecretOutput -join ' ') 'opaque-ghcr-token' 'GHCR Secret preparation never logs the token'
+    $ghcrSecretObject = $ghcrSecretText | ConvertFrom-Json
+    Assert-Equal $ghcrSecretObject.metadata.name 'ghcr-pull' 'GHCR pull Secret uses stable name'
+    Assert-Equal $ghcrSecretObject.type 'kubernetes.io/dockerconfigjson' 'GHCR pull Secret uses Docker registry type'
+
     $backendSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash
     $dashboardSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash
     $renderRunner = {
@@ -683,15 +715,15 @@ try {
         $renderedText = (Get-Content -Raw -LiteralPath $source) -replace 'ewsp-(backend|dashboard):replace-with-ewsp-local-tag', $image
         New-FakeNativeResult 0 @($renderedText -split "`r?`n")
     }
-    $rendered = New-EwspKubernetesRenderedManifests $localRoot 'ewsp-backend:test-a8b83aa9' 'ewsp-dashboard:test-471172e8' $renderRunner
-    Assert-Contains (Get-Content -Raw $rendered.Backend) 'ewsp-backend:test-a8b83aa9' 'backend placeholder renders to exact image'
-    Assert-Contains (Get-Content -Raw $rendered.Dashboard) 'ewsp-dashboard:test-471172e8' 'dashboard placeholder renders to exact image'
+    $rendered = New-EwspKubernetesRenderedManifests $localRoot $backendGhcrImage $dashboardGhcrImage $renderRunner
+    Assert-Contains (Get-Content -Raw $rendered.Backend) $backendGhcrImage 'backend placeholder renders to exact image'
+    Assert-Contains (Get-Content -Raw $rendered.Dashboard) $dashboardGhcrImage 'dashboard placeholder renders to exact image'
     Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash $backendSourceHash 'backend source manifest remains unchanged after rendering'
     Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash $dashboardSourceHash 'dashboard source manifest remains unchanged after rendering'
-    Assert-ThrowsContains { New-EwspKubernetesRenderedManifests $localRoot 'ewsp-backend:latest' 'ewsp-dashboard:test' $renderRunner | Out-Null } 'Invalid resolved application image' 'latest Kubernetes application image is rejected'
+    Assert-ThrowsCategory { New-EwspKubernetesRenderedManifests $localRoot 'ghcr.io/mohammad-hamadi/ewsp-backend:latest' $dashboardGhcrImage $renderRunner | Out-Null } 'GHCR_IMAGE_INVALID' 'latest Kubernetes application image is rejected during rendering'
 
-    $applyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath)
-    Assert-Equal (@($applyPlan.Stage) -join ',') 'NAMESPACE,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD' 'Kubernetes resources have deterministic apply order'
+    $applyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath $ghcrSecretPath)
+    Assert-Equal (@($applyPlan.Stage) -join ',') 'NAMESPACE,GHCR_SECRET,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD' 'Kubernetes resources have deterministic apply order'
     Assert-Equal @($applyPlan | Where-Object { $_.Files -contains (Join-Path $localRoot 'k8s\config\secrets.example.yaml') }).Count 0 'placeholder Secret is absent from apply plan'
     $validationCapture = @{}
     $validationRunner = {
@@ -699,15 +731,15 @@ try {
         $validationCapture['Arguments'] = @($arguments)
         [PSCustomObject]@{ ExitCode = 0; Output = @('validated') }
     }.GetNewClosure()
-    Assert-EwspKubernetesManifestSet $localRoot $applyPlan 'ewsp-backend:test-a8b83aa9' 'ewsp-dashboard:test-471172e8' $validationRunner | Out-Null
+    Assert-EwspKubernetesManifestSet $localRoot $applyPlan $backendGhcrImage $dashboardGhcrImage $validationRunner | Out-Null
     $script:PassCount++
     Write-Host 'PASS: complete rendered Kubernetes manifest set validates'
     Assert-Contains ($validationCapture.Arguments -join ' ') '--dry-run=client --validate=true' 'manifest validation is strict client-side validation'
     Assert-NotContains ($validationCapture.Arguments -join ' ') 'secrets.example.yaml' 'example Secret is never validated as a real apply input'
 
-    $permanentApplyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath $tunnelEnabled $cloudflareSecretPath)
-    Assert-Equal (@($permanentApplyPlan.Stage) -join ',') 'NAMESPACE,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD,NETWORKPOLICIES,CLOUDFLARE_SECRET,CLOUDFLARED' 'permanent tunnel resources have deterministic apply order'
-    Assert-EwspKubernetesManifestSet $localRoot $permanentApplyPlan 'ewsp-backend:test-a8b83aa9' 'ewsp-dashboard:test-471172e8' $validationRunner | Out-Null
+    $permanentApplyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath $ghcrSecretPath $tunnelEnabled $cloudflareSecretPath)
+    Assert-Equal (@($permanentApplyPlan.Stage) -join ',') 'NAMESPACE,GHCR_SECRET,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD,NETWORKPOLICIES,CLOUDFLARE_SECRET,CLOUDFLARED' 'permanent tunnel resources have deterministic apply order'
+    Assert-EwspKubernetesManifestSet $localRoot $permanentApplyPlan $backendGhcrImage $dashboardGhcrImage $validationRunner | Out-Null
     $script:PassCount++
     Write-Host 'PASS: permanent tunnel rendered manifest set validates'
     $cloudflaredManifest = Get-Content -Raw (Join-Path $localRoot 'k8s\cloudflared\deployment.yaml')
@@ -733,6 +765,8 @@ try {
 
     $pullPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Pending'; containerStatuses = @([PSCustomObject]@{ state = [PSCustomObject]@{ waiting = [PSCustomObject]@{ reason = 'ImagePullBackOff' } }; lastState = [PSCustomObject]@{} }) } }
     Assert-Equal (Get-EwspKubernetesPodReason $pullPod) 'ImagePullBackOff' 'Pod diagnostics recognize image pull failure'
+    Assert-Equal (Get-EwspKubernetesFailureCategory @([PSCustomObject]@{ Reason = 'ErrImagePull' })) 'IMAGE_PULL_FAILED' 'private registry pull failure is classified'
+    Assert-Equal (Get-EwspKubernetesFailureCategory @([PSCustomObject]@{ Reason = 'ImagePullBackOff' })) 'IMAGE_PULL_BACKOFF' 'ImagePullBackOff is classified'
     $oomPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Running'; containerStatuses = @([PSCustomObject]@{ state = [PSCustomObject]@{}; lastState = [PSCustomObject]@{ terminated = [PSCustomObject]@{ reason = 'OOMKilled' } } }) } }
     Assert-Equal (Get-EwspKubernetesPodReason $oomPod) 'OOMKilled' 'Pod diagnostics recognize OOMKilled'
     $unscheduledPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Pending'; containerStatuses = @(); conditions = @([PSCustomObject]@{ type = 'PodScheduled'; status = 'False'; reason = 'Unschedulable'; message = 'insufficient memory' }) } }
@@ -774,6 +808,16 @@ try {
     $healthySnapshots = @(Get-EwspKubernetesWorkloadSnapshot $snapshotRunner)
     Assert-Equal @($healthySnapshots | Where-Object Ready).Count 5 'Kubernetes status recognizes all five healthy workloads'
     Assert-Equal @($healthySnapshots | Where-Object Name -eq 'backend')[0].Image 'backend:test-tag' 'Kubernetes status reports running application image'
+    $matchingSnapshots = @(
+        [PSCustomObject]@{ Name = 'backend'; Image = $backendGhcrImage },
+        [PSCustomObject]@{ Name = 'dashboard'; Image = $dashboardGhcrImage }
+    )
+    Assert-Equal (Assert-EwspDeployedApplicationImages $ghcr $matchingSnapshots) $true 'configured and running immutable images can agree'
+    $mismatchedSnapshots = @(
+        [PSCustomObject]@{ Name = 'backend'; Image = $backendGhcrImage },
+        [PSCustomObject]@{ Name = 'dashboard'; Image = 'ghcr.io/mohammad-hamadi/ewsp-dashboard:0000000000000000000000000000000000000000' }
+    )
+    Assert-ThrowsCategory { Assert-EwspDeployedApplicationImages $ghcr $mismatchedSnapshots | Out-Null } 'DEPLOYED_IMAGE_MISMATCH' 'configured and running image mismatch is rejected'
     $snapshotMode.BackendReason = 'ImagePullBackOff'
     $unhealthySnapshots = @(Get-EwspKubernetesWorkloadSnapshot $snapshotRunner)
     $unhealthyBackend = @($unhealthySnapshots | Where-Object Name -eq 'backend')[0]
@@ -979,8 +1023,10 @@ try {
     Assert-Contains $kubeFailure.Message 'Category: KUBERNETES_READINESS_FAILURE' 'Kubernetes failure preserves category'
     Assert-Contains $kubeFailure.Message 'Not attempted afterward: FINAL_VERIFICATION, ACCESS_SETUP' 'Kubernetes failure lists skipped phases'
     Assert-NotContains (Protect-EwspDiagnosticText $kubeFailure.Message $testSecretValues) 'test-jwt-private' 'Kubernetes diagnostics redact secret values'
+    Assert-NotContains (Protect-EwspDiagnosticText 'failed opaque-ghcr-token' $ghcrValues) 'opaque-ghcr-token' 'Kubernetes diagnostics redact GHCR token values'
 
     Remove-EwspKubernetesSecretArtifact $localRoot
+    Remove-EwspGhcrPullSecretArtifact $localRoot
     Remove-EwspCloudflareTunnelSecretArtifact $localRoot
 
     $moduleText = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
@@ -1008,7 +1054,14 @@ try {
     $tunnelStartFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspQuickTunnelStart \{.*?(?=function Invoke-EwspQuickTunnelStatus \{)').Value
     Assert-NotContains $k8sUpFunction 'Invoke-EwspKubernetesSeed' 'k8s-up never invokes local user seeding automatically'
     Assert-NotContains $tunnelStartFunction 'Invoke-EwspKubernetesSeed' 'tunnel-quick never invokes local user seeding automatically'
-    Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'REPOSITORY_STATE', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
+    Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'CONFIGURATION', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
+    Assert-NotContains $k8sUpFunction 'New-EwspImagePlan' 'Kubernetes path does not use sibling source-aware image planning'
+    Assert-NotContains $k8sUpFunction 'Invoke-EwspImageBuilds' 'Kubernetes path does not invoke local application builds'
+    Assert-NotContains $k8sUpFunction 'Resolve-EwspRepositoryPath' 'Kubernetes startup does not require sibling application repositories'
+    Assert-Contains $moduleText 'Invoke-EwspImageBuilds $LocalRoot $EnvironmentInfo' 'Compose start retains local application build behavior'
+    Assert-Contains $moduleText "Resolve-EwspRepositoryPath `$LocalRoot `$repository" 'repository discovery remains available for Compose and seed workflows'
+    Assert-Contains (Get-Content -Raw (Join-Path $localRoot 'k8s\backend\deployment.yaml')) 'imagePullSecrets:' 'backend Pod uses private registry pull Secret'
+    Assert-Contains (Get-Content -Raw (Join-Path $localRoot 'k8s\dashboard\deployment.yaml')) 'name: ghcr-pull' 'dashboard Pod uses private registry pull Secret'
     Assert-Contains $moduleText "'--tail=40'" 'Kubernetes failure diagnostics bound recent logs'
     Assert-Contains $moduleText 'Select-Object -Last 12' 'Kubernetes failure diagnostics bound recent events'
     Assert-Contains $moduleText "@('scale', `$target.Type, `$name" 'k8s-stop uses reversible controller scaling'

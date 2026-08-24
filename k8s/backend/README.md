@@ -8,23 +8,23 @@ update; multi-replica STOMP distribution is intentionally out of scope.
 ## Image tag
 
 The checked-in image `ewsp-backend:replace-with-ewsp-local-tag` is an explicit
-placeholder and must be replaced before deployment. `ewsp-local` tags clean
-backend builds as `ewsp-backend:<commit12>-<build-input-hash12>` and dirty builds
-as `ewsp-backend:dirty-<commit>-<session>`, so a static manifest cannot safely
-name the current locally built image.
+environment-independent placeholder. `k8s-up` replaces it only in ignored
+rendered output with `EWSP_BACKEND_IMAGE`, which must be the private
+`ghcr.io/mohammad-hamadi/ewsp-backend` image tagged by a full Git SHA.
 
 Render the Deployment with the actual tag without editing the checked-in
 manifest, then apply the rendered output when deployment is intended:
 
 ```powershell
-$backendImage = 'ewsp-backend:<actual-ewsp-local-tag>'
+$backendImage = 'ghcr.io/mohammad-hamadi/ewsp-backend:<full-git-sha>'
 kubectl set image -f k8s/backend/deployment.yaml `
   backend=$backendImage --local -o yaml |
   kubectl apply -f -
 ```
 
-Apply `configmap.yaml` and `service.yaml` separately. The image must exist in the
-Docker Desktop image store because `imagePullPolicy` is `IfNotPresent`.
+`imagePullPolicy: IfNotPresent` permits cache reuse, while the `ghcr-pull`
+`imagePullSecret` lets Kubernetes obtain a missing private image. `k8s-up`
+creates that Secret from ignored local credentials and never builds this image.
 
 ## Health and shutdown
 

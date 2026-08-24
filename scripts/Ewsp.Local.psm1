@@ -695,7 +695,9 @@ function Get-EwspEffectiveEnvironmentValues {
             'POSTGRES_HOST_PORT', 'REDIS_HOST_PORT', 'MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD',
             'MINIO_BUCKET_NAME', 'MINIO_API_HOST_PORT', 'MINIO_CONSOLE_HOST_PORT',
             'BACKEND_HOST_PORT', 'SPRING_PROFILES_ACTIVE', 'JWT_SECRET',
-            'EWSP_CORS_ALLOWED_ORIGINS', 'DASHBOARD_HOST_PORT'
+            'EWSP_CORS_ALLOWED_ORIGINS', 'DASHBOARD_HOST_PORT',
+            'EWSP_COMPOSE_BACKEND_IMAGE', 'EWSP_COMPOSE_DASHBOARD_IMAGE',
+            'EWSP_BACKEND_IMAGE', 'EWSP_DASHBOARD_IMAGE', 'GHCR_USERNAME', 'GHCR_TOKEN'
         )
     ) | Sort-Object -Unique
     foreach ($name in $knownNames) {
@@ -1292,6 +1294,13 @@ function Get-EwspFailureNextAction {
         'KUBERNETES_API_UNREACHABLE' { return 'Start Docker Desktop Kubernetes, wait for its API to become ready, and retry. The cluster was not reset.' }
         'KUBERNETES_NODE_NOT_READY' { return 'Wait for the Docker Desktop Kubernetes node to become Ready and retry; inspect Docker Desktop diagnostics if it remains NotReady.' }
         'KUBERNETES_STORAGE_UNAVAILABLE' { return "Restore the default 'standard' StorageClass backed by rancher.io/local-path, then retry without deleting existing PVCs." }
+        'GHCR_CONFIGURATION_MISSING' { return 'Set both immutable EWSP_BACKEND_IMAGE and EWSP_DASHBOARD_IMAGE values in ignored .env, then rerun k8s-up.' }
+        'GHCR_CREDENTIALS_MISSING' { return 'Create a local GitHub token with read:packages only, then place GHCR_USERNAME and GHCR_TOKEN directly in ignored .env. Do not paste the token into chat.' }
+        'GHCR_IMAGE_INVALID' { return 'Use the exact expected ghcr.io repository and a full 40-character Git SHA tag; main and latest are refused.' }
+        'GHCR_SECRET_PREPARATION_FAILED' { return 'Verify .tmp is ignored and local file ACL changes are permitted, then rerun k8s-up.' }
+        'IMAGE_PULL_FAILED' { return 'Verify the immutable image exists and the local read-only package credential can pull it, then rerun k8s-up.' }
+        'IMAGE_PULL_BACKOFF' { return 'Review the bounded Pod events above, correct the GHCR credential or image reference, then rerun k8s-up.' }
+        'DEPLOYED_IMAGE_MISMATCH' { return 'Inspect the Deployment and Pod image refs, then rerun k8s-up to reconcile the configured immutable images.' }
         'KUBERNETES_MANIFEST_INVALID' { return 'Correct the reported source or rendered manifest contract and rerun k8s-up. No placeholder Secret was applied.' }
         'KUBERNETES_APPLY_FAILURE' { return 'Review the named resource and bounded Kubernetes diagnostics, correct the manifest or cluster condition, and rerun k8s-up.' }
         'KUBERNETES_READINESS_FAILURE' { return 'Review the bounded Pod, event, and PVC diagnostics, correct the evidenced condition, and rerun k8s-up.' }
@@ -1792,7 +1801,7 @@ function Show-EwspKubernetesEnvironment {
     }
     Write-Host "      namespace    $($kubernetes.Namespace) ($(if ($kubernetes.NamespaceExists) { 'present' } else { 'absent' }))"
     Write-Host "      storage      $($kubernetes.StorageClass.Name) [$($kubernetes.StorageClass.Provisioner)]"
-    Write-Host "      Docker       $($EnvironmentInfo.Docker.EngineVersion)"
+    Write-Host "      runtime      $(@($kubernetes.Nodes.ContainerRuntime) -join ', ')"
 }
 
 function Get-EwspKubernetesPaths {
@@ -1805,6 +1814,7 @@ function Get-EwspKubernetesPaths {
         BackendRendered = Join-Path $temporaryRoot 'rendered\backend-deployment.yaml'
         DashboardRendered = Join-Path $temporaryRoot 'rendered\dashboard-deployment.yaml'
         Secret = Join-Path $temporaryRoot 'secrets.local.json'
+        GhcrSecret = Join-Path $temporaryRoot 'ghcr-pull.local.json'
         CloudflareSecret = Join-Path $temporaryRoot 'cloudflared-token.local.json'
         PortForwardState = Join-Path $temporaryRoot 'port-forward.json'
         PortForwardOutput = Join-Path $temporaryRoot 'port-forward.out.log'
@@ -1813,6 +1823,44 @@ function Get-EwspKubernetesPaths {
         QuickTunnelOutput = Join-Path $temporaryRoot 'quick-tunnel.out.log'
         QuickTunnelError = Join-Path $temporaryRoot 'quick-tunnel.err.log'
     }
+}
+
+function Get-EwspGhcrConfiguration {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$EnvironmentValues,
+        [switch]$RequireCredentials
+    )
+    $imageDefinitions = @(
+        @{ Service = 'backend'; Setting = 'EWSP_BACKEND_IMAGE'; Repository = 'ghcr.io/mohammad-hamadi/ewsp-backend' },
+        @{ Service = 'dashboard'; Setting = 'EWSP_DASHBOARD_IMAGE'; Repository = 'ghcr.io/mohammad-hamadi/ewsp-dashboard' }
+    )
+    $images = @()
+    foreach ($definition in $imageDefinitions) {
+        if (-not $EnvironmentValues.ContainsKey($definition.Setting) -or
+            [string]::IsNullOrWhiteSpace([string]$EnvironmentValues[$definition.Setting])) {
+            throw (New-EwspKubernetesException "$($definition.Setting) is missing or empty." 'GHCR_CONFIGURATION_MISSING' $definition.Service 'Read .env')
+        }
+        $value = ([string]$EnvironmentValues[$definition.Setting]).Trim()
+        $expectedPattern = '^' + [regex]::Escape($definition.Repository) + ':(?<sha>[0-9a-fA-F]{40})$'
+        if ($value -notmatch $expectedPattern) {
+            $reason = if ($value -match '(?i):latest$') { 'latest is a moving tag' }
+                elseif ($value -match '(?i):main$') { 'main is a moving tag' }
+                elseif ($value -notmatch '^ghcr\.io/') { 'registry must be ghcr.io' }
+                elseif ($value -notmatch ('^' + [regex]::Escape($definition.Repository) + ':')) { "repository must be $($definition.Repository)" }
+                else { 'tag must be a full 40-character Git SHA' }
+            throw (New-EwspKubernetesException "$($definition.Setting) is invalid: $reason." 'GHCR_IMAGE_INVALID' $definition.Service 'Validate immutable GHCR image configuration')
+        }
+        $images += [PSCustomObject]@{ Service = $definition.Service; Setting = $definition.Setting; Tag = $value; GitSha = $Matches.sha.ToLowerInvariant() }
+    }
+    $username = if ($EnvironmentValues.ContainsKey('GHCR_USERNAME')) { ([string]$EnvironmentValues.GHCR_USERNAME).Trim() } else { '' }
+    $token = if ($EnvironmentValues.ContainsKey('GHCR_TOKEN')) { [string]$EnvironmentValues.GHCR_TOKEN } else { '' }
+    if ($RequireCredentials -and ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($token))) {
+        $missing = @()
+        if ([string]::IsNullOrWhiteSpace($username)) { $missing += 'GHCR_USERNAME' }
+        if ([string]::IsNullOrWhiteSpace($token)) { $missing += 'GHCR_TOKEN' }
+        throw (New-EwspKubernetesException "Private GHCR pull credentials are missing: $($missing -join ', '). Values were not printed." 'GHCR_CREDENTIALS_MISSING' 'GHCR pull credentials' 'Read ignored .env')
+    }
+    [PSCustomObject]@{ Images = $images; BackendImage = @($images | Where-Object Service -eq 'backend')[0].Tag; DashboardImage = @($images | Where-Object Service -eq 'dashboard')[0].Tag; Username = $username; Token = $token }
 }
 
 function Get-EwspPermanentTunnelConfiguration {
@@ -2487,6 +2535,58 @@ function Remove-EwspKubernetesSecretArtifact {
     if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
 }
 
+function New-EwspGhcrPullSecretArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)]$GhcrConfiguration,
+        [switch]$SkipAcl
+    )
+    if ([string]::IsNullOrWhiteSpace([string]$GhcrConfiguration.Username) -or
+        [string]::IsNullOrWhiteSpace([string]$GhcrConfiguration.Token)) {
+        throw (New-EwspKubernetesException 'Private GHCR pull credentials are missing. Values were not printed.' 'GHCR_CREDENTIALS_MISSING' 'GHCR pull credentials' 'Read ignored .env')
+    }
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $secretPath = Assert-EwspSafeTemporaryPath $LocalRoot $paths.GhcrSecret
+    New-Item -ItemType Directory -Path (Split-Path -Parent $secretPath) -Force | Out-Null
+    $auth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($GhcrConfiguration.Username):$($GhcrConfiguration.Token)"))
+    $dockerConfig = [ordered]@{ auths = [ordered]@{ 'ghcr.io' = [ordered]@{
+        username = [string]$GhcrConfiguration.Username
+        password = [string]$GhcrConfiguration.Token
+        auth = $auth
+    } } }
+    $dockerConfigJson = $dockerConfig | ConvertTo-Json -Depth 6 -Compress
+    $secret = [ordered]@{
+        apiVersion = 'v1'; kind = 'Secret'
+        metadata = [ordered]@{
+            name = 'ghcr-pull'; namespace = $script:EwspKubernetesNamespace
+            labels = [ordered]@{ 'app.kubernetes.io/component' = 'registry-credentials'; 'app.kubernetes.io/part-of' = 'ewsp' }
+        }
+        type = 'kubernetes.io/dockerconfigjson'
+        data = [ordered]@{ '.dockerconfigjson' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($dockerConfigJson)) }
+    }
+    try {
+        [IO.File]::WriteAllText($secretPath, ($secret | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        $ignored = Invoke-EwspNative 'git' @('-C', $LocalRoot, 'check-ignore', '--quiet', '--', '.tmp/k8s/ghcr-pull.local.json')
+        if ($ignored.ExitCode -ne 0) { throw 'Temporary GHCR pull Secret artifact is not ignored by Git.' }
+        if (-not $SkipAcl -and (Get-EwspHostPlatform).Name -eq 'Windows') {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $aclResult = Invoke-EwspNative 'icacls' @($secretPath, '/inheritance:r', '/grant:r', "${identity}:(F)")
+            if ($aclResult.ExitCode -ne 0) { throw 'Failed to restrict the temporary GHCR pull Secret artifact ACL.' }
+        }
+    } catch {
+        if (Test-Path -LiteralPath $secretPath -PathType Leaf) { Remove-Item -LiteralPath $secretPath -Force }
+        if ($_.Exception.Data.Contains('Category')) { throw }
+        throw (New-EwspKubernetesException 'Unable to prepare the ignored GHCR pull Secret artifact. Credential values were not printed.' 'GHCR_SECRET_PREPARATION_FAILED' 'ghcr-pull Secret' 'Prepare ignored Secret artifact')
+    }
+    $secretPath
+}
+
+function Remove-EwspGhcrPullSecretArtifact {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $path = Assert-EwspSafeTemporaryPath $LocalRoot (Get-EwspKubernetesPaths $LocalRoot).GhcrSecret
+    if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+}
+
 function New-EwspCloudflareTunnelSecretArtifact {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
@@ -2537,10 +2637,9 @@ function New-EwspKubernetesRenderedManifests {
         [Parameter(Mandatory = $true)][string]$DashboardImage,
         [scriptblock]$CommandRunner
     )
-    foreach ($image in @($BackendImage, $DashboardImage)) {
-        if ($image -match ':latest$' -or $image -match 'replace-with-ewsp-local-tag') {
-            throw (New-EwspKubernetesException "Invalid resolved application image '$image'." 'KUBERNETES_MANIFEST_INVALID' 'Application images' 'Resolve source-aware image tags')
-        }
+    if ($BackendImage -notmatch '^ghcr\.io/mohammad-hamadi/ewsp-backend:[0-9a-fA-F]{40}$' -or
+        $DashboardImage -notmatch '^ghcr\.io/mohammad-hamadi/ewsp-dashboard:[0-9a-fA-F]{40}$') {
+        throw (New-EwspKubernetesException 'Resolved application images must be the expected GHCR repositories with full Git SHA tags.' 'GHCR_IMAGE_INVALID' 'Application images' 'Validate immutable GHCR image configuration')
     }
     $paths = Clear-EwspKubernetesRenderedArtifacts $LocalRoot
     $sources = @(
@@ -2570,12 +2669,14 @@ function Get-EwspKubernetesApplyPlan {
         [Parameter(Mandatory = $true)][string]$LocalRoot,
         [Parameter(Mandatory = $true)]$Rendered,
         [Parameter(Mandatory = $true)][string]$SecretPath,
+        [Parameter(Mandatory = $true)][string]$GhcrSecretPath,
         $PermanentTunnel,
         [string]$CloudflareSecretPath
     )
     $root = Join-Path $LocalRoot 'k8s'
     $plan = @(
         [PSCustomObject]@{ Stage = 'NAMESPACE'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'namespace.yaml')) },
+        [PSCustomObject]@{ Stage = 'GHCR_SECRET'; Scope = 'Infrastructure'; Files = @($GhcrSecretPath) },
         [PSCustomObject]@{ Stage = 'CONFIGMAPS'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'config\postgres-configmap.yaml'), (Join-Path $root 'backend\configmap.yaml')) },
         [PSCustomObject]@{ Stage = 'SECRET'; Scope = 'Infrastructure'; Files = @($SecretPath) },
         [PSCustomObject]@{ Stage = 'POSTGRES'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'postgres\service.yaml'), (Join-Path $root 'postgres\statefulset.yaml')) },
@@ -2624,7 +2725,7 @@ function Assert-EwspKubernetesManifestSet {
     foreach ($requiredText in @(
         'namespace: ewsp', 'name: ewsp-infrastructure-secrets', 'name: postgres-config', 'name: backend-config',
         'storage: 5Gi', 'storage: 10Gi', 'medium: Memory', 'sizeLimit: 128Mi',
-        'imagePullPolicy: IfNotPresent', 'app.kubernetes.io/part-of: ewsp'
+        'imagePullPolicy: IfNotPresent', 'imagePullSecrets:', 'name: ghcr-pull', 'app.kubernetes.io/part-of: ewsp'
     )) {
         if (-not $combined.Contains($requiredText)) {
             throw (New-EwspKubernetesException "Manifest contract is missing '$requiredText'." 'KUBERNETES_MANIFEST_INVALID' 'Manifest set' 'Validate Kubernetes source contract')
@@ -2864,6 +2965,7 @@ function Get-EwspKubernetesPvcSnapshot {
         @($object.items | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.metadata.name
+                Uid = if ($_.metadata.PSObject.Properties['uid']) { $_.metadata.uid } else { '<unknown>' }
                 Status = $_.status.phase
                 Capacity = if ($_.status.PSObject.Properties['capacity']) { $_.status.capacity.storage } else { '<pending>' }
                 StorageClass = $_.spec.storageClassName
@@ -2954,10 +3056,41 @@ function Wait-EwspKubernetesWorkloads {
         if ($notReady.Count) { throw "Workloads remained non-ready: $(@($notReady.Name) -join ', ')" }
     } catch {
         Show-EwspKubernetesFailureDiagnostics $EnvironmentValues $CommandRunner
-        $exception = New-EwspKubernetesException $_.Exception.Message 'KUBERNETES_READINESS_FAILURE' 'EWSP workloads' 'Wait for Kubernetes rollouts and PVC binding'
+        $failureSnapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+        $pullFailure = @($failureSnapshots | Where-Object { $_.Reason -in @('ErrImagePull', 'ImagePullBackOff') } | Select-Object -First 1)
+        $category = Get-EwspKubernetesFailureCategory $failureSnapshots
+        $component = if ($pullFailure.Count) { $pullFailure[0].Name } else { 'EWSP workloads' }
+        $exception = New-EwspKubernetesException $_.Exception.Message $category $component 'Wait for Kubernetes rollouts and PVC binding'
         throw $exception
     }
     Get-EwspKubernetesWorkloadSnapshot $CommandRunner
+}
+
+function Get-EwspKubernetesFailureCategory {
+    param([object[]]$Snapshots)
+    if (@($Snapshots | Where-Object Reason -eq 'ImagePullBackOff').Count) { return 'IMAGE_PULL_BACKOFF' }
+    if (@($Snapshots | Where-Object Reason -eq 'ErrImagePull').Count) { return 'IMAGE_PULL_FAILED' }
+    'KUBERNETES_READINESS_FAILURE'
+}
+
+function Assert-EwspDeployedApplicationImages {
+    param(
+        [Parameter(Mandatory = $true)]$GhcrConfiguration,
+        [object[]]$Snapshots,
+        [scriptblock]$CommandRunner
+    )
+    if (-not $Snapshots) { $Snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner) }
+    foreach ($expected in @(
+        @{ Name = 'backend'; Image = $GhcrConfiguration.BackendImage },
+        @{ Name = 'dashboard'; Image = $GhcrConfiguration.DashboardImage }
+    )) {
+        $snapshot = @($Snapshots | Where-Object Name -eq $expected.Name | Select-Object -First 1)
+        if (-not $snapshot.Count -or $snapshot[0].Image -cne $expected.Image) {
+            $actual = if ($snapshot.Count -and $snapshot[0].Image) { $snapshot[0].Image } else { '<none>' }
+            throw (New-EwspKubernetesException "Configured image for $($expected.Name) does not match the running Pod image (configured=$($expected.Image), running=$actual)." 'DEPLOYED_IMAGE_MISMATCH' $expected.Name 'Compare configured and running Pod images')
+        }
+    }
+    $true
 }
 
 function Wait-EwspKubernetesInfrastructure {
@@ -3588,12 +3721,26 @@ function Show-EwspKubernetesStatusSnapshot {
     Write-Host 'Applications'
     Write-Host '------------'
     $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
+    $configuredImages = @{}
+    try {
+        $configuredGhcr = Get-EwspGhcrConfiguration (Get-EwspEffectiveEnvironmentValues $LocalRoot)
+        $configuredImages['backend'] = $configuredGhcr.BackendImage
+        $configuredImages['dashboard'] = $configuredGhcr.DashboardImage
+    } catch {
+        Write-Host "Configured GHCR images: invalid or missing ($($_.Exception.Data['Category']))" -ForegroundColor Yellow
+    }
     foreach ($snapshot in $snapshots) {
         $state = if (-not $snapshot.ControllerExists) { 'Missing' } elseif ($snapshot.Desired -eq 0) { 'Stopped' } elseif ($snapshot.Ready) { 'Ready' } else { $snapshot.Reason }
         Write-Host ("{0,-10} {1,-11} {2,-18} ready={3}/{4} restarts={5} image={6}" -f `
             $snapshot.Name, $snapshot.ControllerType, $(if ($snapshot.PodName) { $snapshot.PodName } else { '<none>' }), `
             $snapshot.ReadyReplicas, $snapshot.Desired, $snapshot.Restarts, $(if ($snapshot.Image) { $snapshot.Image } else { '<none>' }))
         if ($state -notin @('Ready', 'Stopped')) { Write-Host "             state=$state" -ForegroundColor Yellow }
+        if ($snapshot.Name -in @('backend', 'dashboard')) {
+            $configured = if ($configuredImages.ContainsKey($snapshot.Name)) { $configuredImages[$snapshot.Name] } else { '<not configured>' }
+            $agreement = if ($configured -eq '<not configured>') { 'unknown' } elseif ($snapshot.Image -ceq $configured) { 'yes' } else { 'NO' }
+            Write-Host "             configured=$configured"
+            Write-Host "             imageID=$(if ($snapshot.ImageId) { $snapshot.ImageId } else { '<none>' }) match=$agreement"
+        }
     }
     Write-Host ''
     Write-Host 'Storage'
@@ -3601,7 +3748,7 @@ function Show-EwspKubernetesStatusSnapshot {
     $pvcs = @(Get-EwspKubernetesPvcSnapshot $CommandRunner)
     foreach ($name in @('postgres-data-postgres-0', 'minio-data-minio-0')) {
         $pvc = @($pvcs | Where-Object Name -eq $name)
-        if ($pvc.Count) { Write-Host ("{0,-28} {1,-8} {2}" -f $name, $pvc[0].Status, $pvc[0].Capacity) }
+        if ($pvc.Count) { Write-Host ("{0,-28} {1,-8} {2} uid={3}" -f $name, $pvc[0].Status, $pvc[0].Capacity, $pvc[0].Uid) }
         else { Write-Host ("{0,-28} Missing" -f $name) -ForegroundColor Yellow }
     }
     Write-Host ''
@@ -3643,7 +3790,7 @@ function Show-EwspKubernetesStatusSnapshot {
 function Invoke-EwspKubernetesStatus {
     param([Parameter(Mandatory = $true)][string]$LocalRoot)
     $environment = Get-EwspKubernetesEnvironment
-    Assert-EwspKubernetesEnvironment $environment -RequireDocker | Out-Null
+    Assert-EwspKubernetesEnvironment $environment | Out-Null
     Show-EwspKubernetesStatusSnapshot $LocalRoot $environment | Out-Null
 }
 
@@ -3671,7 +3818,7 @@ function Wait-EwspKubernetesPodsStopped {
 function Invoke-EwspKubernetesStop {
     param([Parameter(Mandatory = $true)][string]$LocalRoot)
     $environment = Get-EwspKubernetesEnvironment
-    Assert-EwspKubernetesEnvironment $environment -RequireDocker | Out-Null
+    Assert-EwspKubernetesEnvironment $environment | Out-Null
     Stop-EwspKubernetesPortForward $LocalRoot | Out-Null
     foreach ($target in @(
         @{ Type = 'deployment'; Names = @('cloudflared', 'dashboard', 'backend', 'redis') },
@@ -3693,14 +3840,14 @@ function Invoke-EwspKubernetesStop {
 function Invoke-EwspKubernetesUp {
     param([Parameter(Mandatory = $true)][string]$LocalRoot)
     $phaseNames = @(
-        'K8S_ENVIRONMENT', 'REPOSITORY_STATE', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION',
+        'K8S_ENVIRONMENT', 'CONFIGURATION', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION',
         'TRUST_BOUNDARY', 'MANIFEST_VALIDATION', 'INFRASTRUCTURE_APPLY', 'APPLICATION_APPLY',
         'READINESS_WAIT', 'FINAL_VERIFICATION', 'ACCESS_SETUP'
     )
     $completed = New-Object System.Collections.Generic.List[string]
     $context = @{
         Environment = $null; Configuration = $null; EnvironmentValues = $null; Ports = $null
-        ImagePlan = $null; PreviousTagEnvironment = $null; SecretPath = $null; CloudflareSecretPath = $null; Rendered = $null
+        Ghcr = $null; ImagePlan = $null; SecretPath = $null; GhcrSecretPath = $null; CloudflareSecretPath = $null; Rendered = $null
         ApplyPlan = $null; States = $null; PortForward = $null; DashboardPort = $null
         OldBackendImage = $null; OldDashboardImage = $null; PermanentTunnel = $null; PodCidrBoundary = $null
     }
@@ -3708,51 +3855,40 @@ function Invoke-EwspKubernetesUp {
 
     Invoke-EwspUpPhase 1 $total $phaseNames[0] 'Detecting Kubernetes environment' {
         $runtime = Get-EwspRuntimeEnvironment
-        Assert-EwspPrerequisites -RequireDocker -EnvironmentInfo $runtime | Out-Null
         $context.Environment = Get-EwspKubernetesEnvironment -RuntimeEnvironment $runtime
-        Assert-EwspKubernetesEnvironment $context.Environment -RequireDocker | Out-Null
+        Assert-EwspKubernetesEnvironment $context.Environment | Out-Null
         Show-EwspKubernetesEnvironment $context.Environment
     } $completed $phaseNames[1..($total - 1)] $context.Environment 'Detect kubectl, Docker Desktop Kubernetes, nodes, namespace, and storage' 'Kubernetes environment' -WorkflowName 'k8s-up' | Out-Null
 
-    Invoke-EwspUpPhase 2 $total $phaseNames[1] 'Checking repository state' {
+    Invoke-EwspUpPhase 2 $total $phaseNames[1] 'Validating local deployment configuration' {
         if (-not (Test-Path -LiteralPath (Join-Path $LocalRoot '.env') -PathType Leaf)) {
             throw '.env is missing. Run .\ewsp.ps1 setup first; no Kubernetes resources were changed.'
         }
-        $context.Configuration = Get-EwspConfiguration $LocalRoot
         $context.EnvironmentValues = Get-EwspEffectiveEnvironmentValues $LocalRoot
         $context.PermanentTunnel = Get-EwspPermanentTunnelConfiguration $context.EnvironmentValues
         $context.Ports = @(Assert-EwspEnvironmentConfiguration $context.EnvironmentValues)
-        foreach ($repository in @($context.Configuration.Repositories | Where-Object { $_.ContainsKey('Image') })) {
-            $path = Resolve-EwspRepositoryPath $LocalRoot $repository
-            $state = Get-EwspRepositoryState $path $repository.ExpectedIdentity $repository.PrimaryBranch
-            if ($state.Classification -eq 'MISSING' -or $state.Classification -eq 'IDENTITY_MISMATCH') {
-                throw "$($repository.Name) repository state is $($state.Classification). No files were changed."
-            }
-            Assert-EwspApplicationBuildAssets $path $repository
-            Write-Host ("      {0,-14} {1} {2}" -f $repository.Name, $state.ShortCommit, $(if ($state.Dirty) { 'dirty' } else { 'clean' }))
-        }
-    } $completed $phaseNames[2..($total - 1)] $context.Environment 'Validate sibling identities, source state, Docker assets, and .env' 'EWSP repositories' -WorkflowName 'k8s-up' | Out-Null
+        $context.Ghcr = Get-EwspGhcrConfiguration $context.EnvironmentValues -RequireCredentials
+        Write-Host '      immutable GHCR image refs and local pull credential setting names validated; credential values hidden'
+    } $completed $phaseNames[2..($total - 1)] $context.Environment 'Validate .env, immutable GHCR refs, and credential setting names' 'GHCR deployment configuration' -WorkflowName 'k8s-up' | Out-Null
 
-    Invoke-EwspUpPhase 3 $total $phaseNames[2] 'Resolving and preparing application images' {
-        $context.ImagePlan = New-EwspImagePlan $LocalRoot $context.Configuration $context.EnvironmentValues
-        $tagEnvironment = @{}
-        foreach ($descriptor in $context.ImagePlan.Descriptors) {
-            if ($descriptor.Tag -match ':latest$') { throw "Resolved image must not use latest: $($descriptor.Tag)" }
-            $tagEnvironment[$descriptor.EnvironmentName] = $descriptor.Tag
-            Write-Host "      resolved $($descriptor.Service): $($descriptor.Tag)"
-        }
-        $context.PreviousTagEnvironment = Set-EwspProcessEnvironment $tagEnvironment
-        Invoke-EwspImageBuilds $LocalRoot $context.Environment $context.ImagePlan.Descriptors
-    } $completed $phaseNames[3..($total - 1)] $context.Environment 'Resolve, reuse, or build source-aware local images' 'Application images' -WorkflowName 'k8s-up' | Out-Null
+    Invoke-EwspUpPhase 3 $total $phaseNames[2] 'Resolving immutable application images' {
+        $context.ImagePlan = [PSCustomObject]@{ Descriptors = @(
+            [PSCustomObject]@{ Service = 'backend'; Tag = $context.Ghcr.BackendImage },
+            [PSCustomObject]@{ Service = 'dashboard'; Tag = $context.Ghcr.DashboardImage }
+        ) }
+        foreach ($descriptor in $context.ImagePlan.Descriptors) { Write-Host "      configured $($descriptor.Service): $($descriptor.Tag)" }
+        Write-Host '      Kubernetes will pull these private CI artifacts; no local application build was requested'
+    } $completed $phaseNames[3..($total - 1)] $context.Environment 'Resolve exact configured GHCR SHA images without Docker builds' 'Application images' -WorkflowName 'k8s-up' | Out-Null
 
     try {
         Invoke-EwspUpPhase 4 $total $phaseNames[3] 'Preparing local Kubernetes Secret' {
             $context.SecretPath = New-EwspKubernetesSecretArtifact $LocalRoot $context.EnvironmentValues
+            $context.GhcrSecretPath = New-EwspGhcrPullSecretArtifact $LocalRoot $context.Ghcr
             if ($context.PermanentTunnel.Enabled) {
                 $context.CloudflareSecretPath = New-EwspCloudflareTunnelSecretArtifact $LocalRoot $context.PermanentTunnel.Token
             }
-            Write-Host "      generated ignored local Secret artifact(s); permanent tunnel=$(if ($context.PermanentTunnel.Enabled) { 'enabled' } else { 'disabled' }); values hidden"
-        } $completed $phaseNames[4..($total - 1)] $context.Environment 'Generate real local Secret from .env' 'Kubernetes Secret' -WorkflowName 'k8s-up' | Out-Null
+            Write-Host "      generated ignored infrastructure and ghcr-pull Secret artifacts; permanent tunnel=$(if ($context.PermanentTunnel.Enabled) { 'enabled' } else { 'disabled' }); values hidden"
+        } $completed $phaseNames[4..($total - 1)] $context.Environment 'Generate local Secrets from .env with values hidden' 'Kubernetes Secrets' -WorkflowName 'k8s-up' | Out-Null
 
         Invoke-EwspUpPhase 5 $total $phaseNames[4] 'Deriving permanent trusted-proxy boundary' {
             if ($context.PermanentTunnel.Enabled) {
@@ -3765,7 +3901,7 @@ function Invoke-EwspKubernetesUp {
             $backendDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'backend')[0]
             $dashboardDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'dashboard')[0]
             $context.Rendered = New-EwspKubernetesRenderedManifests $LocalRoot $backendDescriptor.Tag $dashboardDescriptor.Tag
-            $context.ApplyPlan = @(Get-EwspKubernetesApplyPlan $LocalRoot $context.Rendered $context.SecretPath $context.PermanentTunnel $context.CloudflareSecretPath)
+            $context.ApplyPlan = @(Get-EwspKubernetesApplyPlan $LocalRoot $context.Rendered $context.SecretPath $context.GhcrSecretPath $context.PermanentTunnel $context.CloudflareSecretPath)
             Assert-EwspKubernetesManifestSet $LocalRoot $context.ApplyPlan $backendDescriptor.Tag $dashboardDescriptor.Tag | Out-Null
             $dashboardPort = @($context.Ports | Where-Object Service -eq 'dashboard')[0].Port
             $context.DashboardPort = [int]$dashboardPort
@@ -3777,6 +3913,8 @@ function Invoke-EwspKubernetesUp {
             Invoke-EwspKubernetesApplyStages $context.ApplyPlan 'Infrastructure'
             Remove-EwspKubernetesSecretArtifact $LocalRoot
             $context.SecretPath = $null
+            Remove-EwspGhcrPullSecretArtifact $LocalRoot
+            $context.GhcrSecretPath = $null
             Wait-EwspKubernetesInfrastructure $context.EnvironmentValues | Out-Null
         } $completed $phaseNames[7..($total - 1)] $context.Environment 'Apply namespace, ConfigMaps, Secret, PostgreSQL, Redis, and MinIO' 'Kubernetes infrastructure' -WorkflowName 'k8s-up' | Out-Null
 
@@ -3804,6 +3942,7 @@ function Invoke-EwspKubernetesUp {
 
         Invoke-EwspUpPhase 9 $total $phaseNames[8] 'Waiting for Kubernetes readiness' {
             $context.States = @(Wait-EwspKubernetesWorkloads $context.EnvironmentValues)
+            Assert-EwspDeployedApplicationImages $context.Ghcr $context.States | Out-Null
             if ($context.PermanentTunnel.Enabled) { Wait-EwspCloudflaredReady $context.EnvironmentValues | Out-Null }
         } $completed $phaseNames[9..($total - 1)] $context.Environment 'Wait for five workloads, optional cloudflared, and two PVCs' 'EWSP workloads' -WorkflowName 'k8s-up' | Out-Null
 
@@ -3826,7 +3965,11 @@ function Invoke-EwspKubernetesUp {
                 Write-Warning 'Temporary Cloudflare Secret cleanup failed. Remove .tmp\k8s\cloudflared-token.local.json manually without displaying it.'
             }
         }
-        if ($context.PreviousTagEnvironment) { Restore-EwspProcessEnvironment $context.PreviousTagEnvironment }
+        if ($context.GhcrSecretPath) {
+            try { Remove-EwspGhcrPullSecretArtifact $LocalRoot } catch {
+                Write-Warning 'Temporary GHCR pull Secret cleanup failed. Remove .tmp\k8s\ghcr-pull.local.json manually without displaying it.'
+            }
+        }
     }
 
     Write-Host ''
@@ -3912,8 +4055,11 @@ Export-ModuleMember -Function @(
     'New-EwspKubernetesException',
     'Get-EwspKubernetesEnvironment',
     'Assert-EwspKubernetesEnvironment',
+    'Get-EwspGhcrConfiguration',
     'New-EwspKubernetesSecretArtifact',
     'Remove-EwspKubernetesSecretArtifact',
+    'New-EwspGhcrPullSecretArtifact',
+    'Remove-EwspGhcrPullSecretArtifact',
     'Get-EwspPermanentTunnelConfiguration',
     'ConvertTo-EwspPodCidrRegex',
     'Get-EwspNodePodCidr',
@@ -3924,6 +4070,8 @@ Export-ModuleMember -Function @(
     'Assert-EwspKubernetesManifestSet',
     'Get-EwspKubernetesPodReason',
     'Get-EwspKubernetesWorkloadSnapshot',
+    'Get-EwspKubernetesFailureCategory',
+    'Assert-EwspDeployedApplicationImages',
     'Get-EwspKubernetesPvcSnapshot',
     'Get-EwspKubernetesServiceSnapshot',
     'Resolve-EwspKubernetesPortForwardAction',

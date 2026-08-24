@@ -16,24 +16,23 @@ the dashboard Deployment.
 ## Image tag
 
 The checked-in image `ewsp-dashboard:replace-with-ewsp-local-tag` is an explicit
-placeholder and must be replaced before deployment. `ewsp-local` tags clean
-dashboard builds as `ewsp-dashboard:<commit12>-<build-input-hash12>` and dirty
-builds as `ewsp-dashboard:dirty-<commit>-<session>`. This avoids pinning a stale
-commit or using `latest`.
+environment-independent placeholder. `k8s-up` replaces it only in ignored
+rendered output with `EWSP_DASHBOARD_IMAGE`, which must be the private
+`ghcr.io/mohammad-hamadi/ewsp-dashboard` image tagged by a full Git SHA.
 
 Render the Deployment with the selected immutable local tag without editing the
 checked-in manifest:
 
 ```powershell
-$dashboardImage = 'ewsp-dashboard:<actual-ewsp-local-tag>'
+$dashboardImage = 'ghcr.io/mohammad-hamadi/ewsp-dashboard:<full-git-sha>'
 kubectl set image -f k8s/dashboard/deployment.yaml `
   dashboard=$dashboardImage --local -o yaml |
   kubectl apply -f -
 ```
 
-The selected image must be visible through Docker Desktop's shared local image
-store or local registry mirror. `imagePullPolicy: IfNotPresent` then uses that
-local image without requiring a public registry.
+`imagePullPolicy: IfNotPresent` permits cache reuse, while the `ghcr-pull`
+`imagePullSecret` lets Kubernetes obtain a missing private image. `k8s-up`
+creates that Secret from ignored local credentials and never builds this image.
 
 ## Health checks
 

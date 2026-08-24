@@ -9,7 +9,7 @@
             Image            = @{
                 Service         = 'backend'
                 RepositoryName  = 'ewsp-backend'
-                EnvironmentName = 'EWSP_BACKEND_IMAGE'
+                EnvironmentName = 'EWSP_COMPOSE_BACKEND_IMAGE'
                 RequiredBuildFiles = @('Dockerfile', '.dockerignore')
                 BuildInputs     = @()
             }
@@ -23,7 +23,7 @@
             Image            = @{
                 Service         = 'dashboard'
                 RepositoryName  = 'ewsp-dashboard'
-                EnvironmentName = 'EWSP_DASHBOARD_IMAGE'
+                EnvironmentName = 'EWSP_COMPOSE_DASHBOARD_IMAGE'
                 RequiredBuildFiles = @('Dockerfile', '.dockerignore', 'nginx.conf')
                 BuildInputs     = @()
             }
