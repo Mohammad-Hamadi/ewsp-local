@@ -152,6 +152,8 @@ Docker Compose remains the convenient local development and full-stack path driv
 
 `k8s-up` requires Docker Desktop Kubernetes, refuses any context other than `docker-desktop`, verifies the single Ready Docker Desktop kind node and default local-path StorageClass, and reconciles resources without deleting persistent data. It applies resources in dependency order, waits for infrastructure before applications, verifies all five workloads and their internal DNS/service contracts, then starts or reuses an EWSP-managed dashboard port-forward. Browser access is through `http://localhost:3000`; dashboard Nginx keeps `/api` and `/ws` on that same origin and forwards them to `backend:8080`. If port 3000 belongs to an external process, Kubernetes startup reports the conflict and does not stop that process.
 
+Dashboard port-forward ownership is machine-global at `%USERPROFILE%\.ewsp\dashboard-port-forward.json`, not checkout-relative. Interactive commands, clean Actions workspaces, startup reconciliation, status, stop, and Quick Tunnel therefore validate and reuse one host process. Validation requires the recorded PID and process start time, the resolved `kubectl.exe` path, the exact `port-forward -n ewsp service/dashboard 3000:80` command semantics, listener ownership, and a healthy dashboard response. A matching healthy forward can be safely adopted when state is missing; unrelated listeners are never adopted or stopped. The first use after this change validates and migrates the old `.tmp\k8s\port-forward.json` record without restarting a healthy forward.
+
 Kubernetes never builds the backend or dashboard locally. It requires `EWSP_BACKEND_IMAGE` and `EWSP_DASHBOARD_IMAGE` in ignored `.env`; each must use its expected `ghcr.io/mohammad-hamadi/...` repository and a full 40-character Git SHA tag. `main`, `latest`, malformed refs, and wrong repositories are refused rather than rewritten. Checked-in placeholders remain environment-independent while the exact refs are rendered under ignored `.tmp/k8s/rendered/` files with `imagePullPolicy: IfNotPresent`.
 
 Both GHCR packages are private. Put `GHCR_USERNAME` and `GHCR_TOKEN` directly in ignored `.env`; the token needs package-read permission only and does not need repository write permission. Never use a GitHub Actions `GITHUB_TOKEN` locally or paste the token into chat. `k8s-up` creates/reconciles the `kubernetes.io/dockerconfigjson` Secret `ghcr-pull`, applies it without printing values, and removes its ACL-restricted ignored temporary artifact. The backend and dashboard Pod specs reference that Secret through `imagePullSecrets`.
@@ -237,6 +239,11 @@ printed or uploaded. The non-secret, recoverable
 SHAs, digests, timestamps, result, trigger, changed components, and PVC UIDs.
 GitHub and Kubernetes remain authoritative if this state file is deleted or
 malformed.
+
+The same protected directory contains non-secret machine ownership metadata
+for the long-lived dashboard forward plus a narrow process/state lock. This
+lets the stable checkout and `C:\actions-runner\_work\...` reuse the same
+validated `kubectl` process without trusting a PID alone or starting duplicates.
 
 `runner-setup` validates the already registered `EWSP-PC` runner under
 `C:\actions-runner`; it does not register a runner or use the removed Windows

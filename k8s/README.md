@@ -105,10 +105,15 @@ IfNotPresent`. Kubernetes pulls a missing artifact from GHCR; `k8s-up` does not
 inspect sibling source or invoke a local application build.
 
 On success, an EWSP-managed `kubectl port-forward` exposes only the dashboard at
-`http://localhost:3000`. Its state is recorded under ignored `.tmp/k8s/` so a
-later run can reuse it and `k8s-stop` can stop only that process. An unrelated
-listener on the configured dashboard port is reported and never killed. The
-dashboard keeps `/api` and `/ws` same-origin and proxies them to the internal
+`http://localhost:3000`. Its non-secret ownership state is machine-global at
+`%USERPROFILE%\.ewsp\dashboard-port-forward.json`, so stable, Actions, startup,
+status, stop, and Quick Tunnel commands share one process. Reuse or stop requires
+the recorded PID and start time, resolved `kubectl.exe`, exact namespace/service
+and `3000:80` command, listener PID, and a healthy endpoint. A validated legacy
+`.tmp/k8s/port-forward.json` record migrates once without restarting the process;
+an exact healthy unmanaged EWSP forward may be adopted when state is missing.
+Stale state is cleaned, while an unrelated listener is reported and never killed.
+The dashboard keeps `/api` and `/ws` same-origin and proxies them to the internal
 `backend:8080` Service.
 
 `k8s-stop` scales the three Deployments and two StatefulSets to zero and stops

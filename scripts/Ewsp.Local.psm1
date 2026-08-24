@@ -1805,8 +1805,9 @@ function Show-EwspKubernetesEnvironment {
 }
 
 function Get-EwspKubernetesPaths {
-    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    param([Parameter(Mandatory = $true)][string]$LocalRoot, [string]$UserProfile = $env:USERPROFILE)
     $temporaryRoot = Join-Path $LocalRoot '.tmp\k8s'
+    $machinePaths = Get-EwspDeploymentMachinePaths $UserProfile
     [PSCustomObject]@{
         SourceRoot = Join-Path $LocalRoot 'k8s'
         TemporaryRoot = $temporaryRoot
@@ -1816,9 +1817,12 @@ function Get-EwspKubernetesPaths {
         Secret = Join-Path $temporaryRoot 'secrets.local.json'
         GhcrSecret = Join-Path $temporaryRoot 'ghcr-pull.local.json'
         CloudflareSecret = Join-Path $temporaryRoot 'cloudflared-token.local.json'
-        PortForwardState = Join-Path $temporaryRoot 'port-forward.json'
-        PortForwardOutput = Join-Path $temporaryRoot 'port-forward.out.log'
-        PortForwardError = Join-Path $temporaryRoot 'port-forward.err.log'
+        PortForwardState = $machinePaths.DashboardPortForwardState
+        PortForwardStateTemporary = $machinePaths.DashboardPortForwardStateTemporary
+        PortForwardLock = $machinePaths.DashboardPortForwardLock
+        PortForwardOutput = $machinePaths.DashboardPortForwardOutput
+        PortForwardError = $machinePaths.DashboardPortForwardError
+        LegacyPortForwardState = Join-Path $temporaryRoot 'port-forward.json'
         QuickTunnelState = Join-Path $temporaryRoot 'quick-tunnel.json'
         QuickTunnelOutput = Join-Path $temporaryRoot 'quick-tunnel.out.log'
         QuickTunnelError = Join-Path $temporaryRoot 'quick-tunnel.err.log'
@@ -3449,6 +3453,142 @@ function Resolve-EwspKubernetesPortForwardAction {
     'START'
 }
 
+function Get-EwspTextSha256 {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))) -replace '-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+}
+
+function Test-EwspDashboardPortForwardCommandLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [int]$LocalPort = 3000,
+        [int]$RemotePort = 80,
+        [string]$Namespace = $script:EwspKubernetesNamespace
+    )
+    $pattern = '^\s*"?(?:[^"\r\n]*[\\/])?kubectl(?:\.exe)?"?\s+port-forward\s+-n\s+' +
+        [regex]::Escape($Namespace) + '\s+service/dashboard\s+' +
+        [regex]::Escape("$LocalPort`:$RemotePort") + '\s*$'
+    [regex]::IsMatch($CommandLine, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
+function Get-EwspDashboardPortForwardCommandLine {
+    param([Parameter(Mandatory = $true)][int]$ProcessId, [scriptblock]$CommandLineProvider)
+    if ($CommandLineProvider) { return [string](& $CommandLineProvider $ProcessId) }
+    if ((Get-EwspHostPlatform).Name -ne 'Windows') { return '' }
+    try { [string](Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop).CommandLine } catch { '' }
+}
+
+function Get-EwspDashboardPortForwardListeners {
+    param([Parameter(Mandatory = $true)][int]$Port, [scriptblock]$ListenerProvider)
+    if ($ListenerProvider) { return @(& $ListenerProvider $Port) }
+    if ((Get-EwspHostPlatform).Name -ne 'Windows') { return @() }
+    try { @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop) } catch { @() }
+}
+
+function Enter-EwspDashboardPortForwardLock {
+    param([string]$UserProfile = $env:USERPROFILE, [int]$TimeoutSeconds = 15)
+    $paths = Get-EwspDeploymentMachinePaths $UserProfile
+    Protect-EwspDeploymentDirectory $paths.Root | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $stream = [IO.File]::Open($paths.DashboardPortForwardLock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            return [PSCustomObject]@{ Stream=$stream; Path=$paths.DashboardPortForwardLock }
+        } catch [IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw (New-EwspKubernetesException 'Dashboard port-forward ownership is being reconciled by another EWSP process.' 'KUBERNETES_PORT_FORWARD_BUSY' 'Dashboard access' $paths.DashboardPortForwardLock)
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    } while ($true)
+}
+
+function Exit-EwspDashboardPortForwardLock {
+    param($Lock)
+    if ($Lock -and $Lock.Stream) { $Lock.Stream.Dispose() }
+}
+
+function Write-EwspDashboardPortForwardState {
+    param([Parameter(Mandatory = $true)]$State, [string]$UserProfile = $env:USERPROFILE)
+    $paths = Get-EwspDeploymentMachinePaths $UserProfile
+    Protect-EwspDeploymentDirectory $paths.Root | Out-Null
+    try {
+        [IO.File]::WriteAllText($paths.DashboardPortForwardStateTemporary, ($State | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $paths.DashboardPortForwardStateTemporary -Destination $paths.DashboardPortForwardState -Force
+    } finally {
+        if (Test-Path -LiteralPath $paths.DashboardPortForwardStateTemporary -PathType Leaf) { Remove-Item -LiteralPath $paths.DashboardPortForwardStateTemporary -Force }
+    }
+    $paths.DashboardPortForwardState
+}
+
+function Remove-EwspDashboardPortForwardState {
+    param([string]$UserProfile = $env:USERPROFILE)
+    $path = (Get-EwspDeploymentMachinePaths $UserProfile).DashboardPortForwardState
+    if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+}
+
+function Test-EwspDashboardPortForwardEvidence {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [scriptblock]$ProcessProvider,
+        [scriptblock]$CommandLineProvider,
+        [scriptblock]$ListenerProvider,
+        [scriptblock]$Probe,
+        [string]$ExpectedKubectlPath,
+        [switch]$Legacy
+    )
+    $invalid = { param($reason,$process=$null) [PSCustomObject]@{ Valid=$false; Healthy=$false; Reason=$reason; Process=$process; CommandLine=$null } }
+    if (-not $State -or ([int]$State.ProcessId) -le 0 -or ([int]$State.LocalPort) -le 0 -or ([int]$State.RemotePort) -le 0) { return (& $invalid 'STATE_INVALID') }
+    if (-not $Legacy -and ([int]$State.Version -ne 2 -or $State.Manager -ne 'ewsp-local' -or $State.OwnershipSource -ne 'machine-global')) { return (& $invalid 'STATE_OWNER_MISMATCH') }
+    if ($State.Namespace -ne $script:EwspKubernetesNamespace -or $State.Service -ne 'dashboard' -or [int]$State.RemotePort -ne 80) { return (& $invalid 'TARGET_MISMATCH') }
+    if (-not $ProcessProvider) { $ProcessProvider = { param($id) Get-Process -Id $id -ErrorAction SilentlyContinue } }
+    $process = & $ProcessProvider ([int]$State.ProcessId)
+    if (-not $process) { return (& $invalid 'PROCESS_MISSING') }
+    try {
+        if ($process.ProcessName -ne 'kubectl' -or [string]$process.StartTime.ToUniversalTime().Ticks -ne [string]$State.StartTimeUtcTicks) { return (& $invalid 'PROCESS_IDENTITY_MISMATCH' $process) }
+        $processPath = [IO.Path]::GetFullPath([string]$process.Path)
+    } catch { return (& $invalid 'PROCESS_IDENTITY_UNAVAILABLE' $process) }
+    if (-not $ExpectedKubectlPath) {
+        try { $ExpectedKubectlPath = [string](Get-Command kubectl -ErrorAction Stop).Source } catch { return (& $invalid 'KUBECTL_PATH_UNAVAILABLE' $process) }
+    }
+    try { $expectedPath = [IO.Path]::GetFullPath($ExpectedKubectlPath) } catch { return (& $invalid 'KUBECTL_PATH_UNAVAILABLE' $process) }
+    if (-not $processPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) { return (& $invalid 'EXECUTABLE_MISMATCH' $process) }
+    if (-not $Legacy) {
+        try { $recordedPath = [IO.Path]::GetFullPath([string]$State.ExecutablePath) } catch { return (& $invalid 'RECORDED_EXECUTABLE_MISMATCH' $process) }
+        if ([string]::IsNullOrWhiteSpace([string]$State.ExecutablePath) -or -not $processPath.Equals($recordedPath, [StringComparison]::OrdinalIgnoreCase)) { return (& $invalid 'RECORDED_EXECUTABLE_MISMATCH' $process) }
+    }
+    $commandLine = Get-EwspDashboardPortForwardCommandLine ([int]$State.ProcessId) $CommandLineProvider
+    if (-not (Test-EwspDashboardPortForwardCommandLine $commandLine ([int]$State.LocalPort) ([int]$State.RemotePort) ([string]$State.Namespace))) { return (& $invalid 'COMMAND_LINE_MISMATCH' $process) }
+    $fingerprint = Get-EwspTextSha256 $commandLine.Trim()
+    if (-not $Legacy -and $fingerprint -ne [string]$State.CommandLineSha256) { return (& $invalid 'COMMAND_LINE_FINGERPRINT_MISMATCH' $process) }
+    $listeners = @(Get-EwspDashboardPortForwardListeners ([int]$State.LocalPort) $ListenerProvider)
+    if ($listeners.Count -eq 0 -or @($listeners | Where-Object { [int]$_.OwningProcess -ne [int]$State.ProcessId }).Count -gt 0) { return (& $invalid 'LISTENER_OWNERSHIP_MISMATCH' $process) }
+    $healthy = if ($Probe) { [bool](& $Probe ([int]$State.LocalPort)) } else { (Test-EwspKubernetesDashboardEndpoint ([int]$State.LocalPort)).Success }
+    [PSCustomObject]@{ Valid=$true; Healthy=$healthy; Reason=$(if($healthy){'VALID'}else{'ENDPOINT_UNHEALTHY'}); Process=$process; CommandLine=$commandLine; ExecutablePath=$processPath; CommandLineSha256=$fingerprint }
+}
+
+function New-EwspDashboardPortForwardState {
+    param([Parameter(Mandatory = $true)]$Evidence, [Parameter(Mandatory = $true)][int]$LocalPort, [string]$OwnershipReason = 'started')
+    [ordered]@{
+        Version = 2
+        Manager = 'ewsp-local'
+        OwnershipSource = 'machine-global'
+        OwnershipReason = $OwnershipReason
+        ProcessId = [int]$Evidence.Process.Id
+        StartTimeUtcTicks = [string]$Evidence.Process.StartTime.ToUniversalTime().Ticks
+        ExecutablePath = [string]$Evidence.ExecutablePath
+        CommandLineSha256 = [string]$Evidence.CommandLineSha256
+        ExpectedInvocation = "kubectl port-forward -n $script:EwspKubernetesNamespace service/dashboard $LocalPort`:80"
+        Namespace = $script:EwspKubernetesNamespace
+        Service = 'dashboard'
+        LocalPort = $LocalPort
+        RemotePort = 80
+        RecordedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+
 function Test-EwspKubernetesDashboardEndpoint {
     param(
         [Parameter(Mandatory = $true)][int]$Port,
@@ -3485,36 +3625,62 @@ function Get-EwspManagedKubernetesPortForward {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
         [scriptblock]$ProcessProvider,
-        [scriptblock]$Probe
+        [scriptblock]$Probe,
+        [scriptblock]$CommandLineProvider,
+        [scriptblock]$ListenerProvider,
+        [string]$ExpectedKubectlPath,
+        [string]$UserProfile = $env:USERPROFILE,
+        [switch]$LockHeld
     )
-    $paths = Get-EwspKubernetesPaths $LocalRoot
-    if (-not (Test-Path -LiteralPath $paths.PortForwardState -PathType Leaf)) {
-        return [PSCustomObject]@{ Active = $false; Healthy = $false; Process = $null; State = $null; Url = $null }
-    }
-    try { $state = Get-Content -Raw -LiteralPath $paths.PortForwardState | ConvertFrom-Json } catch {
-        return [PSCustomObject]@{ Active = $false; Healthy = $false; Process = $null; State = $null; Url = $null }
-    }
-    if (-not $ProcessProvider) {
-        $ProcessProvider = { param($id) Get-Process -Id $id -ErrorAction SilentlyContinue }
-    }
-    $process = & $ProcessProvider ([int]$state.ProcessId)
-    $active = $false
-    if ($process) {
-        try {
-            $active = $process.ProcessName -eq 'kubectl' -and
-                [string]$process.StartTime.ToUniversalTime().Ticks -eq [string]$state.StartTimeUtcTicks -and
-                $state.Namespace -eq $script:EwspKubernetesNamespace -and $state.Service -eq 'dashboard'
-        } catch { $active = $false }
-    }
-    $healthy = $false
-    if ($active) {
-        if ($Probe) { $healthy = [bool](& $Probe ([int]$state.LocalPort)) }
-        else { $healthy = (Test-EwspKubernetesDashboardEndpoint ([int]$state.LocalPort)).Success }
-    }
-    [PSCustomObject]@{
-        Active = $active; Healthy = $healthy; Process = $process; State = $state
-        Url = if ($active) { "http://localhost:$($state.LocalPort)" } else { $null }
-    }
+    $lock = $null
+    if (-not $LockHeld) { $lock = Enter-EwspDashboardPortForwardLock $UserProfile }
+    try {
+        $paths = Get-EwspKubernetesPaths $LocalRoot $UserProfile
+        Protect-EwspDeploymentDirectory (Split-Path -Parent $paths.PortForwardState) | Out-Null
+        $state = $null
+        $invalidGlobalState = $false
+        if (Test-Path -LiteralPath $paths.PortForwardState -PathType Leaf) {
+            try { $state = Get-Content -Raw -LiteralPath $paths.PortForwardState | ConvertFrom-Json } catch { Remove-EwspDashboardPortForwardState $UserProfile }
+        }
+        if ($state) {
+            $evidence = Test-EwspDashboardPortForwardEvidence $state $ProcessProvider $CommandLineProvider $ListenerProvider $Probe $ExpectedKubectlPath
+            if ($evidence.Valid) {
+                return [PSCustomObject]@{ Active=$true; Healthy=$evidence.Healthy; Managed=$true; Process=$evidence.Process; State=$state; Url="http://localhost:$($state.LocalPort)"; OwnershipSource='machine-global'; Reason=$evidence.Reason }
+            }
+            $invalidGlobalState = $true
+            Remove-EwspDashboardPortForwardState $UserProfile
+        }
+
+        if (Test-Path -LiteralPath $paths.LegacyPortForwardState -PathType Leaf) {
+            try { $legacyState = Get-Content -Raw -LiteralPath $paths.LegacyPortForwardState | ConvertFrom-Json } catch { $legacyState = $null }
+            if ($legacyState) {
+                $legacyEvidence = Test-EwspDashboardPortForwardEvidence $legacyState $ProcessProvider $CommandLineProvider $ListenerProvider $Probe $ExpectedKubectlPath -Legacy
+                if ($legacyEvidence.Valid) {
+                    $migrated = New-EwspDashboardPortForwardState $legacyEvidence ([int]$legacyState.LocalPort) 'migrated-checkout-state'
+                    Write-EwspDashboardPortForwardState ([PSCustomObject]$migrated) $UserProfile | Out-Null
+                    Remove-Item -LiteralPath $paths.LegacyPortForwardState -Force
+                    return [PSCustomObject]@{ Active=$true; Healthy=$legacyEvidence.Healthy; Managed=$true; Process=$legacyEvidence.Process; State=[PSCustomObject]$migrated; Url="http://localhost:$($legacyState.LocalPort)"; OwnershipSource='machine-global'; Reason='MIGRATED' }
+                }
+            }
+            Remove-Item -LiteralPath $paths.LegacyPortForwardState -Force -ErrorAction SilentlyContinue
+        }
+
+        $listeners = if ($invalidGlobalState) { @() } else { @(Get-EwspDashboardPortForwardListeners 3000 $ListenerProvider) }
+        $listenerPids = @($listeners | ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
+        if ($listenerPids.Count -eq 1) {
+            $candidateProcess = if ($ProcessProvider) { & $ProcessProvider $listenerPids[0] } else { Get-Process -Id $listenerPids[0] -ErrorAction SilentlyContinue }
+            if ($candidateProcess) {
+                $candidateState = [PSCustomObject]@{ ProcessId=$listenerPids[0]; StartTimeUtcTicks=[string]$candidateProcess.StartTime.ToUniversalTime().Ticks; Namespace=$script:EwspKubernetesNamespace; Service='dashboard'; LocalPort=3000; RemotePort=80 }
+                $candidateEvidence = Test-EwspDashboardPortForwardEvidence $candidateState $ProcessProvider $CommandLineProvider $ListenerProvider $Probe $ExpectedKubectlPath -Legacy
+                if ($candidateEvidence.Valid -and $candidateEvidence.Healthy) {
+                    $adopted = New-EwspDashboardPortForwardState $candidateEvidence 3000 'adopted-exact-process'
+                    Write-EwspDashboardPortForwardState ([PSCustomObject]$adopted) $UserProfile | Out-Null
+                    return [PSCustomObject]@{ Active=$true; Healthy=$true; Managed=$true; Process=$candidateEvidence.Process; State=[PSCustomObject]$adopted; Url='http://localhost:3000'; OwnershipSource='machine-global'; Reason='ADOPTED' }
+                }
+            }
+        }
+        [PSCustomObject]@{ Active=$false; Healthy=$false; Managed=$false; Process=$null; State=$null; Url=$null; OwnershipSource='machine-global'; Reason='NOT_MANAGED' }
+    } finally { if ($lock) { Exit-EwspDashboardPortForwardLock $lock } }
 }
 
 function Assert-EwspKubernetesAccessPortAvailable {
@@ -3534,19 +3700,26 @@ function Assert-EwspKubernetesAccessPortAvailable {
 function Stop-EwspKubernetesPortForward {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [scriptblock]$ProcessProvider,
+        [scriptblock]$Probe,
+        [scriptblock]$CommandLineProvider,
+        [scriptblock]$ListenerProvider,
+        [string]$ExpectedKubectlPath,
+        [string]$UserProfile = $env:USERPROFILE,
+        [scriptblock]$StopAction
     )
-    $paths = Get-EwspKubernetesPaths $LocalRoot
-    $managed = Get-EwspManagedKubernetesPortForward $LocalRoot
-    if ($managed.Active) {
-        Stop-Process -Id $managed.Process.Id -ErrorAction Stop
-        $managed.Process.WaitForExit(5000) | Out-Null
-        if (-not $Quiet) { Write-Host "Stopped EWSP-managed dashboard port-forward (PID $($managed.Process.Id))." }
-    } elseif (-not $Quiet) {
-        Write-Host 'No active EWSP-managed dashboard port-forward.'
-    }
-    if (Test-Path -LiteralPath $paths.PortForwardState) { Remove-Item -LiteralPath $paths.PortForwardState -Force }
-    $managed.Active
+    $lock = Enter-EwspDashboardPortForwardLock $UserProfile
+    try {
+        $managed = Get-EwspManagedKubernetesPortForward -LocalRoot $LocalRoot -ProcessProvider $ProcessProvider -Probe $Probe -CommandLineProvider $CommandLineProvider -ListenerProvider $ListenerProvider -ExpectedKubectlPath $ExpectedKubectlPath -UserProfile $UserProfile -LockHeld
+        if ($managed.Active) {
+            if ($StopAction) { & $StopAction ([int]$managed.Process.Id) }
+            else { Stop-Process -Id $managed.Process.Id -ErrorAction Stop; $managed.Process.WaitForExit(5000) | Out-Null }
+            if (-not $Quiet) { Write-Host "Stopped EWSP-managed dashboard port-forward (PID $($managed.Process.Id))." }
+        } elseif (-not $Quiet) { Write-Host 'No active EWSP-managed dashboard port-forward.' }
+        Remove-EwspDashboardPortForwardState $UserProfile
+        $managed.Active
+    } finally { Exit-EwspDashboardPortForwardLock $lock }
 }
 
 function Start-EwspKubernetesPortForward {
@@ -3554,58 +3727,60 @@ function Start-EwspKubernetesPortForward {
         [Parameter(Mandatory = $true)][string]$LocalRoot,
         [Parameter(Mandatory = $true)][int]$Port
     )
-    $paths = Get-EwspKubernetesPaths $LocalRoot
-    $managed = Get-EwspManagedKubernetesPortForward $LocalRoot
-    $occupied = @(Get-EwspOccupiedTcpPorts) -contains $Port
-    $action = Resolve-EwspKubernetesPortForwardAction $managed.Active $managed.Healthy $occupied
-    if ($action -eq 'REUSE') {
-        Write-Host "      reused managed dashboard port-forward (PID $($managed.Process.Id))"
-        return $managed
-    }
-    if ($action -eq 'CONFLICT') {
-        throw (New-EwspKubernetesException "Dashboard port $Port is occupied by a process not managed by EWSP Kubernetes orchestration. It was not stopped." 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "kubectl port-forward service/dashboard $Port`:80")
-    }
-    if ($managed.Active) { Stop-EwspKubernetesPortForward $LocalRoot -Quiet | Out-Null }
-    New-Item -ItemType Directory -Path $paths.TemporaryRoot -Force | Out-Null
-    foreach ($log in @($paths.PortForwardOutput, $paths.PortForwardError)) {
-        $safeLog = Assert-EwspSafeTemporaryPath $LocalRoot $log
-        if (Test-Path -LiteralPath $safeLog) { Remove-Item -LiteralPath $safeLog -Force }
-    }
-    $kubectl = Get-Command kubectl -ErrorAction Stop
-    $arguments = @('port-forward', '-n', $script:EwspKubernetesNamespace, 'service/dashboard', "$Port`:80")
-    $startArguments = @{
-        FilePath = $kubectl.Source; ArgumentList = $arguments; PassThru = $true
-        RedirectStandardOutput = $paths.PortForwardOutput; RedirectStandardError = $paths.PortForwardError
-    }
-    if ((Get-EwspHostPlatform).Name -eq 'Windows') { $startArguments.WindowStyle = 'Hidden' }
-    $process = Start-Process @startArguments
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    $healthy = $false
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if ($process.HasExited) { break }
-        $probe = Test-EwspKubernetesDashboardEndpoint $Port
-        if ($probe.Success) { $healthy = $true; break }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $healthy) {
-        if (-not $process.HasExited) { Stop-Process -Id $process.Id -ErrorAction SilentlyContinue }
-        $reason = if (Test-Path -LiteralPath $paths.PortForwardError) {
-            Protect-EwspDiagnosticText ((Get-Content -LiteralPath $paths.PortForwardError -Tail 20) -join ' ')
-        } else { 'dashboard endpoint did not become reachable' }
-        throw (New-EwspKubernetesException "Managed dashboard port-forward failed: $reason" 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "kubectl port-forward service/dashboard $Port`:80")
-    }
-    $state = [ordered]@{
-        ProcessId = $process.Id
-        StartTimeUtcTicks = [string]$process.StartTime.ToUniversalTime().Ticks
-        Namespace = $script:EwspKubernetesNamespace
-        Service = 'dashboard'
-        LocalPort = $Port
-        RemotePort = 80
-        StartedAtUtc = [DateTime]::UtcNow.ToString('o')
-    }
-    [IO.File]::WriteAllText($paths.PortForwardState, ($state | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-    Write-Host "      started managed dashboard port-forward (PID $($process.Id))"
-    Get-EwspManagedKubernetesPortForward $LocalRoot
+    $lock = Enter-EwspDashboardPortForwardLock
+    try {
+        $paths = Get-EwspKubernetesPaths $LocalRoot
+        $managed = Get-EwspManagedKubernetesPortForward $LocalRoot -LockHeld
+        $occupied = @(Get-EwspOccupiedTcpPorts) -contains $Port
+        $action = Resolve-EwspKubernetesPortForwardAction $managed.Active $managed.Healthy $occupied
+        if ($action -eq 'REUSE') {
+            Write-Host "      reused machine-global managed dashboard port-forward (PID $($managed.Process.Id))"
+            return $managed
+        }
+        if ($action -eq 'CONFLICT') {
+            throw (New-EwspKubernetesException "Dashboard port $Port is occupied by a process not managed by EWSP Kubernetes orchestration. It was not stopped." 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "kubectl port-forward service/dashboard $Port`:80")
+        }
+        if ($managed.Active) {
+            Stop-Process -Id $managed.Process.Id -ErrorAction Stop
+            $managed.Process.WaitForExit(5000) | Out-Null
+            Remove-EwspDashboardPortForwardState
+        }
+        Protect-EwspDeploymentDirectory (Split-Path -Parent $paths.PortForwardState) | Out-Null
+        foreach ($log in @($paths.PortForwardOutput, $paths.PortForwardError)) {
+            if (Test-Path -LiteralPath $log -PathType Leaf) { Remove-Item -LiteralPath $log -Force }
+        }
+        $kubectl = Get-Command kubectl -ErrorAction Stop
+        $arguments = @('port-forward', '-n', $script:EwspKubernetesNamespace, 'service/dashboard', "$Port`:80")
+        $startArguments = @{
+            FilePath = $kubectl.Source; ArgumentList = $arguments; PassThru = $true
+            RedirectStandardOutput = $paths.PortForwardOutput; RedirectStandardError = $paths.PortForwardError
+        }
+        if ((Get-EwspHostPlatform).Name -eq 'Windows') { $startArguments.WindowStyle = 'Hidden' }
+        $process = Start-Process @startArguments
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        $healthy = $false
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) { break }
+            $probe = Test-EwspKubernetesDashboardEndpoint $Port
+            if ($probe.Success) { $healthy = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $healthy) {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -ErrorAction SilentlyContinue }
+            $reason = if (Test-Path -LiteralPath $paths.PortForwardError) { Protect-EwspDiagnosticText ((Get-Content -LiteralPath $paths.PortForwardError -Tail 20) -join ' ') } else { 'dashboard endpoint did not become reachable' }
+            throw (New-EwspKubernetesException "Managed dashboard port-forward failed: $reason" 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' "kubectl port-forward service/dashboard $Port`:80")
+        }
+        $candidateState = [PSCustomObject]@{ ProcessId=$process.Id; StartTimeUtcTicks=[string]$process.StartTime.ToUniversalTime().Ticks; Namespace=$script:EwspKubernetesNamespace; Service='dashboard'; LocalPort=$Port; RemotePort=80 }
+        $evidence = Test-EwspDashboardPortForwardEvidence $candidateState $null $null $null $null ([string]$kubectl.Source) -Legacy
+        if (-not $evidence.Valid -or -not $evidence.Healthy) {
+            Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+            throw (New-EwspKubernetesException "New dashboard port-forward ownership validation failed: $($evidence.Reason)." 'KUBERNETES_PORT_CONFLICT' 'Dashboard access' 'Validate kubectl process identity')
+        }
+        $state = New-EwspDashboardPortForwardState $evidence $Port 'started'
+        Write-EwspDashboardPortForwardState ([PSCustomObject]$state) | Out-Null
+        Write-Host "      started machine-global managed dashboard port-forward (PID $($process.Id))"
+        Get-EwspManagedKubernetesPortForward $LocalRoot -LockHeld
+    } finally { Exit-EwspDashboardPortForwardLock $lock }
 }
 
 function Get-EwspManagedQuickTunnel {
@@ -3944,7 +4119,7 @@ function Invoke-EwspQuickTunnelStatus {
     Write-Host "cloudflared: $(if ($cloudflared.Available) { "$($cloudflared.Version) [$($cloudflared.Path)]" } else { 'unavailable' })"
     Write-Host "Quick Tunnel: $(if ($managed.Active) { 'active' } else { 'inactive' })"
     Write-Host "Public URL: $(if ($managed.PublicUrl) { $managed.PublicUrl } else { '<none>' })"
-    Write-Host "Dashboard forward: $(if ($forward.Active -and $forward.Healthy) { 'active http://localhost:3000' } elseif ($forward.Active) { 'active but unhealthy' } else { 'inactive' })"
+    Write-Host "Dashboard forward: $(if ($forward.Active -and $forward.Healthy) { "active $($forward.Url) (PID $($forward.Process.Id), ownership=machine-global)" } elseif ($forward.Active) { "active but unhealthy (PID $($forward.Process.Id), ownership=machine-global)" } else { 'inactive (ownership=machine-global)' })"
     if ($runtime) {
         Write-Host "Forwarded headers: $(if ($runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value) { $runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value } else { 'NONE (application default)' })"
         Write-Host "Trusted proxy boundary: $(if ($runtime.Settings.SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES.Value) { $runtime.Settings.SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES.Value } else { '<none>' })"
@@ -4045,9 +4220,9 @@ function Show-EwspKubernetesStatusSnapshot {
     Write-Host 'Access'
     Write-Host '------'
     $forward = Get-EwspManagedKubernetesPortForward $LocalRoot
-    if ($forward.Active -and $forward.Healthy) { Write-Host "Dashboard: active $($forward.Url) (PID $($forward.Process.Id))" }
-    elseif ($forward.Active) { Write-Host "Dashboard: managed process active but endpoint unhealthy (PID $($forward.Process.Id))" -ForegroundColor Yellow }
-    else { Write-Host 'Dashboard: inactive' }
+    if ($forward.Active -and $forward.Healthy) { Write-Host "Dashboard: active $($forward.Url) (PID $($forward.Process.Id), ownership=machine-global)" }
+    elseif ($forward.Active) { Write-Host "Dashboard: managed process active but endpoint unhealthy (PID $($forward.Process.Id), ownership=machine-global)" -ForegroundColor Yellow }
+    else { Write-Host 'Dashboard: inactive (ownership=machine-global)' }
     $environmentValues = Get-EwspEffectiveEnvironmentValues $LocalRoot
     $permanentConfiguration = Get-EwspPermanentTunnelConfiguration $environmentValues
     $permanentStatus = Get-EwspPermanentTunnelStatus $CommandRunner
@@ -4271,6 +4446,11 @@ function Get-EwspDeploymentMachinePaths {
         State = Join-Path $root 'deployment-state.json'
         StateTemporary = Join-Path $root 'deployment-state.json.tmp'
         Lock = Join-Path $root 'deployment.lock'
+        DashboardPortForwardState = Join-Path $root 'dashboard-port-forward.json'
+        DashboardPortForwardStateTemporary = Join-Path $root 'dashboard-port-forward.json.tmp'
+        DashboardPortForwardLock = Join-Path $root 'dashboard-port-forward.lock'
+        DashboardPortForwardOutput = Join-Path $root 'dashboard-port-forward.out.log'
+        DashboardPortForwardError = Join-Path $root 'dashboard-port-forward.err.log'
         RunnerRoot = 'C:\actions-runner'
         RunnerTaskName = 'EWSP GitHub Actions Runner'
         ReconcileTaskName = 'EWSP Startup Reconciliation'
@@ -5217,6 +5397,13 @@ Export-ModuleMember -Function @(
     'Get-EwspKubernetesPvcSnapshot',
     'Get-EwspKubernetesServiceSnapshot',
     'Resolve-EwspKubernetesPortForwardAction',
+    'Get-EwspTextSha256',
+    'Test-EwspDashboardPortForwardCommandLine',
+    'Test-EwspDashboardPortForwardEvidence',
+    'Enter-EwspDashboardPortForwardLock',
+    'Exit-EwspDashboardPortForwardLock',
+    'Write-EwspDashboardPortForwardState',
+    'Remove-EwspDashboardPortForwardState',
     'Get-EwspManagedKubernetesPortForward',
     'Stop-EwspKubernetesPortForward',
     'Wait-EwspKubernetesPodsStopped',

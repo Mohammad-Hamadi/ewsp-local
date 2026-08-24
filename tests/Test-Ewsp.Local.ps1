@@ -841,6 +841,86 @@ try {
     Assert-Equal (Resolve-EwspKubernetesPortForwardAction $false $false $false) 'START' 'free dashboard port starts managed forward'
     Assert-Equal (Resolve-EwspKubernetesPortForwardAction $true $false $true) 'START' 'unhealthy managed forward is safely replaced'
 
+    $forwardProfile = Join-Path $testRoot 'port-forward-profile'
+    $forwardCheckoutA = Join-Path $testRoot 'port-forward-checkout-a'
+    $forwardCheckoutB = Join-Path $testRoot 'port-forward-checkout-b'
+    $forwardCheckoutC = Join-Path $testRoot 'port-forward-checkout-c'
+    foreach($path in @($forwardCheckoutA,$forwardCheckoutB,$forwardCheckoutC)){New-Item -ItemType Directory -Path $path -Force|Out-Null}
+    $forwardPaths = Get-EwspDeploymentMachinePaths $forwardProfile
+    Assert-Equal $forwardPaths.DashboardPortForwardState (Join-Path $forwardProfile '.ewsp\dashboard-port-forward.json') 'dashboard port-forward ownership state is machine-global under the user profile'
+    $forwardStart = [DateTime]::UtcNow.AddMinutes(-5)
+    $forwardExecutable = 'C:\Program Files\Docker\Docker\resources\bin\kubectl.exe'
+    $forwardCommand = '"C:\Program Files\Docker\Docker\resources\bin\kubectl.exe" port-forward -n ewsp service/dashboard 3000:80'
+    $forwardProcess = [PSCustomObject]@{Id=4242;ProcessName='kubectl';Path=$forwardExecutable;StartTime=$forwardStart}
+    $forwardProcessProvider = {param($id) if($id -eq 4242){$forwardProcess}}.GetNewClosure()
+    $forwardCommandProvider = {param($id) if($id -eq 4242){$forwardCommand}}.GetNewClosure()
+    $forwardListenerProvider = {param($port) if($port -eq 3000){[PSCustomObject]@{OwningProcess=4242}}}
+    $forwardHealthyProbe = {param($port) $port -eq 3000}
+    $forwardState = [PSCustomObject]@{
+        Version=2;Manager='ewsp-local';OwnershipSource='machine-global';OwnershipReason='test';ProcessId=4242
+        StartTimeUtcTicks=[string]$forwardStart.ToUniversalTime().Ticks;ExecutablePath=$forwardExecutable
+        CommandLineSha256=(Get-EwspTextSha256 $forwardCommand);Namespace='ewsp';Service='dashboard';LocalPort=3000;RemotePort=80
+    }
+    Assert-Equal (Test-EwspDashboardPortForwardCommandLine $forwardCommand 3000 80 'ewsp') $true 'exact EWSP dashboard port-forward command is accepted'
+    Assert-Equal (Test-EwspDashboardPortForwardCommandLine ($forwardCommand -replace '-n ewsp','-n other') 3000 80 'ewsp') $false 'wrong dashboard port-forward namespace is rejected'
+    Assert-Equal (Test-EwspDashboardPortForwardCommandLine ($forwardCommand -replace '3000:80','3001:80') 3000 80 'ewsp') $false 'wrong dashboard local port is rejected'
+    Assert-Equal (Test-EwspDashboardPortForwardCommandLine ($forwardCommand -replace '3000:80','3000:81') 3000 80 'ewsp') $false 'wrong dashboard remote port is rejected'
+    $validEvidence = Test-EwspDashboardPortForwardEvidence $forwardState $forwardProcessProvider $forwardCommandProvider $forwardListenerProvider $forwardHealthyProbe $forwardExecutable
+    Assert-Equal $validEvidence.Valid $true 'managed forward validates PID, start time, executable, command, listener, and endpoint'
+    $reusedPidProcess = [PSCustomObject]@{Id=4242;ProcessName='kubectl';Path=$forwardExecutable;StartTime=$forwardStart.AddMinutes(1)}
+    $reusedPidProvider = {param($id) $reusedPidProcess}.GetNewClosure()
+    Assert-Equal (Test-EwspDashboardPortForwardEvidence $forwardState $reusedPidProvider $forwardCommandProvider $forwardListenerProvider $forwardHealthyProbe $forwardExecutable).Reason 'PROCESS_IDENTITY_MISMATCH' 'PID reuse is rejected by process start-time mismatch'
+    $wrongExecutableProcess = [PSCustomObject]@{Id=4242;ProcessName='kubectl';Path='C:\untrusted\kubectl.exe';StartTime=$forwardStart}
+    $wrongExecutableProvider = {param($id) $wrongExecutableProcess}.GetNewClosure()
+    Assert-Equal (Test-EwspDashboardPortForwardEvidence $forwardState $wrongExecutableProvider $forwardCommandProvider $forwardListenerProvider $forwardHealthyProbe $forwardExecutable).Reason 'EXECUTABLE_MISMATCH' 'wrong kubectl executable path is rejected'
+    $wrongCommandProvider = {param($id) 'kubectl.exe port-forward -n other service/dashboard 3000:80'}
+    Assert-Equal (Test-EwspDashboardPortForwardEvidence $forwardState $forwardProcessProvider $wrongCommandProvider $forwardListenerProvider $forwardHealthyProbe $forwardExecutable).Reason 'COMMAND_LINE_MISMATCH' 'wrong managed process command line is rejected'
+    $wrongListenerProvider = {param($port) [PSCustomObject]@{OwningProcess=9999}}
+    Assert-Equal (Test-EwspDashboardPortForwardEvidence $forwardState $forwardProcessProvider $forwardCommandProvider $wrongListenerProvider $forwardHealthyProbe $forwardExecutable).Reason 'LISTENER_OWNERSHIP_MISMATCH' 'listener owned by another PID is rejected'
+
+    $legacyPath = Join-Path $forwardCheckoutA '.tmp\k8s\port-forward.json'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $legacyPath) -Force|Out-Null
+    ([PSCustomObject]@{ProcessId=4242;StartTimeUtcTicks=[string]$forwardStart.ToUniversalTime().Ticks;Namespace='ewsp';Service='dashboard';LocalPort=3000;RemotePort=80}|ConvertTo-Json)|Set-Content -LiteralPath $legacyPath
+    $migratedForward = Get-EwspManagedKubernetesPortForward -LocalRoot $forwardCheckoutA -ProcessProvider $forwardProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $forwardListenerProvider -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile
+    Assert-Equal $migratedForward.Reason 'MIGRATED' 'valid checkout-local ownership state migrates without restarting the process'
+    Assert-Equal (Test-Path -LiteralPath $legacyPath) $false 'obsolete checkout-local ownership state is removed after migration'
+    Assert-Equal (Test-Path -LiteralPath $forwardPaths.DashboardPortForwardState) $true 'migration creates machine-global ownership state'
+    $actionsForward = Get-EwspManagedKubernetesPortForward -LocalRoot $forwardCheckoutB -ProcessProvider $forwardProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $forwardListenerProvider -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile
+    Assert-Equal $actionsForward.Process.Id 4242 'Actions checkout reuses the same machine-global managed forward PID'
+    $startupForward = Get-EwspManagedKubernetesPortForward -LocalRoot $forwardCheckoutC -ProcessProvider $forwardProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $forwardListenerProvider -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile
+    Assert-Equal $startupForward.Process.Id 4242 'startup reconciliation checkout reuses the same machine-global managed forward PID'
+    $quickTunnelForward = Get-EwspManagedKubernetesPortForward -LocalRoot (Join-Path $testRoot 'quick-tunnel-checkout') -ProcessProvider $forwardProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $forwardListenerProvider -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile
+    Assert-Equal $quickTunnelForward.Process.Id 4242 'Quick Tunnel checkout reuses the same machine-global managed forward PID'
+
+    Remove-EwspDashboardPortForwardState $forwardProfile
+    $adoptedForward = Get-EwspManagedKubernetesPortForward -LocalRoot $forwardCheckoutB -ProcessProvider $forwardProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $forwardListenerProvider -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile
+    Assert-Equal $adoptedForward.Reason 'ADOPTED' 'missing state safely adopts only the exact healthy EWSP kubectl forward'
+    Write-EwspDashboardPortForwardState $forwardState $forwardProfile|Out-Null
+    $missingProcessProvider = {param($id) $null}
+    $noListeners = {param($port) @()}
+    $staleForward = Get-EwspManagedKubernetesPortForward -LocalRoot $forwardCheckoutB -ProcessProvider $missingProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $noListeners -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile
+    Assert-Equal $staleForward.Active $false 'stale state becomes inactive when the recorded process exited'
+    Assert-Equal (Test-Path -LiteralPath $forwardPaths.DashboardPortForwardState) $false 'stale machine-global state is cleaned when the process exited'
+    $unrelatedProcess = [PSCustomObject]@{Id=9999;ProcessName='node';Path='C:\tools\node.exe';StartTime=$forwardStart}
+    $unrelatedProvider = {param($id) if($id -eq 9999){$unrelatedProcess}}.GetNewClosure()
+    $unrelatedListeners = {param($port) [PSCustomObject]@{OwningProcess=9999}}
+    $unrelatedStopCounter = [PSCustomObject]@{Count=0}
+    $unrelatedStop = {param($id) $unrelatedStopCounter.Count++}.GetNewClosure()
+    Stop-EwspKubernetesPortForward -LocalRoot $forwardCheckoutB -Quiet -ProcessProvider $unrelatedProvider -Probe $forwardHealthyProbe -CommandLineProvider {param($id) 'node.exe server.js'} -ListenerProvider $unrelatedListeners -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile -StopAction $unrelatedStop|Out-Null
+    Assert-Equal $unrelatedStopCounter.Count 0 'stop never terminates an unrelated process occupying dashboard port 3000'
+    Write-EwspDashboardPortForwardState $forwardState $forwardProfile|Out-Null
+    $managedStopCounter = [PSCustomObject]@{Count=0}
+    $managedStop = {param($id) if($id -eq 4242){$managedStopCounter.Count++}}.GetNewClosure()
+    Stop-EwspKubernetesPortForward -LocalRoot $forwardCheckoutB -Quiet -ProcessProvider $forwardProcessProvider -Probe $forwardHealthyProbe -CommandLineProvider $forwardCommandProvider -ListenerProvider $forwardListenerProvider -ExpectedKubectlPath $forwardExecutable -UserProfile $forwardProfile -StopAction $managedStop|Out-Null
+    Assert-Equal $managedStopCounter.Count 1 'stop terminates a managed forward only after full ownership validation'
+    Assert-Equal (Test-Path -LiteralPath $forwardPaths.DashboardPortForwardState) $false 'stop removes machine-global state after validated termination'
+    $forwardLock = Enter-EwspDashboardPortForwardLock $forwardProfile
+    Assert-ThrowsCategory { Enter-EwspDashboardPortForwardLock $forwardProfile 0|Out-Null } 'KUBERNETES_PORT_FORWARD_BUSY' 'machine-global forward lock prevents concurrent ownership/start races'
+    Exit-EwspDashboardPortForwardLock $forwardLock
+    $portForwardModuleText=Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
+    Assert-Contains $portForwardModuleText 'DashboardPortForwardState = Join-Path $root' 'all persistent dashboard-forward ownership resolves from machine-global paths'
+    Assert-Contains $portForwardModuleText 'LegacyPortForwardState' 'only explicit one-time migration references checkout-local forward state'
+
     $missingCloudflared = Get-EwspCloudflaredInfo -CommandResolver { param($name) $null }
     Assert-Equal $missingCloudflared.Available $false 'Quick Tunnel detects unavailable cloudflared'
     Assert-ThrowsContains { Assert-EwspCloudflaredAvailable $missingCloudflared | Out-Null } 'CLOUDFLARED_MISSING' 'missing cloudflared uses precise diagnostic category'
