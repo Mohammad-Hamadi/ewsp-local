@@ -169,9 +169,16 @@ The existing seed is idempotent, so rerunning the command reconciles the same lo
 
 The guaranteed target is the PC-dependent, single-node Docker Desktop kind cluster (verified with Kubernetes v1.36.1). Do not run Compose and Kubernetes simultaneously when both would need dashboard host port 3000; neither workflow automatically stops the other.
 
-### Temporary Cloudflare Quick Tunnel proof
+### Temporary/current $0 Cloudflare Quick Tunnel
 
-The Quick Tunnel workflow is an explicit, temporary external proof only. It starts the locally installed `cloudflared` against the existing EWSP-managed `localhost:3000` dashboard port-forward and receives a random `https://<random>.trycloudflare.com` hostname. It needs neither a Cloudflare account nor a domain, and it is not the permanent deployment design. The workflow does not install `cloudflared`, create Kubernetes tunnel resources, or store Cloudflare credentials or tokens.
+The current public demo/testing path remains free: `tunnel-quick` starts the
+locally installed `cloudflared` against the existing EWSP-managed
+`localhost:3000` dashboard port-forward and receives a random
+`https://<random>.trycloudflare.com` hostname. It needs neither a Cloudflare
+account nor a domain. The hostname changes between runs, so this path is for
+temporary demos and testing, not stable publication. The workflow does not
+install `cloudflared`, create Kubernetes tunnel resources, or store Cloudflare
+credentials or tokens.
 
 ```powershell
 .\ewsp.ps1 tunnel-quick
@@ -188,6 +195,46 @@ The current production application exposes no safe request diagnostic for backen
 `tunnel-stop` validates the recorded process identity before stopping it, so unrelated `cloudflared` processes are never killed. It restores the exact pre-run backend environment overrides (therefore returning to the normal ConfigMap/application defaults such as forwarded-header strategy `NONE` and local CORS origin), waits for backend readiness, removes Quick Tunnel runtime files, and leaves all Kubernetes workloads, PVCs, Services, and the dashboard port-forward running.
 
 If `cloudflared` is unavailable, install it explicitly (on Windows, `winget install --id Cloudflare.cloudflared`), open a new PowerShell, and verify `cloudflared --version`; the orchestration never installs it silently. Quick Tunnel process logs are bounded in diagnostics and remain under ignored `.tmp/k8s/` only while needed for the managed lifecycle.
+
+### Optional future permanent named Cloudflare Tunnel
+
+The permanent design is separate from `tunnel-quick`. It runs the pinned
+`cloudflare/cloudflared:2026.8.2` connector as a hardened, one-replica
+Deployment in namespace `ewsp`. Cloudflare is the only public traffic path:
+the remotely managed hostname routes to
+`http://dashboard.ewsp.svc.cluster.local:80`; dashboard serves React and proxies
+`/api` and `/ws` to the internal backend. Backend, PostgreSQL, Redis, and MinIO
+remain ClusterIP-only. No NodePort, LoadBalancer, Kubernetes Ingress, or
+cloudflared Service is created.
+
+This optional path requires a domain and public hostname controlled through
+Cloudflare. No permanent tunnel, token, or hostname is currently configured for
+EWSP; the project remains on the $0 Quick Tunnel path. Normal `k8s-up` cannot
+publish EWSP accidentally because permanent publication remains disabled unless
+all explicit local requirements below are supplied.
+
+Permanent publication requires an explicit opt-in in ignored `.env`:
+
+```dotenv
+CLOUDFLARE_TUNNEL_ENABLED=true
+CLOUDFLARE_TUNNEL_TOKEN=<named-tunnel connector token>
+CLOUDFLARE_PUBLIC_HOSTNAME=ewsp.example.com
+```
+
+The token alone never enables the connector. `k8s-up` safely creates the
+`cloudflared-tunnel-token` Secret without displaying it, derives the current
+node-assigned Pod CIDR (not the kindnet or Service subnet), converts it to an
+anchored Tomcat regex, and sets the backend to native forwarded-header handling.
+Targeted NetworkPolicies then allow only `cloudflared -> dashboard:80` and
+`dashboard -> backend:8080`; this isolation is what makes trusting the node Pod
+CIDR safe against unrelated in-cluster Pods forging forwarding headers.
+
+If no named tunnel exists yet, create one under Cloudflare **Networking >
+Tunnels**, copy its **Add a replica** connector token, and configure its public
+hostname service exactly as
+`http://dashboard.ewsp.svc.cluster.local:80`. No `cert.pem`, account-wide key,
+API token, or credentials JSON is needed by the running Pod. See
+`k8s/README.md` for lifecycle, security, status, and stop/restoration details.
 
 Kubernetes PostgreSQL and MinIO PVCs are separate from the Docker Compose named volumes and do not migrate or reuse their data. Deleting the Kubernetes PVCs or resetting the cluster can destroy Kubernetes data; neither action affects the preserved Compose volumes unless those volumes are separately removed.
 

@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: ewsp
+  labels:
+    app.kubernetes.io/name: cloudflared
+    app.kubernetes.io/component: tunnel
+    app.kubernetes.io/part-of: ewsp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared
+      app.kubernetes.io/part-of: ewsp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared
+        app.kubernetes.io/component: tunnel
+        app.kubernetes.io/part-of: ewsp
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.8.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --loglevel
+            - info
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-tunnel-token
+                  key: token
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

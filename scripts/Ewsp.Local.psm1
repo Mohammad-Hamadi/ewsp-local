@@ -1684,9 +1684,15 @@ function Get-EwspKubernetesEnvironment {
                         $nodeObject = ($nodeResult.Output -join "`n") | ConvertFrom-Json
                         $nodes = @($nodeObject.items | ForEach-Object {
                             $condition = @($_.status.conditions | Where-Object type -eq 'Ready')
+                            $nodeSpec = if ($_.PSObject.Properties['spec']) { $_.spec } else { $null }
                             [PSCustomObject]@{
                                 Name = $_.metadata.name
                                 Ready = [bool]($condition.Count -gt 0 -and $condition[0].status -eq 'True')
+                                Schedulable = -not [bool]$(if ($nodeSpec -and $nodeSpec.PSObject.Properties['unschedulable']) { $nodeSpec.unschedulable } else { $false })
+                                PodCIDRs = @(
+                                    if ($nodeSpec -and $nodeSpec.PSObject.Properties['podCIDRs']) { @($nodeSpec.podCIDRs) }
+                                    elseif ($nodeSpec -and $nodeSpec.PSObject.Properties['podCIDR']) { @($nodeSpec.podCIDR) }
+                                )
                                 Version = $_.status.nodeInfo.kubeletVersion
                                 ContainerRuntime = $_.status.nodeInfo.containerRuntimeVersion
                             }
@@ -1799,6 +1805,7 @@ function Get-EwspKubernetesPaths {
         BackendRendered = Join-Path $temporaryRoot 'rendered\backend-deployment.yaml'
         DashboardRendered = Join-Path $temporaryRoot 'rendered\dashboard-deployment.yaml'
         Secret = Join-Path $temporaryRoot 'secrets.local.json'
+        CloudflareSecret = Join-Path $temporaryRoot 'cloudflared-token.local.json'
         PortForwardState = Join-Path $temporaryRoot 'port-forward.json'
         PortForwardOutput = Join-Path $temporaryRoot 'port-forward.out.log'
         PortForwardError = Join-Path $temporaryRoot 'port-forward.err.log'
@@ -1806,6 +1813,84 @@ function Get-EwspKubernetesPaths {
         QuickTunnelOutput = Join-Path $temporaryRoot 'quick-tunnel.out.log'
         QuickTunnelError = Join-Path $temporaryRoot 'quick-tunnel.err.log'
     }
+}
+
+function Get-EwspPermanentTunnelConfiguration {
+    param([Parameter(Mandatory = $true)][hashtable]$EnvironmentValues)
+    $rawEnabled = if ($EnvironmentValues.ContainsKey('CLOUDFLARE_TUNNEL_ENABLED')) {
+        ([string]$EnvironmentValues.CLOUDFLARE_TUNNEL_ENABLED).Trim()
+    } else { 'false' }
+    if ($rawEnabled -notmatch '^(?i:true|false)$') {
+        throw (New-EwspKubernetesException 'CLOUDFLARE_TUNNEL_ENABLED must be exactly true or false.' 'INVALID_ENV_CONFIGURATION' 'Permanent Cloudflare Tunnel' 'Read .env')
+    }
+    $enabled = $rawEnabled -ieq 'true'
+    $token = if ($EnvironmentValues.ContainsKey('CLOUDFLARE_TUNNEL_TOKEN')) { [string]$EnvironmentValues.CLOUDFLARE_TUNNEL_TOKEN } else { '' }
+    $hostname = if ($EnvironmentValues.ContainsKey('CLOUDFLARE_PUBLIC_HOSTNAME')) { ([string]$EnvironmentValues.CLOUDFLARE_PUBLIC_HOSTNAME).Trim().ToLowerInvariant() } else { '' }
+    if ($enabled -and [string]::IsNullOrWhiteSpace($token)) {
+        throw (New-EwspKubernetesException 'Permanent Cloudflare Tunnel is enabled, but CLOUDFLARE_TUNNEL_TOKEN is missing or empty. The value was not printed.' 'INVALID_ENV_CONFIGURATION' 'Permanent Cloudflare Tunnel' 'Read .env')
+    }
+    if ($hostname -and $hostname -notmatch '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') {
+        throw (New-EwspKubernetesException 'CLOUDFLARE_PUBLIC_HOSTNAME must be a bare DNS hostname without a scheme, path, port, or wildcard.' 'INVALID_ENV_CONFIGURATION' 'Permanent Cloudflare Tunnel' 'Read .env')
+    }
+    [PSCustomObject]@{ Enabled = $enabled; Token = $token; PublicHostname = $hostname }
+}
+
+function ConvertTo-EwspPodCidrRegex {
+    param([Parameter(Mandatory = $true)][string]$Cidr)
+    $parts = @($Cidr.Trim() -split '/', 2)
+    $address = $null
+    $prefix = 0
+    if ($parts.Count -ne 2 -or -not [Net.IPAddress]::TryParse($parts[0], [ref]$address) -or
+        $address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
+        -not [int]::TryParse($parts[1], [ref]$prefix) -or $prefix -lt 0 -or $prefix -gt 32) {
+        throw (New-EwspKubernetesException "Node Pod CIDR '$Cidr' is not a valid canonical IPv4 CIDR." 'KUBERNETES_POD_CIDR_INVALID' 'Kubernetes Pod CIDR' 'kubectl get nodes -o json')
+    }
+    if ($address.ToString() -ne $parts[0]) {
+        throw (New-EwspKubernetesException "Node Pod CIDR '$Cidr' is not in canonical IPv4 notation." 'KUBERNETES_POD_CIDR_INVALID' 'Kubernetes Pod CIDR' 'kubectl get nodes -o json')
+    }
+    $octets = @($address.GetAddressBytes() | ForEach-Object { [int]$_ })
+    for ($bit = $prefix; $bit -lt 32; $bit++) {
+        $octetIndex = [math]::Floor($bit / 8)
+        $mask = 1 -shl (7 - ($bit % 8))
+        if (($octets[$octetIndex] -band $mask) -ne 0) {
+            throw (New-EwspKubernetesException "Node Pod CIDR '$Cidr' contains host bits and is not a canonical network." 'KUBERNETES_POD_CIDR_INVALID' 'Kubernetes Pod CIDR' 'kubectl get nodes -o json')
+        }
+    }
+    $anyOctet = '(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+    $segments = New-Object System.Collections.Generic.List[string]
+    $fullOctets = [math]::Floor($prefix / 8)
+    for ($index = 0; $index -lt $fullOctets; $index++) { $segments.Add([string]$octets[$index]) }
+    $remainingBits = $prefix % 8
+    if ($remainingBits -gt 0) {
+        $rangeSize = 1 -shl (8 - $remainingBits)
+        $values = @($octets[$fullOctets]..($octets[$fullOctets] + $rangeSize - 1)) -join '|'
+        $segments.Add("(?:$values)")
+    }
+    while ($segments.Count -lt 4) { $segments.Add($anyOctet) }
+    '^(?:' + ($segments -join '\.') + ')$'
+}
+
+function Get-EwspNodePodCidr {
+    param([scriptblock]$CommandRunner)
+    $result = Invoke-EwspKubectl @('get', 'nodes', '-o', 'json') $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Unable to query node-assigned Pod CIDRs.' 'KUBERNETES_POD_CIDR_INVALID' 'Kubernetes Pod CIDR' 'kubectl get nodes -o json')
+    }
+    try { $nodes = @((($result.Output -join "`n") | ConvertFrom-Json).items) } catch { $nodes = @() }
+    $nodes = @($nodes | Where-Object {
+        $unschedulable = if ($_.spec.PSObject.Properties['unschedulable']) { [bool]$_.spec.unschedulable } else { $false }
+        -not $unschedulable -and @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -eq 1
+    })
+    if ($nodes.Count -ne 1) {
+        throw (New-EwspKubernetesException "Expected exactly one Ready schedulable node for Pod-CIDR trust; found $($nodes.Count)." 'KUBERNETES_POD_CIDR_INVALID' 'Kubernetes Pod CIDR' 'kubectl get nodes -o json')
+    }
+    $cidrs = if ($nodes[0].spec.PSObject.Properties['podCIDRs']) { @($nodes[0].spec.podCIDRs) } else { @($nodes[0].spec.podCIDR) }
+    $cidrs = @($cidrs | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+    if ($cidrs.Count -ne 1) {
+        throw (New-EwspKubernetesException "Expected exactly one node-assigned Pod CIDR; found $($cidrs.Count). No broader trust fallback was used." 'KUBERNETES_POD_CIDR_INVALID' 'Kubernetes Pod CIDR' 'kubectl get nodes -o json')
+    }
+    $regex = ConvertTo-EwspPodCidrRegex ([string]$cidrs[0])
+    [PSCustomObject]@{ NodeName = [string]$nodes[0].metadata.name; Cidr = [string]$cidrs[0]; Regex = $regex }
 }
 
 function New-EwspQuickTunnelException {
@@ -2402,6 +2487,49 @@ function Remove-EwspKubernetesSecretArtifact {
     if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
 }
 
+function New-EwspCloudflareTunnelSecretArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][string]$Token,
+        [switch]$SkipAcl
+    )
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        throw (New-EwspKubernetesException 'Cloudflare tunnel token is missing or empty. The value was not printed.' 'INVALID_ENV_CONFIGURATION' 'Permanent Cloudflare Tunnel' 'Read .env')
+    }
+    $paths = Get-EwspKubernetesPaths $LocalRoot
+    $secretPath = Assert-EwspSafeTemporaryPath $LocalRoot $paths.CloudflareSecret
+    New-Item -ItemType Directory -Path (Split-Path -Parent $secretPath) -Force | Out-Null
+    $secret = [ordered]@{
+        apiVersion = 'v1'; kind = 'Secret'
+        metadata = [ordered]@{
+            name = 'cloudflared-tunnel-token'; namespace = $script:EwspKubernetesNamespace
+            labels = [ordered]@{ 'app.kubernetes.io/name' = 'cloudflared'; 'app.kubernetes.io/part-of' = 'ewsp' }
+        }
+        type = 'Opaque'
+        data = [ordered]@{ token = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Token)) }
+    }
+    try {
+        [IO.File]::WriteAllText($secretPath, ($secret | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        $ignored = Invoke-EwspNative 'git' @('-C', $LocalRoot, 'check-ignore', '--quiet', '--', '.tmp/k8s/cloudflared-token.local.json')
+        if ($ignored.ExitCode -ne 0) { throw 'Temporary Cloudflare Secret artifact is not ignored by Git.' }
+        if (-not $SkipAcl -and (Get-EwspHostPlatform).Name -eq 'Windows') {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $aclResult = Invoke-EwspNative 'icacls' @($secretPath, '/inheritance:r', '/grant:r', "${identity}:(F)")
+            if ($aclResult.ExitCode -ne 0) { throw 'Failed to restrict the temporary Cloudflare Secret artifact ACL.' }
+        }
+    } catch {
+        if (Test-Path -LiteralPath $secretPath -PathType Leaf) { Remove-Item -LiteralPath $secretPath -Force }
+        throw
+    }
+    $secretPath
+}
+
+function Remove-EwspCloudflareTunnelSecretArtifact {
+    param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $path = Assert-EwspSafeTemporaryPath $LocalRoot (Get-EwspKubernetesPaths $LocalRoot).CloudflareSecret
+    if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+}
+
 function New-EwspKubernetesRenderedManifests {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
@@ -2441,10 +2569,12 @@ function Get-EwspKubernetesApplyPlan {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
         [Parameter(Mandatory = $true)]$Rendered,
-        [Parameter(Mandatory = $true)][string]$SecretPath
+        [Parameter(Mandatory = $true)][string]$SecretPath,
+        $PermanentTunnel,
+        [string]$CloudflareSecretPath
     )
     $root = Join-Path $LocalRoot 'k8s'
-    @(
+    $plan = @(
         [PSCustomObject]@{ Stage = 'NAMESPACE'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'namespace.yaml')) },
         [PSCustomObject]@{ Stage = 'CONFIGMAPS'; Scope = 'Infrastructure'; Files = @((Join-Path $root 'config\postgres-configmap.yaml'), (Join-Path $root 'backend\configmap.yaml')) },
         [PSCustomObject]@{ Stage = 'SECRET'; Scope = 'Infrastructure'; Files = @($SecretPath) },
@@ -2454,6 +2584,15 @@ function Get-EwspKubernetesApplyPlan {
         [PSCustomObject]@{ Stage = 'BACKEND'; Scope = 'Application'; Files = @((Join-Path $root 'backend\service.yaml'), $Rendered.Backend) },
         [PSCustomObject]@{ Stage = 'DASHBOARD'; Scope = 'Application'; Files = @((Join-Path $root 'dashboard\service.yaml'), $Rendered.Dashboard) }
     )
+    if ($PermanentTunnel -and $PermanentTunnel.Enabled) {
+        if ([string]::IsNullOrWhiteSpace($CloudflareSecretPath)) { throw 'Cloudflare Secret path is required when the permanent tunnel is enabled.' }
+        $plan += @(
+            [PSCustomObject]@{ Stage = 'NETWORKPOLICIES'; Scope = 'Application'; Files = @((Join-Path $root 'networkpolicies\backend-ingress.yaml'), (Join-Path $root 'networkpolicies\dashboard-ingress.yaml')) },
+            [PSCustomObject]@{ Stage = 'CLOUDFLARE_SECRET'; Scope = 'Application'; Files = @($CloudflareSecretPath) },
+            [PSCustomObject]@{ Stage = 'CLOUDFLARED'; Scope = 'Application'; Files = @((Join-Path $root 'cloudflared\deployment.yaml')) }
+        )
+    }
+    $plan
 }
 
 function Assert-EwspKubernetesManifestSet {
@@ -2535,6 +2674,106 @@ function Invoke-EwspKubernetesApplyStages {
                 throw
             }
         }
+    }
+}
+
+function Set-EwspPermanentBackendTrust {
+    param(
+        [Parameter(Mandatory = $true)]$PodCidrBoundary,
+        [hashtable]$EnvironmentValues,
+        [scriptblock]$CommandRunner
+    )
+    $result = Invoke-EwspKubectl @(
+        'set', 'env', 'deployment/backend', '-n', $script:EwspKubernetesNamespace,
+        'SERVER_FORWARD_HEADERS_STRATEGY=NATIVE',
+        "SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES=$($PodCidrBoundary.Regex)"
+    ) $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        $reason = Protect-EwspDiagnosticText ($result.Output -join ' ') $EnvironmentValues
+        throw (New-EwspKubernetesException "Failed to reconcile permanent backend proxy trust: $reason" 'KUBERNETES_APPLY_FAILURE' 'backend trusted proxy boundary' 'kubectl set env deployment/backend')
+    }
+    $rollout = Invoke-EwspKubectl @('rollout', 'status', 'deployment/backend', '-n', $script:EwspKubernetesNamespace, '--timeout=240s') $CommandRunner
+    if ($rollout.ExitCode -ne 0) {
+        throw (New-EwspKubernetesException 'Backend did not become Ready after permanent proxy trust reconciliation.' 'KUBERNETES_READINESS_FAILURE' 'backend trusted proxy boundary' 'kubectl rollout status deployment/backend')
+    }
+    $true
+}
+
+function Disable-EwspPermanentTunnelResources {
+    param(
+        [string]$LocalRoot,
+        [scriptblock]$CommandRunner
+    )
+    $quickTunnelActive = $false
+    if ($LocalRoot) {
+        try { $quickTunnelActive = [bool](Get-EwspManagedQuickTunnel $LocalRoot).Active } catch { }
+    }
+    if (-not $quickTunnelActive) {
+        $backend = Invoke-EwspKubectl @(
+            'set', 'env', 'deployment/backend', '-n', $script:EwspKubernetesNamespace,
+            'SERVER_FORWARD_HEADERS_STRATEGY-', 'SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES-'
+        ) $CommandRunner
+        if ($backend.ExitCode -ne 0) { throw 'Failed to restore normal backend forwarded-header behavior.' }
+    }
+    $deployment = Invoke-EwspKubectl @('get', 'deployment', 'cloudflared', '-n', $script:EwspKubernetesNamespace, '-o', 'name') $CommandRunner
+    if ($deployment.ExitCode -eq 0) {
+        $scaled = Invoke-EwspKubectl @('scale', 'deployment', 'cloudflared', '-n', $script:EwspKubernetesNamespace, '--replicas=0') $CommandRunner
+        if ($scaled.ExitCode -ne 0) { throw 'Failed to disable the existing cloudflared Deployment.' }
+    }
+    $policies = Invoke-EwspKubectl @('delete', 'networkpolicy', 'backend-ingress-from-dashboard', 'dashboard-ingress-from-cloudflared', '-n', $script:EwspKubernetesNamespace, '--ignore-not-found=true') $CommandRunner
+    if ($policies.ExitCode -ne 0) { throw 'Failed to remove disabled permanent-tunnel NetworkPolicies.' }
+    $true
+}
+
+function Wait-EwspCloudflaredReady {
+    param(
+        [hashtable]$EnvironmentValues,
+        [scriptblock]$CommandRunner
+    )
+    $result = Invoke-EwspKubectl @('rollout', 'status', 'deployment/cloudflared', '-n', $script:EwspKubernetesNamespace, '--timeout=180s') $CommandRunner
+    if ($result.ExitCode -ne 0) {
+        $logs = Invoke-EwspKubectl @('logs', '-n', $script:EwspKubernetesNamespace, 'deployment/cloudflared', '--tail=40') $CommandRunner
+        $reason = Protect-EwspDiagnosticText (($logs.Output | Select-Object -Last 40) -join ' ') $EnvironmentValues
+        throw (New-EwspKubernetesException "cloudflared did not become Ready. Bounded logs: $reason" 'KUBERNETES_READINESS_FAILURE' 'cloudflared' 'kubectl rollout status deployment/cloudflared')
+    }
+    $true
+}
+
+function Get-EwspPermanentTunnelStatus {
+    param([scriptblock]$CommandRunner)
+    $deploymentResult = Invoke-EwspKubectl @('get', 'deployment', 'cloudflared', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $deployment = $null
+    if ($deploymentResult.ExitCode -eq 0) { try { $deployment = ($deploymentResult.Output -join "`n") | ConvertFrom-Json } catch { } }
+    $podResult = Invoke-EwspKubectl @('get', 'pods', '-n', $script:EwspKubernetesNamespace, '-l', 'app.kubernetes.io/name=cloudflared,app.kubernetes.io/part-of=ewsp', '-o', 'json') $CommandRunner
+    $pod = $null
+    if ($podResult.ExitCode -eq 0) { try { $pod = @( (($podResult.Output -join "`n") | ConvertFrom-Json).items | Sort-Object { $_.metadata.creationTimestamp } -Descending )[0] } catch { } }
+    $containerStatus = if ($pod -and @($pod.status.containerStatuses).Count) { @($pod.status.containerStatuses)[0] } else { $null }
+    $backendResult = Invoke-EwspKubectl @('get', 'deployment', 'backend', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $strategy = 'NONE'
+    $proxyRegex = $null
+    if ($backendResult.ExitCode -eq 0) {
+        try {
+            $backend = ($backendResult.Output -join "`n") | ConvertFrom-Json
+            foreach ($env in @($backend.spec.template.spec.containers[0].env)) {
+                if ($env.name -eq 'SERVER_FORWARD_HEADERS_STRATEGY') { $strategy = [string]$env.value }
+                if ($env.name -eq 'SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES') { $proxyRegex = [string]$env.value }
+            }
+        } catch { }
+    }
+    $policyResult = Invoke-EwspKubectl @('get', 'networkpolicy', '-n', $script:EwspKubernetesNamespace, '-o', 'json') $CommandRunner
+    $policyNames = @()
+    if ($policyResult.ExitCode -eq 0) { try { $policyNames = @( (($policyResult.Output -join "`n") | ConvertFrom-Json).items.metadata.name ) } catch { } }
+    [PSCustomObject]@{
+        Exists = $null -ne $deployment
+        Desired = if ($deployment) { [int]$deployment.spec.replicas } else { 0 }
+        Ready = if ($deployment -and $deployment.status.PSObject.Properties['readyReplicas']) { [int]$deployment.status.readyReplicas } else { 0 }
+        PodName = if ($pod) { [string]$pod.metadata.name } else { $null }
+        PodPhase = if ($pod) { [string]$pod.status.phase } else { 'Missing' }
+        Restarts = if ($containerStatus) { [int]$containerStatus.restartCount } else { 0 }
+        Image = if ($pod) { [string]$pod.spec.containers[0].image } elseif ($deployment) { [string]$deployment.spec.template.spec.containers[0].image } else { $null }
+        BackendStrategy = $strategy
+        ProxyRegex = $proxyRegex
+        NetworkPoliciesPresent = @(@('backend-ingress-from-dashboard', 'dashboard-ingress-from-cloudflared') | Where-Object { $policyNames -contains $_ }).Count -eq 2
     }
 }
 
@@ -2774,8 +3013,8 @@ function Assert-EwspKubernetesFunctionality {
     Assert-EwspKubernetesCommandResult $dns 'Kubernetes DNS contracts' 'postgres.ewsp.svc.cluster.local' | Out-Null
     foreach ($check in @(
         @{ Name = 'Backend health'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $backendPod, '--', 'curl', '-fsS', 'http://backend:8080/api/health'); Expected = 'UP' },
-        @{ Name = 'Dashboard root'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $dashboardPod, '--', 'wget', '-q', '-O', '/dev/null', 'http://dashboard/'); Expected = $null },
-        @{ Name = 'Dashboard backend proxy'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $dashboardPod, '--', 'wget', '-q', '-O', '-', 'http://dashboard/api/health'); Expected = 'UP' }
+        @{ Name = 'Dashboard root'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $dashboardPod, '--', 'wget', '-q', '-O', '/dev/null', 'http://localhost/'); Expected = $null },
+        @{ Name = 'Dashboard backend proxy'; Args = @('exec', '-n', $script:EwspKubernetesNamespace, $dashboardPod, '--', 'wget', '-q', '-O', '-', 'http://localhost/api/health'); Expected = 'UP' }
     )) {
         $result = Invoke-EwspKubectl $check.Args $CommandRunner
         Assert-EwspKubernetesCommandResult $result $check.Name $check.Expected | Out-Null
@@ -3381,7 +3620,24 @@ function Show-EwspKubernetesStatusSnapshot {
     if ($forward.Active -and $forward.Healthy) { Write-Host "Dashboard: active $($forward.Url) (PID $($forward.Process.Id))" }
     elseif ($forward.Active) { Write-Host "Dashboard: managed process active but endpoint unhealthy (PID $($forward.Process.Id))" -ForegroundColor Yellow }
     else { Write-Host 'Dashboard: inactive' }
-    [PSCustomObject]@{ Workloads = $snapshots; Pvcs = $pvcs; Services = $services; PortForward = $forward }
+    $environmentValues = Get-EwspEffectiveEnvironmentValues $LocalRoot
+    $permanentConfiguration = Get-EwspPermanentTunnelConfiguration $environmentValues
+    $permanentStatus = Get-EwspPermanentTunnelStatus $CommandRunner
+    Write-Host ''
+    Write-Host 'Permanent Cloudflare Tunnel'
+    Write-Host '---------------------------'
+    Write-Host "Configured: $(if ($permanentConfiguration.Enabled) { 'yes' } else { 'no' })"
+    Write-Host "cloudflared: desired=$($permanentStatus.Desired) ready=$($permanentStatus.Ready) pod=$(if ($permanentStatus.PodName) { $permanentStatus.PodName } else { '<none>' }) status=$($permanentStatus.PodPhase) restarts=$($permanentStatus.Restarts) image=$(if ($permanentStatus.Image) { $permanentStatus.Image } else { '<none>' })"
+    Write-Host "Backend forwarded headers: $($permanentStatus.BackendStrategy)"
+    if ($permanentStatus.BackendStrategy -eq 'NATIVE') {
+        try {
+            $boundary = Get-EwspNodePodCidr $CommandRunner
+            Write-Host "Trusted boundary source: node Pod CIDR ($($boundary.Cidr) on $($boundary.NodeName))"
+        } catch { Write-Host 'Trusted boundary source: node Pod CIDR unavailable' -ForegroundColor Yellow }
+    } else { Write-Host 'Trusted boundary source: none' }
+    Write-Host "NetworkPolicies: $(if ($permanentStatus.NetworkPoliciesPresent) { 'present (enforcement requires empirical test)' } else { 'not present' })"
+    Write-Host "Public hostname: $(if ($permanentConfiguration.PublicHostname) { $permanentConfiguration.PublicHostname } else { '<not configured>' })"
+    [PSCustomObject]@{ Workloads = $snapshots; Pvcs = $pvcs; Services = $services; PortForward = $forward; PermanentTunnel = $permanentStatus }
 }
 
 function Invoke-EwspKubernetesStatus {
@@ -3418,7 +3674,7 @@ function Invoke-EwspKubernetesStop {
     Assert-EwspKubernetesEnvironment $environment -RequireDocker | Out-Null
     Stop-EwspKubernetesPortForward $LocalRoot | Out-Null
     foreach ($target in @(
-        @{ Type = 'deployment'; Names = @('dashboard', 'backend', 'redis') },
+        @{ Type = 'deployment'; Names = @('cloudflared', 'dashboard', 'backend', 'redis') },
         @{ Type = 'statefulset'; Names = @('minio', 'postgres') }
     )) {
         foreach ($name in $target.Names) {
@@ -3438,15 +3694,15 @@ function Invoke-EwspKubernetesUp {
     param([Parameter(Mandatory = $true)][string]$LocalRoot)
     $phaseNames = @(
         'K8S_ENVIRONMENT', 'REPOSITORY_STATE', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION',
-        'MANIFEST_VALIDATION', 'INFRASTRUCTURE_APPLY', 'APPLICATION_APPLY', 'READINESS_WAIT',
-        'FINAL_VERIFICATION', 'ACCESS_SETUP'
+        'TRUST_BOUNDARY', 'MANIFEST_VALIDATION', 'INFRASTRUCTURE_APPLY', 'APPLICATION_APPLY',
+        'READINESS_WAIT', 'FINAL_VERIFICATION', 'ACCESS_SETUP'
     )
     $completed = New-Object System.Collections.Generic.List[string]
     $context = @{
         Environment = $null; Configuration = $null; EnvironmentValues = $null; Ports = $null
-        ImagePlan = $null; PreviousTagEnvironment = $null; SecretPath = $null; Rendered = $null
+        ImagePlan = $null; PreviousTagEnvironment = $null; SecretPath = $null; CloudflareSecretPath = $null; Rendered = $null
         ApplyPlan = $null; States = $null; PortForward = $null; DashboardPort = $null
-        OldBackendImage = $null; OldDashboardImage = $null
+        OldBackendImage = $null; OldDashboardImage = $null; PermanentTunnel = $null; PodCidrBoundary = $null
     }
     $total = $phaseNames.Count
 
@@ -3464,6 +3720,7 @@ function Invoke-EwspKubernetesUp {
         }
         $context.Configuration = Get-EwspConfiguration $LocalRoot
         $context.EnvironmentValues = Get-EwspEffectiveEnvironmentValues $LocalRoot
+        $context.PermanentTunnel = Get-EwspPermanentTunnelConfiguration $context.EnvironmentValues
         $context.Ports = @(Assert-EwspEnvironmentConfiguration $context.EnvironmentValues)
         foreach ($repository in @($context.Configuration.Repositories | Where-Object { $_.ContainsKey('Image') })) {
             $path = Resolve-EwspRepositoryPath $LocalRoot $repository
@@ -3491,32 +3748,49 @@ function Invoke-EwspKubernetesUp {
     try {
         Invoke-EwspUpPhase 4 $total $phaseNames[3] 'Preparing local Kubernetes Secret' {
             $context.SecretPath = New-EwspKubernetesSecretArtifact $LocalRoot $context.EnvironmentValues
-            Write-Host '      generated ignored local Secret artifact; values hidden'
+            if ($context.PermanentTunnel.Enabled) {
+                $context.CloudflareSecretPath = New-EwspCloudflareTunnelSecretArtifact $LocalRoot $context.PermanentTunnel.Token
+            }
+            Write-Host "      generated ignored local Secret artifact(s); permanent tunnel=$(if ($context.PermanentTunnel.Enabled) { 'enabled' } else { 'disabled' }); values hidden"
         } $completed $phaseNames[4..($total - 1)] $context.Environment 'Generate real local Secret from .env' 'Kubernetes Secret' -WorkflowName 'k8s-up' | Out-Null
 
-        Invoke-EwspUpPhase 5 $total $phaseNames[4] 'Rendering and validating manifests' {
+        Invoke-EwspUpPhase 5 $total $phaseNames[4] 'Deriving permanent trusted-proxy boundary' {
+            if ($context.PermanentTunnel.Enabled) {
+                $context.PodCidrBoundary = Get-EwspNodePodCidr
+                Write-Host "      source=node Pod CIDR; node=$($context.PodCidrBoundary.NodeName); CIDR=$($context.PodCidrBoundary.Cidr)"
+            } else { Write-Host '      permanent tunnel disabled; no Pod-CIDR trust enabled' }
+        } $completed $phaseNames[5..($total - 1)] $context.Environment 'Derive an exact trusted-proxy regex from the node-assigned Pod CIDR' 'Kubernetes Pod CIDR' -WorkflowName 'k8s-up' | Out-Null
+
+        Invoke-EwspUpPhase 6 $total $phaseNames[5] 'Rendering and validating manifests' {
             $backendDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'backend')[0]
             $dashboardDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'dashboard')[0]
             $context.Rendered = New-EwspKubernetesRenderedManifests $LocalRoot $backendDescriptor.Tag $dashboardDescriptor.Tag
-            $context.ApplyPlan = @(Get-EwspKubernetesApplyPlan $LocalRoot $context.Rendered $context.SecretPath)
+            $context.ApplyPlan = @(Get-EwspKubernetesApplyPlan $LocalRoot $context.Rendered $context.SecretPath $context.PermanentTunnel $context.CloudflareSecretPath)
             Assert-EwspKubernetesManifestSet $LocalRoot $context.ApplyPlan $backendDescriptor.Tag $dashboardDescriptor.Tag | Out-Null
             $dashboardPort = @($context.Ports | Where-Object Service -eq 'dashboard')[0].Port
             $context.DashboardPort = [int]$dashboardPort
             Assert-EwspKubernetesAccessPortAvailable $LocalRoot $context.DashboardPort | Out-Null
             Write-Host "      strict validation passed; rendered manifests: $($context.Rendered.Root)"
-        } $completed $phaseNames[5..($total - 1)] $context.Environment 'Render exact images and run strict client validation' 'Kubernetes manifests' -WorkflowName 'k8s-up' | Out-Null
+        } $completed $phaseNames[6..($total - 1)] $context.Environment 'Render exact images and run strict client validation' 'Kubernetes manifests' -WorkflowName 'k8s-up' | Out-Null
 
-        Invoke-EwspUpPhase 6 $total $phaseNames[5] 'Reconciling Kubernetes infrastructure' {
+        Invoke-EwspUpPhase 7 $total $phaseNames[6] 'Reconciling Kubernetes infrastructure' {
             Invoke-EwspKubernetesApplyStages $context.ApplyPlan 'Infrastructure'
             Remove-EwspKubernetesSecretArtifact $LocalRoot
             $context.SecretPath = $null
             Wait-EwspKubernetesInfrastructure $context.EnvironmentValues | Out-Null
-        } $completed $phaseNames[6..($total - 1)] $context.Environment 'Apply namespace, ConfigMaps, Secret, PostgreSQL, Redis, and MinIO' 'Kubernetes infrastructure' -WorkflowName 'k8s-up' | Out-Null
+        } $completed $phaseNames[7..($total - 1)] $context.Environment 'Apply namespace, ConfigMaps, Secret, PostgreSQL, Redis, and MinIO' 'Kubernetes infrastructure' -WorkflowName 'k8s-up' | Out-Null
 
-        Invoke-EwspUpPhase 7 $total $phaseNames[6] 'Reconciling Kubernetes applications' {
+        Invoke-EwspUpPhase 8 $total $phaseNames[7] 'Reconciling Kubernetes applications' {
             $context.OldBackendImage = Get-EwspRunningKubernetesImage 'backend'
             $context.OldDashboardImage = Get-EwspRunningKubernetesImage 'dashboard'
             Invoke-EwspKubernetesApplyStages $context.ApplyPlan 'Application'
+            if ($context.PermanentTunnel.Enabled) {
+                Set-EwspPermanentBackendTrust $context.PodCidrBoundary $context.EnvironmentValues | Out-Null
+                Remove-EwspCloudflareTunnelSecretArtifact $LocalRoot
+                $context.CloudflareSecretPath = $null
+            } else {
+                Disable-EwspPermanentTunnelResources $LocalRoot | Out-Null
+            }
             foreach ($descriptor in $context.ImagePlan.Descriptors) {
                 $old = if ($descriptor.Service -eq 'backend') { $context.OldBackendImage } else { $context.OldDashboardImage }
                 if ($old -eq $descriptor.Tag) {
@@ -3526,17 +3800,18 @@ function Invoke-EwspKubernetesUp {
                     Write-Host "      $($descriptor.Service): new image=$($descriptor.Tag)" -ForegroundColor Green
                 }
             }
-        } $completed $phaseNames[7..($total - 1)] $context.Environment 'Apply exact backend and dashboard images' 'Kubernetes applications' -WorkflowName 'k8s-up' | Out-Null
+        } $completed $phaseNames[8..($total - 1)] $context.Environment 'Apply applications, proxy trust, policies, and optional cloudflared' 'Kubernetes applications' -WorkflowName 'k8s-up' | Out-Null
 
-        Invoke-EwspUpPhase 8 $total $phaseNames[7] 'Waiting for Kubernetes readiness' {
+        Invoke-EwspUpPhase 9 $total $phaseNames[8] 'Waiting for Kubernetes readiness' {
             $context.States = @(Wait-EwspKubernetesWorkloads $context.EnvironmentValues)
-        } $completed $phaseNames[8..($total - 1)] $context.Environment 'Wait for five workloads and two PVCs' 'EWSP workloads' -WorkflowName 'k8s-up' | Out-Null
+            if ($context.PermanentTunnel.Enabled) { Wait-EwspCloudflaredReady $context.EnvironmentValues | Out-Null }
+        } $completed $phaseNames[9..($total - 1)] $context.Environment 'Wait for five workloads, optional cloudflared, and two PVCs' 'EWSP workloads' -WorkflowName 'k8s-up' | Out-Null
 
-        Invoke-EwspUpPhase 9 $total $phaseNames[8] 'Verifying Kubernetes functionality' {
+        Invoke-EwspUpPhase 10 $total $phaseNames[9] 'Verifying Kubernetes functionality' {
             Assert-EwspKubernetesFunctionality | Out-Null
-        } $completed @($phaseNames[9]) $context.Environment 'Verify infrastructure, DNS, backend, and dashboard inside Kubernetes' 'EWSP Kubernetes services' -WorkflowName 'k8s-up' | Out-Null
+        } $completed @($phaseNames[10]) $context.Environment 'Verify infrastructure, DNS, backend, and dashboard inside Kubernetes' 'EWSP Kubernetes services' -WorkflowName 'k8s-up' | Out-Null
 
-        Invoke-EwspUpPhase 10 $total $phaseNames[9] 'Preparing dashboard access' {
+        Invoke-EwspUpPhase 11 $total $phaseNames[10] 'Preparing dashboard access' {
             $context.PortForward = Start-EwspKubernetesPortForward $LocalRoot $context.DashboardPort
             Assert-EwspKubernetesDashboardAccess $context.DashboardPort | Out-Null
         } $completed @() $context.Environment 'Start or reuse managed dashboard port-forward' 'Dashboard access' -WorkflowName 'k8s-up' | Out-Null
@@ -3544,6 +3819,11 @@ function Invoke-EwspKubernetesUp {
         if ($context.SecretPath) {
             try { Remove-EwspKubernetesSecretArtifact $LocalRoot } catch {
                 Write-Warning 'Temporary Kubernetes Secret cleanup failed. Remove .tmp\k8s\secrets.local.json manually without displaying it.'
+            }
+        }
+        if ($context.CloudflareSecretPath) {
+            try { Remove-EwspCloudflareTunnelSecretArtifact $LocalRoot } catch {
+                Write-Warning 'Temporary Cloudflare Secret cleanup failed. Remove .tmp\k8s\cloudflared-token.local.json manually without displaying it.'
             }
         }
         if ($context.PreviousTagEnvironment) { Restore-EwspProcessEnvironment $context.PreviousTagEnvironment }
@@ -3634,6 +3914,11 @@ Export-ModuleMember -Function @(
     'Assert-EwspKubernetesEnvironment',
     'New-EwspKubernetesSecretArtifact',
     'Remove-EwspKubernetesSecretArtifact',
+    'Get-EwspPermanentTunnelConfiguration',
+    'ConvertTo-EwspPodCidrRegex',
+    'Get-EwspNodePodCidr',
+    'New-EwspCloudflareTunnelSecretArtifact',
+    'Remove-EwspCloudflareTunnelSecretArtifact',
     'New-EwspKubernetesRenderedManifests',
     'Get-EwspKubernetesApplyPlan',
     'Assert-EwspKubernetesManifestSet',
@@ -3645,6 +3930,8 @@ Export-ModuleMember -Function @(
     'Get-EwspManagedKubernetesPortForward',
     'Stop-EwspKubernetesPortForward',
     'Wait-EwspKubernetesPodsStopped',
+    'Wait-EwspCloudflaredReady',
+    'Get-EwspPermanentTunnelStatus',
     'Invoke-EwspKubernetesUp',
     'Invoke-EwspKubernetesStatus',
     'Invoke-EwspKubernetesStop',

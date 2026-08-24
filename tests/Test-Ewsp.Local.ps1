@@ -633,6 +633,46 @@ try {
     $incompleteSecretValues.Remove('JWT_SECRET')
     Assert-ThrowsContains { New-EwspKubernetesSecretArtifact $localRoot $incompleteSecretValues -SkipAcl | Out-Null } 'JWT_SECRET' 'missing Kubernetes Secret setting is rejected by name'
 
+    $tunnelDisabled = Get-EwspPermanentTunnelConfiguration @{}
+    Assert-Equal $tunnelDisabled.Enabled $false 'permanent tunnel defaults to disabled when configuration is absent'
+    $tokenOnly = Get-EwspPermanentTunnelConfiguration @{ CLOUDFLARE_TUNNEL_TOKEN = 'token-present-but-not-enabled' }
+    Assert-Equal $tokenOnly.Enabled $false 'token presence alone never enables the permanent tunnel'
+    Assert-ThrowsContains { Get-EwspPermanentTunnelConfiguration @{ CLOUDFLARE_TUNNEL_ENABLED = 'true' } | Out-Null } 'CLOUDFLARE_TUNNEL_TOKEN' 'enabled permanent tunnel requires a token without printing it'
+    Assert-ThrowsContains { Get-EwspPermanentTunnelConfiguration @{ CLOUDFLARE_TUNNEL_ENABLED = 'sometimes' } | Out-Null } 'exactly true or false' 'permanent tunnel enable flag is strict'
+    $tunnelEnabled = Get-EwspPermanentTunnelConfiguration @{
+        CLOUDFLARE_TUNNEL_ENABLED = 'true'; CLOUDFLARE_TUNNEL_TOKEN = 'opaque-cloudflare-token'
+        CLOUDFLARE_PUBLIC_HOSTNAME = 'EWSP.Example.com'
+    }
+    Assert-Equal $tunnelEnabled.Enabled $true 'explicit valid permanent tunnel configuration enables deployment'
+    Assert-Equal $tunnelEnabled.PublicHostname 'ewsp.example.com' 'safe public hostname is normalized for status'
+    Assert-ThrowsContains { Get-EwspPermanentTunnelConfiguration @{ CLOUDFLARE_TUNNEL_ENABLED = 'false'; CLOUDFLARE_PUBLIC_HOSTNAME = 'https://ewsp.example.com/path' } | Out-Null } 'bare DNS hostname' 'public hostname rejects URL syntax'
+    Assert-NotContains (Protect-EwspDiagnosticText 'TUNNEL_TOKEN=opaque-cloudflare-token' @{ CLOUDFLARE_TUNNEL_TOKEN = 'opaque-cloudflare-token' }) 'opaque-cloudflare-token' 'Cloudflare token is redacted from diagnostics'
+
+    Assert-Equal (ConvertTo-EwspPodCidrRegex '10.77.8.0/24') '^(?:10\.77\.8\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))$' 'Pod CIDR converts to a full-match Tomcat regex'
+    Assert-ThrowsContains { ConvertTo-EwspPodCidrRegex '10.77.8.1/24' | Out-Null } 'host bits' 'non-canonical Pod CIDR is rejected'
+    Assert-ThrowsContains { ConvertTo-EwspPodCidrRegex '10.77.8.0/99' | Out-Null } 'valid canonical IPv4 CIDR' 'invalid Pod CIDR prefix is rejected'
+    $podCidrNode = @{
+        metadata = @{ name = 'desktop-control-plane' }; spec = @{ podCIDR = '10.77.8.0/24'; podCIDRs = @('10.77.8.0/24') }
+        status = @{ conditions = @(@{ type = 'Ready'; status = 'True' }) }
+    }
+    $podCidrRunner = { param($filePath, $arguments) [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($podCidrNode) } | ConvertTo-Json -Depth 8 -Compress)) } }.GetNewClosure()
+    $podBoundary = Get-EwspNodePodCidr $podCidrRunner
+    Assert-Equal $podBoundary.Cidr '10.77.8.0/24' 'node-assigned Pod CIDR is derived dynamically'
+    Assert-NotContains $podBoundary.Regex '127\.0\.0\.1' 'permanent trusted boundary excludes loopback'
+    $multipleCidrNode = $podCidrNode.Clone()
+    $multipleCidrNode.spec = @{ podCIDR = '10.77.8.0/24'; podCIDRs = @('10.77.8.0/24', 'fd00::/64') }
+    $multipleCidrRunner = { param($filePath, $arguments) [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($multipleCidrNode) } | ConvertTo-Json -Depth 8 -Compress)) } }.GetNewClosure()
+    Assert-ThrowsContains { Get-EwspNodePodCidr $multipleCidrRunner | Out-Null } 'exactly one node-assigned Pod CIDR' 'multiple Pod CIDRs fail closed without broad fallback'
+
+    $cloudflareSecretOutput = @(& { New-EwspCloudflareTunnelSecretArtifact $localRoot 'opaque-cloudflare-token' -SkipAcl } *>&1)
+    $cloudflareSecretPath = [string]$cloudflareSecretOutput[-1]
+    $cloudflareSecretText = Get-Content -Raw -LiteralPath $cloudflareSecretPath
+    Assert-NotContains $cloudflareSecretText 'opaque-cloudflare-token' 'temporary Cloudflare Secret stores no plaintext token'
+    Assert-NotContains ($cloudflareSecretOutput -join ' ') 'opaque-cloudflare-token' 'Cloudflare Secret preparation never logs the token'
+    $cloudflareSecretObject = $cloudflareSecretText | ConvertFrom-Json
+    Assert-Equal $cloudflareSecretObject.metadata.name 'cloudflared-tunnel-token' 'Cloudflare Secret uses the stable runtime name'
+    Assert-Equal (@($cloudflareSecretObject.data.PSObject.Properties.Name) -join ',') 'token' 'Cloudflare Secret has only the token key'
+
     $backendSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash
     $dashboardSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash
     $renderRunner = {
@@ -664,6 +704,32 @@ try {
     Write-Host 'PASS: complete rendered Kubernetes manifest set validates'
     Assert-Contains ($validationCapture.Arguments -join ' ') '--dry-run=client --validate=true' 'manifest validation is strict client-side validation'
     Assert-NotContains ($validationCapture.Arguments -join ' ') 'secrets.example.yaml' 'example Secret is never validated as a real apply input'
+
+    $permanentApplyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath $tunnelEnabled $cloudflareSecretPath)
+    Assert-Equal (@($permanentApplyPlan.Stage) -join ',') 'NAMESPACE,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD,NETWORKPOLICIES,CLOUDFLARE_SECRET,CLOUDFLARED' 'permanent tunnel resources have deterministic apply order'
+    Assert-EwspKubernetesManifestSet $localRoot $permanentApplyPlan 'ewsp-backend:test-a8b83aa9' 'ewsp-dashboard:test-471172e8' $validationRunner | Out-Null
+    $script:PassCount++
+    Write-Host 'PASS: permanent tunnel rendered manifest set validates'
+    $cloudflaredManifest = Get-Content -Raw (Join-Path $localRoot 'k8s\cloudflared\deployment.yaml')
+    Assert-Contains $cloudflaredManifest 'cloudflare/cloudflared:2026.8.2' 'cloudflared image is version-pinned'
+    Assert-NotContains $cloudflaredManifest ':latest' 'cloudflared manifest never uses latest'
+    Assert-Contains $cloudflaredManifest 'readOnlyRootFilesystem: true' 'cloudflared uses a read-only root filesystem'
+    Assert-Contains $cloudflaredManifest 'runAsNonRoot: true' 'cloudflared runs as non-root'
+    Assert-Contains $cloudflaredManifest 'path: /ready' 'cloudflared readiness uses its local readiness endpoint'
+    Assert-Contains $cloudflaredManifest 'name: TUNNEL_TOKEN' 'cloudflared receives token through an environment Secret reference'
+    Assert-NotContains $cloudflaredManifest 'cert.pem' 'cloudflared runtime does not require an account certificate'
+    Assert-NotContains $cloudflaredManifest 'credentials.json' 'cloudflared runtime does not require credentials JSON'
+    $backendPolicy = Get-Content -Raw (Join-Path $localRoot 'k8s\networkpolicies\backend-ingress.yaml')
+    $dashboardPolicy = Get-Content -Raw (Join-Path $localRoot 'k8s\networkpolicies\dashboard-ingress.yaml')
+    Assert-Contains $backendPolicy 'app.kubernetes.io/name: dashboard' 'backend ingress is allowed only from dashboard identity'
+    Assert-Contains $backendPolicy 'port: 8080' 'backend ingress policy targets TCP 8080'
+    Assert-NotContains $backendPolicy 'ipBlock:' 'backend policy does not use a broad CIDR allowance'
+    Assert-Contains $dashboardPolicy 'app.kubernetes.io/name: cloudflared' 'dashboard ingress is allowed only from cloudflared identity'
+    Assert-Contains $dashboardPolicy 'port: 80' 'dashboard ingress policy targets TCP 80'
+    Assert-NotContains $dashboardPolicy 'app.kubernetes.io/name: backend' 'dashboard policy does not authorize backend as a source'
+
+    $cloudflaredFailureRunner = { param($filePath, $arguments) if ($arguments[0] -eq 'logs') { [PSCustomObject]@{ ExitCode = 0; Output = @('TUNNEL_TOKEN=opaque-cloudflare-token') } } else { [PSCustomObject]@{ ExitCode = 1; Output = @('timed out') } } }
+    Assert-ThrowsContains { Wait-EwspCloudflaredReady @{ CLOUDFLARE_TUNNEL_TOKEN = 'opaque-cloudflare-token' } $cloudflaredFailureRunner | Out-Null } '<redacted>' 'cloudflared readiness failure is classified with token redaction'
 
     $pullPod = [PSCustomObject]@{ status = [PSCustomObject]@{ phase = 'Pending'; containerStatuses = @([PSCustomObject]@{ state = [PSCustomObject]@{ waiting = [PSCustomObject]@{ reason = 'ImagePullBackOff' } }; lastState = [PSCustomObject]@{} }) } }
     Assert-Equal (Get-EwspKubernetesPodReason $pullPod) 'ImagePullBackOff' 'Pod diagnostics recognize image pull failure'
@@ -739,14 +805,14 @@ try {
     Assert-Equal $cloudflaredInfo.Available $true 'Quick Tunnel accepts runnable cloudflared'
     Assert-Contains $cloudflaredInfo.Version '2026.8.0' 'Quick Tunnel reports cloudflared version'
 
-    Assert-Equal (ConvertTo-EwspLiteralIpv4Regex '10.244.0.24') '10\.244\.0\.24' 'dashboard Pod IPv4 is escaped as a literal regex'
-    Assert-Equal (New-EwspQuickTunnelTrustRegex '10.244.0.24') '^(?:10\.244\.0\.24|127\.0\.0\.1)$' 'temporary trust boundary contains only dashboard Pod and loopback'
-    Assert-ThrowsContains { ConvertTo-EwspLiteralIpv4Regex '10.244.0.0/24' | Out-Null } 'DASHBOARD_POD_RESOLUTION_FAILED' 'non-IPv4 dashboard Pod value is rejected'
+    Assert-Equal (ConvertTo-EwspLiteralIpv4Regex '10.77.8.24') '10\.77\.8\.24' 'dashboard Pod IPv4 is escaped as a literal regex'
+    Assert-Equal (New-EwspQuickTunnelTrustRegex '10.77.8.24') '^(?:10\.77\.8\.24|127\.0\.0\.1)$' 'temporary trust boundary contains only dashboard Pod and loopback'
+    Assert-ThrowsContains { ConvertTo-EwspLiteralIpv4Regex '10.77.8.0/24' | Out-Null } 'DASHBOARD_POD_RESOLUTION_FAILED' 'non-IPv4 dashboard Pod value is rejected'
 
     $readyDashboardPod = @{
         metadata = @{ name = 'dashboard-test' }
         status = @{
-            phase = 'Running'; podIP = '10.244.0.77'
+            phase = 'Running'; podIP = '10.77.8.77'
             conditions = @(@{ type = 'Ready'; status = 'True' })
             containerStatuses = @(@{ ready = $true })
         }
@@ -756,7 +822,7 @@ try {
         [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($readyDashboardPod) } | ConvertTo-Json -Depth 8 -Compress)) }
     }.GetNewClosure()
     $resolvedPod = Get-EwspReadyDashboardPod $podRunner
-    Assert-Equal $resolvedPod.Ip '10.244.0.77' 'current Ready dashboard Pod IP is derived by stable labels'
+    Assert-Equal $resolvedPod.Ip '10.77.8.77' 'current Ready dashboard Pod IP is derived by stable labels'
     $twoPodRunner = {
         param($filePath, $arguments)
         [PSCustomObject]@{ ExitCode = 0; Output = @((@{ items = @($readyDashboardPod, $readyDashboardPod) } | ConvertTo-Json -Depth 8 -Compress)) }
@@ -915,6 +981,7 @@ try {
     Assert-NotContains (Protect-EwspDiagnosticText $kubeFailure.Message $testSecretValues) 'test-jwt-private' 'Kubernetes diagnostics redact secret values'
 
     Remove-EwspKubernetesSecretArtifact $localRoot
+    Remove-EwspCloudflareTunnelSecretArtifact $localRoot
 
     $moduleText = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
     foreach ($destructiveGitOperation in @("@('reset'", "@('clean'", "@('stash'", "@('checkout'", "@('rebase'")) {
@@ -945,6 +1012,20 @@ try {
     Assert-Contains $moduleText "'--tail=40'" 'Kubernetes failure diagnostics bound recent logs'
     Assert-Contains $moduleText 'Select-Object -Last 12' 'Kubernetes failure diagnostics bound recent events'
     Assert-Contains $moduleText "@('scale', `$target.Type, `$name" 'k8s-stop uses reversible controller scaling'
+    Assert-Contains $moduleText "Names = @('cloudflared', 'dashboard', 'backend', 'redis')" 'k8s-stop scales cloudflared with application workloads'
+    Assert-Contains $moduleText 'Permanent Cloudflare Tunnel' 'k8s-status reports permanent tunnel state'
+    Assert-Contains $moduleText 'Trusted boundary source: node Pod CIDR' 'k8s-status identifies the node Pod CIDR trust source'
+    Assert-Contains $moduleText "'SERVER_FORWARD_HEADERS_STRATEGY-', 'SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES-'" 'disabled reconciliation removes permanent backend proxy overrides'
+    Assert-Contains (Get-Content -Raw (Join-Path $localRoot '.env.example')) 'CLOUDFLARE_TUNNEL_ENABLED=false' 'environment example keeps permanent tunnel explicitly disabled'
+    $permanentTrackedText = @(
+        Get-Content -Raw (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
+        Get-Content -Raw (Join-Path $localRoot 'k8s\cloudflared\deployment.yaml')
+        Get-Content -Raw (Join-Path $localRoot 'k8s\networkpolicies\backend-ingress.yaml')
+        Get-Content -Raw (Join-Path $localRoot 'k8s\networkpolicies\dashboard-ingress.yaml')
+    ) -join "`n"
+    $observedPodCidrFixture = '10.244.' + '0.0/24'
+    Assert-NotContains $permanentTrackedText $observedPodCidrFixture 'permanent implementation does not hardcode the observed node Pod CIDR'
+    Assert-NotContains $permanentTrackedText 'eyJ' 'permanent implementation contains no token-like runtime credential'
     Assert-Contains (Get-Content -Raw (Join-Path $localRoot 'k8s\postgres\statefulset.yaml')) 'replicas: 1' 'k8s-up source restores PostgreSQL replica count'
     Assert-Contains (Get-Content -Raw (Join-Path $localRoot 'k8s\minio\statefulset.yaml')) 'replicas: 1' 'k8s-up source restores MinIO replica count'
 

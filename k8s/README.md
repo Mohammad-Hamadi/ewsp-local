@@ -21,6 +21,80 @@ and default `standard` local-path StorageClass. It does not switch context or
 reset the cluster. Resources are reconciled in dependency order and readiness is
 observed rather than delayed with fixed sleeps.
 
+## Current $0 public demo path
+
+The current public demo/testing mechanism is `./ewsp.ps1 tunnel-quick`. It uses
+a random `*.trycloudflare.com` hostname, requires no domain, and costs nothing.
+The hostname changes between runs, so it is intentionally temporary rather than
+a stable deployment. See the repository README for `tunnel-status` and
+`tunnel-stop` behavior.
+
+## Optional future permanent Cloudflare Tunnel
+
+The permanent public path is an explicitly enabled, remotely managed named
+Cloudflare Tunnel running as one `cloudflared` Pod:
+
+```text
+Cloudflare HTTPS/WSS -> cloudflared -> dashboard.ewsp.svc.cluster.local:80
+                                      -> /api and /ws -> backend:8080
+```
+
+This future path requires a domain and hostname controlled through Cloudflare.
+No permanent tunnel, token, or hostname is configured for the current project.
+The default remains disabled, and ordinary `k8s-up` cannot expose EWSP publicly
+when the explicit requirements below are absent.
+
+Set all three values in the ignored `.env` file (never in a tracked manifest):
+
+```dotenv
+CLOUDFLARE_TUNNEL_ENABLED=true
+CLOUDFLARE_TUNNEL_TOKEN=<named-tunnel connector token>
+CLOUDFLARE_PUBLIC_HOSTNAME=ewsp.example.com
+```
+
+The enable flag is deliberately required. A token by itself does not deploy or
+start the connector. When enabled, `k8s-up` derives the single schedulable
+node's assigned Pod CIDR from `.spec.podCIDRs`/`.spec.podCIDR`, rejects missing,
+multiple, non-IPv4, non-canonical, or host-bit-bearing values, and converts the
+CIDR to a fully anchored Tomcat regex. It reconciles the backend to
+`SERVER_FORWARD_HEADERS_STRATEGY=NATIVE` with that runtime-only regex. No Pod
+IP, Service CIDR, node IP, loopback address, cluster-wide kindnet subnet, or
+RFC1918 fallback is trusted. With the feature disabled, the ordinary source
+manifest restores the backend's default `NONE` behavior, any existing connector
+is scaled to zero, and the permanent policies are removed.
+
+`k8s-up` creates/updates `cloudflared-tunnel-token` from `.env`, applies it from
+an ACL-restricted ignored temporary artifact, and removes that artifact. The
+token is never printed. The Deployment uses the pinned
+`cloudflare/cloudflared:2026.8.2` image, a non-root user, a read-only root
+filesystem, no service-account token, and no Linux capabilities. Kubernetes
+checks cloudflared's private port 2000 `/ready` endpoint; there is no Service for
+that endpoint.
+
+Before enabling it, create a remotely managed tunnel in Cloudflare:
+
+1. In Cloudflare, open **Networking > Tunnels**, create a Cloudflared tunnel,
+   and copy the connector token from **Add a replica**.
+2. Add a public hostname for the intended DNS name. Set its service/origin URL
+   exactly to `http://dashboard.ewsp.svc.cluster.local:80`.
+3. Put the token and hostname only in ignored `.env`, set the explicit enable
+   flag, and run `./ewsp.ps1 k8s-up`.
+
+The token-only remotely managed model does not use `cert.pem`, an account API
+key/token, or a tunnel credentials JSON file at runtime. The Cloudflare-side
+public-hostname rule supplies the origin route. `k8s-stop` scales cloudflared
+with the other workloads but preserves its Kubernetes Secret and never deletes
+the remote tunnel or DNS route. `k8s-status` reports desired/ready replicas,
+Pod status/restarts/image, backend proxy mode, node-Pod-CIDR boundary source,
+policy-object presence, and the safe configured hostname; it never reads or
+prints the Secret value.
+
+Two ingress NetworkPolicies enforce the application path: only dashboard Pods
+may reach backend TCP 8080, and only cloudflared Pods may reach dashboard TCP
+80. Kubernetes node-origin probe and port-forward behavior must be confirmed
+empirically on the installed CNI after policy changes; policy-object presence
+alone is not reported as proof of enforcement.
+
 Backend and dashboard image tags use the existing source-aware EWSP image
 identity. An exact clean image already in Docker Desktop is reused; a missing
 image is built from the application repository's own Dockerfile; dirty source

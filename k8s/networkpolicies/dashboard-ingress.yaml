@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dashboard-ingress-from-cloudflared
+  namespace: ewsp
+  labels:
+    app.kubernetes.io/part-of: ewsp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dashboard
+      app.kubernetes.io/part-of: ewsp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ewsp
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudflared
+              app.kubernetes.io/part-of: ewsp
+      ports:
+        - protocol: TCP
+          port: 80
