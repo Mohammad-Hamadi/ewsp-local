@@ -1,0 +1,73 @@
+name: Runner access proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove-runner-access:
+    name: Prove EWSP-PC Kubernetes access
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out ewsp-local without persisted credentials
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify runner identity and checkout
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          Write-Host "Windows identity: $identity"
+          Write-Host "Runner: $env:RUNNER_NAME ($env:RUNNER_OS/$env:RUNNER_ARCH)"
+
+          if ($identity -ne 'MHMD\moham') {
+              throw "Unexpected runner identity '$identity'; expected 'MHMD\moham'."
+          }
+          if ($env:RUNNER_NAME -ne 'EWSP-PC') {
+              throw "Unexpected runner '$env:RUNNER_NAME'; expected 'EWSP-PC'."
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'ewsp.ps1') -PathType Leaf)) {
+              throw 'ewsp-local checkout is unavailable in GITHUB_WORKSPACE.'
+          }
+          Write-Host 'Checkout: available'
+
+      - name: Verify Docker Desktop Kubernetes access
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kubectl = Get-Command kubectl -CommandType Application -ErrorAction Stop
+          Write-Host "kubectl: $($kubectl.Source)"
+
+          $context = (& kubectl config current-context).Trim()
+          if ($LASTEXITCODE -ne 0) {
+              throw 'kubectl could not read its current context.'
+          }
+          Write-Host "Kubernetes context: $context"
+          if ($context -ne 'docker-desktop') {
+              throw "Unexpected Kubernetes context '$context'; expected 'docker-desktop'."
+          }
+
+          & kubectl version -o json | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              throw 'The Docker Desktop Kubernetes API is unavailable.'
+          }
+          Write-Host 'Kubernetes API: reachable'
+
+          $namespace = (& kubectl get namespace ewsp -o name).Trim()
+          if ($LASTEXITCODE -ne 0 -or $namespace -ne 'namespace/ewsp') {
+              throw "Namespace proof failed; received '$namespace'."
+          }
+          Write-Host "Namespace: $namespace"
+
+          Write-Host 'Current EWSP controllers:'
+          & kubectl get deployments,statefulsets -n ewsp `
+              -o 'custom-columns=KIND:.kind,NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,AVAILABLE:.status.availableReplicas'
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to query current EWSP workload status.'
+          }
