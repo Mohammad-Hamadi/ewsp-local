@@ -56,6 +56,20 @@ Commit the declarative metadata change normally. The image-only `deploy` and
 startup reconciliation workflows remain unchanged; they do not build images
 or independently apply runtime ConfigMap revisions.
 
+## SMTP OTP delivery
+
+The backend's SMTP settings come from Secret key references in
+`ewsp-infrastructure-secrets`. Real values live only in the ACL-protected
+`%USERPROFILE%\.ewsp\deployment.env`; `k8s-up` validates that mail, SMTP
+authentication, and STARTTLS are enabled before generating and applying its
+ignored temporary Secret artifact. The tracked example contains placeholders
+only, and the SMTP password is never placed in `backend-config`.
+
+The rendered Pod template carries a SHA-256 fingerprint of the protected mail
+configuration. Changing any SMTP setting and rerunning `k8s-up` therefore
+replaces only the backend Pod so Spring receives the new process environment;
+PostgreSQL, Redis, MinIO, dashboard, PVs, and PVCs remain unchanged.
+
 ## Health and shutdown
 
 All probes use `/api/health`. Per the backend audit contract, this endpoint is a

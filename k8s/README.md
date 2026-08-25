@@ -128,11 +128,18 @@ Kubernetes clean command.
 contains placeholders only and is safe to validate, but must not be used as the
 real Secret.
 
-`k8s-up` reads the required values through ewsp-local's safe `.env` parser,
-creates a restrictive ignored temporary Secret artifact, applies
-`ewsp-infrastructure-secrets`, and removes the temporary secret material after
-application. Values are not printed. The required keys are `POSTGRES_USER`,
-`POSTGRES_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, and `JWT_SECRET`.
+`k8s-up` reads infrastructure values through ewsp-local's safe `.env` parser
+and SMTP delivery values through the ACL-protected
+`%USERPROFILE%\.ewsp\deployment.env`, creates a restrictive ignored temporary
+Secret artifact, applies `ewsp-infrastructure-secrets`, and removes the
+temporary secret material after application. Values are not printed. Alongside
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`,
+`MINIO_ROOT_PASSWORD`, and `JWT_SECRET`, deployed email delivery requires
+`EWSP_MAIL_ENABLED`, `EWSP_MAIL_HOST`, `EWSP_MAIL_PORT`,
+`EWSP_MAIL_USERNAME`, `EWSP_MAIL_PASSWORD`, `EWSP_MAIL_FROM`,
+`EWSP_MAIL_SMTP_AUTH`, and `EWSP_MAIL_STARTTLS_ENABLE`. Enabled deployment mail
+must use authentication and STARTTLS. The backend Pod references these keys
+individually; no SMTP credential is stored in a ConfigMap.
 
 Private application pulls use `GHCR_USERNAME` plus a local `GHCR_TOKEN` with
 package-read permission only. `k8s-up` generates a separate ACL-restricted,

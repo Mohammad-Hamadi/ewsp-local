@@ -628,17 +628,25 @@ try {
         POSTGRES_USER = 'test-db-user'; POSTGRES_PASSWORD = 'test-db-password-private'
         MINIO_ROOT_USER = 'test-minio-user'; MINIO_ROOT_PASSWORD = 'test-minio-password-private'
         JWT_SECRET = 'test-jwt-private'
+        EWSP_MAIL_ENABLED = 'true'; EWSP_MAIL_HOST = 'smtp.example.com'; EWSP_MAIL_PORT = '587'
+        EWSP_MAIL_USERNAME = 'mailer@example.com'; EWSP_MAIL_PASSWORD = 'test-smtp-password-private'
+        EWSP_MAIL_FROM = 'mailer@example.com'; EWSP_MAIL_SMTP_AUTH = 'true'; EWSP_MAIL_STARTTLS_ENABLE = 'true'
     }
     $secretOutput = @(& { New-EwspKubernetesSecretArtifact $localRoot $testSecretValues -SkipAcl } *>&1)
     $secretPath = [string]$secretOutput[-1]
     $secretText = Get-Content -Raw -LiteralPath $secretPath
     Assert-NotContains $secretText 'test-db-password-private' 'temporary Kubernetes Secret stores no plaintext password'
+    Assert-NotContains $secretText 'test-smtp-password-private' 'temporary Kubernetes Secret stores no plaintext SMTP password'
     Assert-NotContains ($secretOutput -join ' ') 'test-jwt-private' 'Kubernetes Secret preparation does not log secret values'
+    Assert-NotContains ($secretOutput -join ' ') 'test-smtp-password-private' 'Kubernetes Secret preparation does not log SMTP credentials'
     $secretObject = $secretText | ConvertFrom-Json
-    Assert-Equal (@($secretObject.data.PSObject.Properties.Name | Sort-Object) -join ',') 'JWT_SECRET,MINIO_ROOT_PASSWORD,MINIO_ROOT_USER,POSTGRES_PASSWORD,POSTGRES_USER' 'temporary Kubernetes Secret has exactly required keys'
+    Assert-Equal (@($secretObject.data.PSObject.Properties.Name | Sort-Object) -join ',') 'EWSP_MAIL_ENABLED,EWSP_MAIL_FROM,EWSP_MAIL_HOST,EWSP_MAIL_PASSWORD,EWSP_MAIL_PORT,EWSP_MAIL_SMTP_AUTH,EWSP_MAIL_STARTTLS_ENABLE,EWSP_MAIL_USERNAME,JWT_SECRET,MINIO_ROOT_PASSWORD,MINIO_ROOT_USER,POSTGRES_PASSWORD,POSTGRES_USER' 'temporary Kubernetes Secret has exactly required keys'
     $incompleteSecretValues = $testSecretValues.Clone()
     $incompleteSecretValues.Remove('JWT_SECRET')
     Assert-ThrowsContains { New-EwspKubernetesSecretArtifact $localRoot $incompleteSecretValues -SkipAcl | Out-Null } 'JWT_SECRET' 'missing Kubernetes Secret setting is rejected by name'
+    $missingMailPassword = $testSecretValues.Clone()
+    $missingMailPassword.Remove('EWSP_MAIL_PASSWORD')
+    Assert-ThrowsContains { New-EwspKubernetesSecretArtifact $localRoot $missingMailPassword -SkipAcl | Out-Null } 'EWSP_MAIL_PASSWORD' 'missing SMTP Secret setting is rejected by name'
 
     $tunnelDisabled = Get-EwspPermanentTunnelConfiguration @{}
     Assert-Equal $tunnelDisabled.Enabled $false 'permanent tunnel defaults to disabled when configuration is absent'
@@ -716,6 +724,9 @@ try {
     Assert-Contains $backendConfigText "EWSP_MOBILE_UPDATE_URL: $exactMobileUrl" 'backend ConfigMap contains exact mobile update URL'
     Assert-Equal ([Uri]$exactMobileUrl).Scheme 'https' 'mobile update URL uses HTTPS'
     Assert-Contains $backendDeploymentText 'name: backend-config' 'backend Pod consumes non-secret mobile metadata through the existing ConfigMap envFrom'
+    Assert-Contains $backendDeploymentText 'key: EWSP_MAIL_PASSWORD' 'backend Pod sources the SMTP password from a Kubernetes Secret key'
+    Assert-NotContains $backendConfigText 'EWSP_MAIL_PASSWORD' 'backend ConfigMap contains no SMTP password'
+    Assert-Contains $composeConfiguration 'EWSP_MAIL_PASSWORD: ${EWSP_MAIL_PASSWORD:-}' 'Compose forwards SMTP credentials without hardcoding them'
     Assert-NotContains $secretText 'EWSP_MOBILE_' 'mobile release metadata is absent from the Kubernetes Secret artifact'
     Assert-Equal ([regex]::Matches(($backendConfigText + $backendDeploymentText + $composeConfiguration), '(?i)minimum[_A-Z]*supported|force[_A-Z]*update|optional[_A-Z]*update').Count) 0 'mobile runtime configuration has no minimum, force, or optional update flag'
     $envExampleText = Get-Content -Raw (Join-Path $localRoot '.env.example')
@@ -723,6 +734,9 @@ try {
     Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION_CODE=1' 'local environment example documents mobile version code 1'
     Assert-Contains $envExampleText "EWSP_MOBILE_UPDATE_URL=$exactMobileUrl" 'local environment example documents the exact mobile update URL'
     Assert-NotContains (Get-Content -Raw (Join-Path $localRoot 'config\deployment.env.example')) 'EWSP_MOBILE_' 'public mobile metadata is not placed in protected deployment credentials'
+    $deploymentExampleText = Get-Content -Raw (Join-Path $localRoot 'config\deployment.env.example')
+    Assert-Contains $deploymentExampleText 'EWSP_MAIL_PASSWORD=' 'protected deployment configuration documents the SMTP password key without a value'
+    Assert-NotContains $deploymentExampleText 'test-smtp-password-private' 'tracked deployment example contains no SMTP credential'
 
     $fingerprintFixture = Join-Path $testRoot 'backend-config-fingerprint.yaml'
     Set-Content -LiteralPath $fingerprintFixture -Value $backendConfigText -NoNewline
@@ -742,16 +756,24 @@ try {
         $renderedText = (Get-Content -Raw -LiteralPath $source) -replace 'ewsp-(backend|dashboard):replace-with-ewsp-local-tag', $image
         New-FakeNativeResult 0 @($renderedText -split "`r?`n")
     }
-    $rendered = New-EwspKubernetesRenderedManifests $localRoot $backendGhcrImage $dashboardGhcrImage $renderRunner
+    $mailFingerprintV1 = Get-EwspMailConfigurationFingerprint $testSecretValues
+    $mailFingerprintValuesV2 = $testSecretValues.Clone(); $mailFingerprintValuesV2.EWSP_MAIL_PASSWORD = 'rotated-test-smtp-password-private'
+    $mailFingerprintV2 = Get-EwspMailConfigurationFingerprint $mailFingerprintValuesV2
+    Assert-Equal ($mailFingerprintV1 -ne $mailFingerprintV2) $true 'SMTP credential rotation changes the backend mail configuration fingerprint'
+    Assert-Equal $mailFingerprintV1.Length 64 'backend mail configuration fingerprint is a SHA-256 value'
+    $rendered = New-EwspKubernetesRenderedManifests $localRoot $backendGhcrImage $dashboardGhcrImage $testSecretValues $renderRunner
     Assert-Contains (Get-Content -Raw $rendered.Backend) $backendGhcrImage 'backend placeholder renders to exact image'
     Assert-Contains (Get-Content -Raw $rendered.Dashboard) $dashboardGhcrImage 'dashboard placeholder renders to exact image'
     Assert-Contains (Get-Content -Raw $rendered.Backend) "ewsp.local/backend-config-sha256: $fingerprintV1" 'rendered backend Pod template contains the current ConfigMap fingerprint'
     Assert-NotContains (Get-Content -Raw $rendered.Backend) 'replace-with-backend-config-sha256' 'rendered backend Pod template resolves the ConfigMap fingerprint placeholder'
+    Assert-Contains (Get-Content -Raw $rendered.Backend) "ewsp.local/backend-mail-config-sha256: $mailFingerprintV1" 'rendered backend Pod template contains the protected SMTP configuration fingerprint'
+    Assert-NotContains (Get-Content -Raw $rendered.Backend) 'replace-with-backend-mail-config-sha256' 'rendered backend Pod template resolves the SMTP fingerprint placeholder'
+    Assert-NotContains (Get-Content -Raw $rendered.Dashboard) 'backend-mail-config-sha256' 'SMTP credential changes do not roll out the dashboard'
     Assert-NotContains (Get-Content -Raw $rendered.Dashboard) 'backend-config-sha256' 'backend ConfigMap changes do not roll out the dashboard'
     Assert-Contains $backendDeploymentText 'type: Recreate' 'mobile ConfigMap changes use the existing short Recreate backend rollout'
     Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash $backendSourceHash 'backend source manifest remains unchanged after rendering'
     Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash $dashboardSourceHash 'dashboard source manifest remains unchanged after rendering'
-    Assert-ThrowsCategory { New-EwspKubernetesRenderedManifests $localRoot 'ghcr.io/mohammad-hamadi/ewsp-backend:latest' $dashboardGhcrImage $renderRunner | Out-Null } 'GHCR_IMAGE_INVALID' 'latest Kubernetes application image is rejected during rendering'
+    Assert-ThrowsCategory { New-EwspKubernetesRenderedManifests $localRoot 'ghcr.io/mohammad-hamadi/ewsp-backend:latest' $dashboardGhcrImage $testSecretValues $renderRunner | Out-Null } 'GHCR_IMAGE_INVALID' 'latest Kubernetes application image is rejected during rendering'
 
     $applyPlan = @(Get-EwspKubernetesApplyPlan $localRoot $rendered $secretPath $ghcrSecretPath)
     Assert-Equal (@($applyPlan.Stage) -join ',') 'NAMESPACE,GHCR_SECRET,CONFIGMAPS,SECRET,POSTGRES,REDIS,MINIO,BACKEND,DASHBOARD' 'Kubernetes resources have deterministic apply order'
@@ -1284,14 +1306,21 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-Equal $machinePaths.Lock (Join-Path $machineProfile '.ewsp\deployment.lock') 'GitHub and startup reconciliation share one machine lock path'
     Assert-ThrowsCategory { Get-EwspDeploymentConfiguration -UserProfile $machineProfile -SkipAcl | Out-Null } 'DEPLOYMENT_CONFIG_MISSING' 'missing machine deployment config fails by setting name'
     New-Item -ItemType Directory -Path $machinePaths.Root -Force | Out-Null
-    @('EWSP_GITHUB_READ_TOKEN=read-token-test','GHCR_USERNAME=test-user','GHCR_TOKEN=ghcr-token-test','EWSP_ADMIN_PASSWORD=admin-password-test') | Set-Content -LiteralPath $machinePaths.Configuration
-    $machineConfiguration = Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireGhcr -RequireAdminLogin -SkipAcl
+    @('EWSP_GITHUB_READ_TOKEN=read-token-test','GHCR_USERNAME=test-user','GHCR_TOKEN=ghcr-token-test','EWSP_ADMIN_PASSWORD=admin-password-test','EWSP_MAIL_ENABLED=true','EWSP_MAIL_HOST=smtp.example.com','EWSP_MAIL_PORT=587','EWSP_MAIL_USERNAME=mailer@example.com','EWSP_MAIL_PASSWORD=smtp-password-test','EWSP_MAIL_FROM=mailer@example.com','EWSP_MAIL_SMTP_AUTH=true','EWSP_MAIL_STARTTLS_ENABLE=true') | Set-Content -LiteralPath $machinePaths.Configuration
+    $machineConfiguration = Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireGhcr -RequireAdminLogin -RequireMail -SkipAcl
     Assert-Equal $machineConfiguration.AdminEmail 'admin@ewsp.local' 'CD login uses the fixed verified local admin identity by default'
     Assert-Equal $machineConfiguration.DashboardPort 3000 'CD dashboard smoke checks use the safe default port'
-    $configOutput = (& { Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireGhcr -RequireAdminLogin -SkipAcl | Out-Null } 6>&1 | Out-String)
+    Assert-Equal $machineConfiguration.MailValues.EWSP_MAIL_HOST 'smtp.example.com' 'protected SMTP host is available to Secret reconciliation'
+    Assert-Equal $machineConfiguration.MailValues.EWSP_MAIL_PORT '587' 'protected SMTP port is available to Secret reconciliation'
+    $configOutput = (& { Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireGhcr -RequireAdminLogin -RequireMail -SkipAcl | Out-Null } 6>&1 | Out-String)
     Assert-NotContains $configOutput 'read-token-test' 'machine config validation never prints GitHub read token'
     Assert-NotContains $configOutput 'ghcr-token-test' 'machine config validation never prints GHCR token'
     Assert-NotContains $configOutput 'admin-password-test' 'machine config validation never prints admin password'
+    Assert-NotContains $configOutput 'smtp-password-test' 'machine config validation never prints SMTP password'
+    $invalidMailConfiguration = Get-Content -LiteralPath $machinePaths.Configuration | Where-Object { $_ -notmatch '^EWSP_MAIL_STARTTLS_ENABLE=' }
+    $invalidMailConfiguration += 'EWSP_MAIL_STARTTLS_ENABLE=false'
+    $invalidMailConfiguration | Set-Content -LiteralPath $machinePaths.Configuration
+    Assert-ThrowsCategory { Get-EwspDeploymentConfiguration -UserProfile $machineProfile -RequireMail -SkipAcl | Out-Null } 'DEPLOYMENT_CONFIG_INVALID' 'deployed SMTP configuration refuses disabled STARTTLS'
 
     $backendApprovedSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     $dashboardApprovedSha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'

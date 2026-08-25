@@ -6,6 +6,10 @@ $script:EwspKubernetesNamespace = 'ewsp'
 $script:EwspMobileBootstrapRelativePath = 'public/mobile-bootstrap.json'
 $script:EwspMobileBootstrapRawUrl = 'https://raw.githubusercontent.com/Mohammad-Hamadi/ewsp-local/main/public/mobile-bootstrap.json'
 $script:EwspLocalRepositoryUrl = 'https://github.com/Mohammad-Hamadi/ewsp-local.git'
+$script:EwspMailSettingNames = @(
+    'EWSP_MAIL_ENABLED', 'EWSP_MAIL_HOST', 'EWSP_MAIL_PORT', 'EWSP_MAIL_USERNAME',
+    'EWSP_MAIL_PASSWORD', 'EWSP_MAIL_FROM', 'EWSP_MAIL_SMTP_AUTH', 'EWSP_MAIL_STARTTLS_ENABLE'
+)
 
 function Invoke-EwspNative {
     [CmdletBinding()]
@@ -2944,7 +2948,7 @@ function New-EwspKubernetesSecretArtifact {
         [Parameter(Mandatory = $true)][hashtable]$EnvironmentValues,
         [switch]$SkipAcl
     )
-    $required = @('POSTGRES_USER', 'POSTGRES_PASSWORD', 'MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD', 'JWT_SECRET')
+    $required = @('POSTGRES_USER', 'POSTGRES_PASSWORD', 'MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD', 'JWT_SECRET') + $script:EwspMailSettingNames
     $missing = @($required | Where-Object {
         -not $EnvironmentValues.ContainsKey($_) -or [string]::IsNullOrWhiteSpace([string]$EnvironmentValues[$_])
     })
@@ -3088,6 +3092,7 @@ function New-EwspKubernetesRenderedManifests {
         [Parameter(Mandatory = $true)][string]$LocalRoot,
         [Parameter(Mandatory = $true)][string]$BackendImage,
         [Parameter(Mandatory = $true)][string]$DashboardImage,
+        [Parameter(Mandatory = $true)][hashtable]$MailValues,
         [scriptblock]$CommandRunner
     )
     if ($BackendImage -notmatch '^ghcr\.io/mohammad-hamadi/ewsp-backend:[0-9a-fA-F]{40}$' -or
@@ -3096,6 +3101,7 @@ function New-EwspKubernetesRenderedManifests {
     }
     $paths = Clear-EwspKubernetesRenderedArtifacts $LocalRoot
     $backendConfigFingerprint = Get-EwspBackendConfigFingerprint (Join-Path $paths.SourceRoot 'backend\configmap.yaml')
+    $backendMailConfigFingerprint = Get-EwspMailConfigurationFingerprint $MailValues
     $sources = @(
         @{ Name = 'backend'; Source = Join-Path $paths.SourceRoot 'backend\deployment.yaml'; Destination = $paths.BackendRendered; Image = $BackendImage },
         @{ Name = 'dashboard'; Source = Join-Path $paths.SourceRoot 'dashboard\deployment.yaml'; Destination = $paths.DashboardRendered; Image = $DashboardImage }
@@ -3110,8 +3116,9 @@ function New-EwspKubernetesRenderedManifests {
         $content = ($result.Output -join [Environment]::NewLine).TrimEnd() + [Environment]::NewLine
         if ($item.Name -eq 'backend') {
             $content = $content.Replace('replace-with-backend-config-sha256', $backendConfigFingerprint)
+            $content = $content.Replace('replace-with-backend-mail-config-sha256', $backendMailConfigFingerprint)
         }
-        if ($content -match 'replace-with-ewsp-local-tag' -or -not $content.Contains($item.Image)) {
+        if ($content -match 'replace-with-ewsp-local-tag|replace-with-backend-mail-config-sha256' -or -not $content.Contains($item.Image)) {
             throw (New-EwspKubernetesException "Rendered $($item.Name) Deployment did not contain the exact resolved image." 'KUBERNETES_MANIFEST_INVALID' $item.Name 'kubectl set image --local')
         }
         [IO.File]::WriteAllText($item.Destination, $content, [Text.UTF8Encoding]::new($false))
@@ -3119,6 +3126,18 @@ function New-EwspKubernetesRenderedManifests {
         if ($before -ne $after) { throw "Source manifest changed while rendering: $($item.Source)" }
     }
     [PSCustomObject]@{ Backend = $paths.BackendRendered; Dashboard = $paths.DashboardRendered; Root = $paths.RenderedRoot }
+}
+
+function Get-EwspMailConfigurationFingerprint {
+    param([Parameter(Mandatory = $true)][hashtable]$MailValues)
+    $missing = @($script:EwspMailSettingNames | Where-Object {
+        -not $MailValues.ContainsKey($_) -or [string]::IsNullOrWhiteSpace([string]$MailValues[$_])
+    })
+    if ($missing.Count) {
+        throw (New-EwspKubernetesException "Required SMTP settings are missing or empty: $($missing -join ', '). Values were not printed." 'DEPLOYMENT_CONFIG_MISSING' 'SMTP configuration' 'Validate protected deployment.env')
+    }
+    $canonical = @($script:EwspMailSettingNames | Sort-Object | ForEach-Object { "$_=$([string]$MailValues[$_])" }) -join "`n"
+    Get-EwspTextSha256 $canonical
 }
 
 function Get-EwspBackendConfigFingerprint {
@@ -3196,7 +3215,7 @@ function Assert-EwspKubernetesManifestSet {
         }
     }
     $combined = ($files | ForEach-Object { [IO.File]::ReadAllText($_) }) -join "`n"
-    if ($combined -match 'replace-with-ewsp-local-tag|replace-with-backend-config-sha256' -or -not $combined.Contains($BackendImage) -or -not $combined.Contains($DashboardImage)) {
+    if ($combined -match 'replace-with-ewsp-local-tag|replace-with-backend-config-sha256|replace-with-backend-mail-config-sha256' -or -not $combined.Contains($BackendImage) -or -not $combined.Contains($DashboardImage)) {
         throw (New-EwspKubernetesException 'Rendered manifest set contains an unresolved image/configuration placeholder or lacks an exact resolved image.' 'KUBERNETES_MANIFEST_INVALID' 'Application manifests' 'Validate rendered images and backend configuration fingerprint')
     }
     foreach ($requiredText in @(
@@ -4528,7 +4547,7 @@ function Invoke-EwspKubernetesUp {
     $completed = New-Object System.Collections.Generic.List[string]
     $context = @{
         Environment = $null; Configuration = $null; EnvironmentValues = $null; ImageConfiguration = $null; Ports = $null
-        Ghcr = $null; ImagePlan = $null; SecretPath = $null; GhcrSecretPath = $null; CloudflareSecretPath = $null; Rendered = $null
+        Ghcr = $null; ImagePlan = $null; SecretPath = $null; GhcrSecretPath = $null; CloudflareSecretPath = $null; Rendered = $null; MailConfiguration = $null
         ApplyPlan = $null; States = $null; PortForward = $null; DashboardPort = $null
         OldBackendImage = $null; OldDashboardImage = $null; PermanentTunnel = $null; PodCidrBoundary = $null
     }
@@ -4547,10 +4566,14 @@ function Invoke-EwspKubernetesUp {
         }
         $context.ImageConfiguration = Resolve-EwspKubernetesImageConfiguration $LocalRoot
         $context.EnvironmentValues = $context.ImageConfiguration.EnvironmentValues
+        $context.MailConfiguration = Get-EwspDeploymentConfiguration -RequireMail
+        foreach ($name in $script:EwspMailSettingNames) {
+            $context.EnvironmentValues[$name] = [string]$context.MailConfiguration.MailValues[$name]
+        }
         $context.PermanentTunnel = Get-EwspPermanentTunnelConfiguration $context.EnvironmentValues
         $context.Ports = @(Assert-EwspEnvironmentConfiguration $context.EnvironmentValues)
         $context.Ghcr = Get-EwspGhcrConfiguration $context.EnvironmentValues -RequireCredentials
-        Write-Host "      immutable GHCR image refs sourced from $($context.ImageConfiguration.ImageSource); local pull credential setting names validated; credential values hidden"
+        Write-Host "      immutable GHCR image refs sourced from $($context.ImageConfiguration.ImageSource); protected SMTP and local pull credential setting names validated; credential values hidden"
     } $completed $phaseNames[2..($total - 1)] $context.Environment 'Validate .env, immutable GHCR refs, and credential setting names' 'GHCR deployment configuration' -WorkflowName 'k8s-up' | Out-Null
 
     Invoke-EwspUpPhase 3 $total $phaseNames[2] 'Resolving immutable application images' {
@@ -4582,7 +4605,7 @@ function Invoke-EwspKubernetesUp {
         Invoke-EwspUpPhase 6 $total $phaseNames[5] 'Rendering and validating manifests' {
             $backendDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'backend')[0]
             $dashboardDescriptor = @($context.ImagePlan.Descriptors | Where-Object Service -eq 'dashboard')[0]
-            $context.Rendered = New-EwspKubernetesRenderedManifests $LocalRoot $backendDescriptor.Tag $dashboardDescriptor.Tag
+            $context.Rendered = New-EwspKubernetesRenderedManifests $LocalRoot $backendDescriptor.Tag $dashboardDescriptor.Tag $context.MailConfiguration.MailValues
             $context.ApplyPlan = @(Get-EwspKubernetesApplyPlan $LocalRoot $context.Rendered $context.SecretPath $context.GhcrSecretPath $context.PermanentTunnel $context.CloudflareSecretPath)
             Assert-EwspKubernetesManifestSet $LocalRoot $context.ApplyPlan $backendDescriptor.Tag $dashboardDescriptor.Tag | Out-Null
             $dashboardPort = @($context.Ports | Where-Object Service -eq 'dashboard')[0].Port
@@ -4727,6 +4750,7 @@ function Get-EwspDeploymentConfiguration {
         [string]$UserProfile = $env:USERPROFILE,
         [switch]$RequireGhcr,
         [switch]$RequireAdminLogin,
+        [switch]$RequireMail,
         [switch]$SkipAcl
     )
     $paths = Get-EwspDeploymentMachinePaths $UserProfile
@@ -4738,9 +4762,24 @@ function Get-EwspDeploymentConfiguration {
     $required = @('EWSP_GITHUB_READ_TOKEN')
     if ($RequireGhcr) { $required += @('GHCR_USERNAME', 'GHCR_TOKEN') }
     if ($RequireAdminLogin) { $required += @('EWSP_ADMIN_PASSWORD') }
+    if ($RequireMail) { $required += $script:EwspMailSettingNames }
     $missing = @($required | Where-Object { -not $values.ContainsKey($_) -or [string]::IsNullOrWhiteSpace([string]$values[$_]) })
     if ($missing.Count) {
         throw (New-EwspKubernetesException "Machine-local deployment configuration is missing required setting names: $($missing -join ', '). Values were not printed." 'DEPLOYMENT_CONFIG_MISSING' 'Deployment host configuration' 'Validate deployment.env')
+    }
+    if ($RequireMail) {
+        foreach ($booleanName in @('EWSP_MAIL_ENABLED', 'EWSP_MAIL_SMTP_AUTH', 'EWSP_MAIL_STARTTLS_ENABLE')) {
+            if (([string]$values[$booleanName]).Trim().ToLowerInvariant() -ne 'true') {
+                throw (New-EwspKubernetesException "$booleanName must be true for deployed SMTP delivery. Values were not printed." 'DEPLOYMENT_CONFIG_INVALID' 'SMTP configuration' 'Validate protected deployment.env')
+            }
+        }
+        if (([string]$values.EWSP_MAIL_PORT) -notmatch '^\d+$' -or [int]$values.EWSP_MAIL_PORT -lt 1 -or [int]$values.EWSP_MAIL_PORT -gt 65535) {
+            throw (New-EwspKubernetesException 'EWSP_MAIL_PORT must be an integer from 1 through 65535. Values were not printed.' 'DEPLOYMENT_CONFIG_INVALID' 'SMTP configuration' 'Validate protected deployment.env')
+        }
+    }
+    $mailValues = @{}
+    foreach ($name in $script:EwspMailSettingNames) {
+        if ($values.ContainsKey($name)) { $mailValues[$name] = [string]$values[$name] }
     }
     [PSCustomObject]@{
         Path = $paths.Configuration
@@ -4751,6 +4790,7 @@ function Get-EwspDeploymentConfiguration {
         AdminEmail = if ($values.ContainsKey('EWSP_ADMIN_EMAIL') -and $values.EWSP_ADMIN_EMAIL) { ([string]$values.EWSP_ADMIN_EMAIL).Trim().ToLowerInvariant() } else { 'admin@ewsp.local' }
         AdminPassword = if ($values.ContainsKey('EWSP_ADMIN_PASSWORD')) { [string]$values.EWSP_ADMIN_PASSWORD } else { '' }
         DashboardPort = if ($values.ContainsKey('DASHBOARD_HOST_PORT') -and [string]$values.DASHBOARD_HOST_PORT -match '^\d+$') { [int]$values.DASHBOARD_HOST_PORT } else { 3000 }
+        MailValues = $mailValues
     }
 }
 
@@ -4784,13 +4824,21 @@ function Invoke-EwspDeployConfigure {
     }
     $source = Read-EwspKeyValueFile $sourcePath
     $copied = @()
-    foreach ($name in @('GHCR_USERNAME','GHCR_TOKEN','CLOUDFLARE_TUNNEL_ENABLED','CLOUDFLARE_TUNNEL_TOKEN','CLOUDFLARE_PUBLIC_HOSTNAME','DASHBOARD_HOST_PORT')) {
-        if ($source.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$source[$name])) {
-            $target[$name] = [string]$source[$name]
+    $copyNames = @('GHCR_USERNAME','GHCR_TOKEN','CLOUDFLARE_TUNNEL_ENABLED','CLOUDFLARE_TUNNEL_TOKEN','CLOUDFLARE_PUBLIC_HOSTNAME','DASHBOARD_HOST_PORT') + $script:EwspMailSettingNames
+    foreach ($name in $copyNames) {
+        $candidate = if ($source.ContainsKey($name)) {
+            [string]$source[$name]
+        } elseif ($target.ContainsKey($name)) {
+            [string]$target[$name]
+        } elseif ($script:EwspMailSettingNames -contains $name) {
+            [Environment]::GetEnvironmentVariable($name, 'User')
+        } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            $target[$name] = $candidate
             $copied += $name
         }
     }
-    $order = @('EWSP_GITHUB_READ_TOKEN','GHCR_USERNAME','GHCR_TOKEN','EWSP_ADMIN_EMAIL','EWSP_ADMIN_PASSWORD','DASHBOARD_HOST_PORT','CLOUDFLARE_TUNNEL_ENABLED','CLOUDFLARE_TUNNEL_TOKEN','CLOUDFLARE_PUBLIC_HOSTNAME')
+    $order = @('EWSP_GITHUB_READ_TOKEN','GHCR_USERNAME','GHCR_TOKEN','EWSP_ADMIN_EMAIL','EWSP_ADMIN_PASSWORD') + $script:EwspMailSettingNames + @('DASHBOARD_HOST_PORT','CLOUDFLARE_TUNNEL_ENABLED','CLOUDFLARE_TUNNEL_TOKEN','CLOUDFLARE_PUBLIC_HOSTNAME')
     $lines = @('# EWSP deployment-host configuration. Never commit, upload, or print this file.')
     foreach ($name in $order) { if ($target.ContainsKey($name)) { $lines += "$name=$($target[$name])" } }
     $temporary = "$($paths.Configuration).tmp"
@@ -4802,7 +4850,7 @@ function Invoke-EwspDeployConfigure {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
     }
     Write-Host "Machine deployment configuration updated at $($paths.Configuration)."
-    Write-Host "Copied setting names from ignored .env: $($copied -join ', '). Values hidden. Source .env preserved."
+    Write-Host "Copied or preserved approved setting names from ignored .env, protected configuration, or Windows user mail settings: $($copied -join ', '). Values hidden. Sources preserved."
     if (-not $target.ContainsKey('EWSP_ADMIN_PASSWORD')) {
         Write-Warning 'Add EWSP_ADMIN_PASSWORD directly to deployment.env before running deploy; do not place it in chat.'
     }
@@ -5356,7 +5404,7 @@ function Get-EwspCommandRegistry {
         [PSCustomObject]@{ Name='start'; Category='local'; Handler='Invoke-EwspStart'; Aliases=@(); ShortDescription='Build and start the verified Compose stack'; Usage='.\ewsp.ps1 start'; LongDescription='Builds required application images, starts five services, waits for readiness, and verifies endpoints.'; Prerequisites=@('Docker Engine and Compose','Configured sibling repositories and .env'); Examples=@('.\ewsp.ps1 start'); SideEffects=@('Builds images and starts containers'); SafetyNotes=@('Does not update Git repositories'); RelatedCommands=@('status','stop','up'); Keywords=@('compose','docker','build','run') }
         [PSCustomObject]@{ Name='stop'; Category='local'; Handler='Invoke-EwspStop'; Aliases=@(); ShortDescription='Stop the local Compose environment'; Usage='.\ewsp.ps1 stop'; LongDescription='Stops and removes project containers and networks.'; Prerequisites=@('Docker Engine and Compose'); Examples=@('.\ewsp.ps1 stop'); SideEffects=@('Stops local EWSP containers'); SafetyNotes=@('Preserves PostgreSQL and MinIO named volumes'); RelatedCommands=@('up','start','status'); Keywords=@('compose','docker','shutdown','storage') }
         [PSCustomObject]@{ Name='status'; Category='local'; Handler='Invoke-EwspStatus'; Aliases=@(); ShortDescription='Show local repository and Compose state'; Usage='.\ewsp.ps1 status'; LongDescription='Reports safe Git classifications, configuration presence, and concise container health.'; Prerequisites=@('Git and Docker for complete runtime status'); Examples=@('.\ewsp.ps1 status'); SideEffects=@('May fetch Git remote metadata; does not mutate runtime state'); SafetyNotes=@('Secret values are redacted'); RelatedCommands=@('up','stop','k8s-status'); Keywords=@('diagnostics','compose','docker','git','troubleshoot') }
-        [PSCustomObject]@{ Name='deploy-configure'; Category='cd'; Handler='Invoke-EwspDeployConfigure'; Aliases=@(); ShortDescription='Explicitly migrate static deployment-host settings'; Usage='.\ewsp.ps1 deploy-configure'; LongDescription='Copies approved setting names from the ignored repository .env into the protected user-profile deployment.env while preserving both files.'; Prerequisites=@('Existing ignored .env','Protected %USERPROFILE%\.ewsp directory'); Examples=@('.\ewsp.ps1 deploy-configure'); SideEffects=@('Copies selected static settings; never deletes or moves .env'); SafetyNotes=@('Values are never printed','Dynamic desired state is not stored in deployment.env'); RelatedCommands=@('deploy','deploy-status'); Keywords=@('deployment','config','credential','machine','migrate') }
+        [PSCustomObject]@{ Name='deploy-configure'; Category='cd'; Handler='Invoke-EwspDeployConfigure'; Aliases=@(); ShortDescription='Explicitly migrate static deployment-host settings'; Usage='.\ewsp.ps1 deploy-configure'; LongDescription='Copies approved setting names from ignored .env and existing Windows user SMTP settings into protected user-profile deployment.env while preserving all sources.'; Prerequisites=@('Existing ignored .env','Protected %USERPROFILE%\.ewsp directory'); Examples=@('.\ewsp.ps1 deploy-configure'); SideEffects=@('Copies selected static settings; never deletes or moves .env'); SafetyNotes=@('Values are never printed','Dynamic desired state is not stored in deployment.env'); RelatedCommands=@('deploy','deploy-status'); Keywords=@('deployment','config','credential','machine','migrate') }
         [PSCustomObject]@{ Name='deploy'; Category='cd'; Handler='Invoke-EwspDeploy'; Aliases=@(); ShortDescription='Reconcile latest CI-approved immutable application images'; Usage='.\ewsp.ps1 deploy'; LongDescription='Discovers the newest successful push/main artifacts, verifies their GHCR digests, and updates only outdated Kubernetes application Deployments.'; Prerequisites=@('Protected machine deployment.env','Docker Desktop Kubernetes on context docker-desktop','Private GitHub Actions read and GHCR pull credentials'); Examples=@('.\ewsp.ps1 deploy','.\ewsp.ps1 deploy-status'); SideEffects=@('May replace backend and/or dashboard Pods','Reconciles ghcr-pull and performs smoke/login checks'); SafetyNotes=@('No local image build or application checkout','Uses one machine lock and preserves PVCs','Backend rollback stops when Flyway history advances'); RelatedCommands=@('deploy-status','runner-status','k8s-status'); Keywords=@('cd','deploy','reconcile','immutable','github','ghcr','offline') }
         [PSCustomObject]@{ Name='deploy-status'; Category='cd'; Handler='Invoke-EwspDeployStatus'; Aliases=@(); ShortDescription='Show desired/running CD and deployment-host state'; Usage='.\ewsp.ps1 deploy-status'; LongDescription='Reports recoverable last state, desired and running SHAs, image IDs, lock state, runner registration, and Scheduled Tasks.'; Prerequisites=@('Machine config and Kubernetes for complete live status'); Examples=@('.\ewsp.ps1 deploy-status'); SideEffects=@('Read-only GitHub, Kubernetes, runner, and local-state inspection'); SafetyNotes=@('Never displays credential values'); RelatedCommands=@('deploy','runner-status','k8s-status'); Keywords=@('cd','deployment','status','desired','running','digest','lock') }
         [PSCustomObject]@{ Name='runner-setup'; Category='cd'; Handler='Invoke-EwspRunnerSetup'; Aliases=@(); ShortDescription='Configure interactive-logon runner and reconciliation tasks'; Usage='.\ewsp.ps1 runner-setup'; LongDescription='Validates the existing EWSP-PC registration and creates current-user Scheduled Tasks for run.cmd and bounded startup reconciliation.'; Prerequisites=@('Windows interactive deployment user','Pre-registered C:\actions-runner EWSP-PC runner'); Examples=@('.\ewsp.ps1 runner-setup','.\ewsp.ps1 runner-status'); SideEffects=@('Creates or updates two current-user Scheduled Tasks'); SafetyNotes=@('Does not re-register the runner or store a Windows password','Does not use the removed runner service'); RelatedCommands=@('runner-status','deploy'); Keywords=@('runner','scheduled task','windows','logon','startup','offline') }
@@ -5651,6 +5699,7 @@ Export-ModuleMember -Function @(
     'Remove-EwspCloudflareTunnelSecretArtifact',
     'New-EwspKubernetesRenderedManifests',
     'Get-EwspBackendConfigFingerprint',
+    'Get-EwspMailConfigurationFingerprint',
     'Get-EwspKubernetesApplyPlan',
     'Assert-EwspKubernetesManifestSet',
     'Get-EwspKubernetesPodReason',

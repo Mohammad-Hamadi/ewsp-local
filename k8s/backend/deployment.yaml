@@ -19,6 +19,7 @@ spec:
     metadata:
       annotations:
         ewsp.local/backend-config-sha256: replace-with-backend-config-sha256
+        ewsp.local/backend-mail-config-sha256: replace-with-backend-mail-config-sha256
       labels:
         app.kubernetes.io/name: backend
         app.kubernetes.io/component: api
@@ -64,6 +65,46 @@ spec:
                 secretKeyRef:
                   name: ewsp-infrastructure-secrets
                   key: JWT_SECRET
+            - name: EWSP_MAIL_ENABLED
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_ENABLED
+            - name: EWSP_MAIL_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_HOST
+            - name: EWSP_MAIL_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_PORT
+            - name: EWSP_MAIL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_USERNAME
+            - name: EWSP_MAIL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_PASSWORD
+            - name: EWSP_MAIL_FROM
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_FROM
+            - name: EWSP_MAIL_SMTP_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_SMTP_AUTH
+            - name: EWSP_MAIL_STARTTLS_ENABLE
+              valueFrom:
+                secretKeyRef:
+                  name: ewsp-infrastructure-secrets
+                  key: EWSP_MAIL_STARTTLS_ENABLE
           startupProbe:
             httpGet:
               path: /api/health

@@ -164,7 +164,16 @@ Both GHCR packages are private. Put `GHCR_USERNAME` and `GHCR_TOKEN` directly in
 
 `k8s-up` therefore does not require the backend or dashboard sibling checkout merely to deploy. Repository discovery remains part of Compose/setup/update/status. `k8s-seed` intentionally still requires the sibling backend repository for its ignored local seed SQL file.
 
-The real `ewsp-infrastructure-secrets` Secret is generated from the current ignored `.env`, applied without displaying its values, and its temporary ignored file is removed after application. `k8s/config/secrets.example.yaml` remains placeholder-only and is never applied by the command.
+The real `ewsp-infrastructure-secrets` Secret is generated from the current ignored `.env` plus protected SMTP settings in `%USERPROFILE%\.ewsp\deployment.env`, applied without displaying its values, and its temporary ignored file is removed after application. `k8s/config/secrets.example.yaml` remains placeholder-only and is never applied by the command.
+
+Registration, resend, email-change, and password-reset OTP email uses those
+protected SMTP settings. Run `.\ewsp.ps1 deploy-configure` to migrate the
+recognized `EWSP_MAIL_*` setting names from ignored `.env` or the existing
+Windows user environment without printing their values. `k8s-up` requires
+enabled authenticated STARTTLS mail and wires the backend only through Secret
+key references; the SMTP password is never stored in a ConfigMap or tracked
+file. A SHA-256 configuration fingerprint restarts only the backend when
+protected SMTP settings change.
 
 The baseline contains:
 
