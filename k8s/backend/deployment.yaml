@@ -17,6 +17,8 @@ spec:
       app.kubernetes.io/part-of: ewsp
   template:
     metadata:
+      annotations:
+        ewsp.local/backend-config-sha256: replace-with-backend-config-sha256
       labels:
         app.kubernetes.io/name: backend
         app.kubernetes.io/component: api

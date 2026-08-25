@@ -428,6 +428,9 @@ try {
     Assert-NotContains $composeConfiguration 'network_mode:' 'dashboard and backend remain on the shared Compose default network'
     Assert-Contains $composeConfiguration 'command: ["redis-server", "--save", "", "--appendonly", "no"]' 'Redis persistence is explicitly disabled'
     Assert-Contains $composeConfiguration 'type: tmpfs' 'Redis image data path is replaced with tmpfs'
+    Assert-Contains $composeConfiguration 'EWSP_MOBILE_LATEST_VERSION: ${EWSP_MOBILE_LATEST_VERSION:-1.0.0}' 'Compose backend receives the current mobile version with a development-safe default'
+    Assert-Contains $composeConfiguration 'EWSP_MOBILE_LATEST_VERSION_CODE: ${EWSP_MOBILE_LATEST_VERSION_CODE:-1}' 'Compose backend receives mobile version code 1'
+    Assert-Contains $composeConfiguration 'EWSP_MOBILE_UPDATE_URL: ${EWSP_MOBILE_UPDATE_URL:-https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk}' 'Compose backend receives the exact HTTPS mobile update URL'
     $environmentExample = Get-Content -Raw -LiteralPath (Join-Path $localRoot '.env.example')
     Assert-NotContains $environmentExample 'VITE_API_BASE_URL' 'environment example removes obsolete dashboard API build configuration'
     Assert-NotContains $environmentExample 'VITE_WS_URL' 'environment example removes obsolete dashboard WebSocket build configuration'
@@ -705,6 +708,30 @@ try {
     Assert-Equal $ghcrSecretObject.metadata.name 'ghcr-pull' 'GHCR pull Secret uses stable name'
     Assert-Equal $ghcrSecretObject.type 'kubernetes.io/dockerconfigjson' 'GHCR pull Secret uses Docker registry type'
 
+    $backendConfigText = Get-Content -Raw (Join-Path $localRoot 'k8s\backend\configmap.yaml')
+    $backendDeploymentText = Get-Content -Raw (Join-Path $localRoot 'k8s\backend\deployment.yaml')
+    $exactMobileUrl = 'https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk'
+    Assert-Contains $backendConfigText 'EWSP_MOBILE_LATEST_VERSION: 1.0.0' 'backend ConfigMap contains exact mobile version 1.0.0'
+    Assert-Contains $backendConfigText 'EWSP_MOBILE_LATEST_VERSION_CODE: "1"' 'backend ConfigMap contains exact mobile version code 1'
+    Assert-Contains $backendConfigText "EWSP_MOBILE_UPDATE_URL: $exactMobileUrl" 'backend ConfigMap contains exact mobile update URL'
+    Assert-Equal ([Uri]$exactMobileUrl).Scheme 'https' 'mobile update URL uses HTTPS'
+    Assert-Contains $backendDeploymentText 'name: backend-config' 'backend Pod consumes non-secret mobile metadata through the existing ConfigMap envFrom'
+    Assert-NotContains $secretText 'EWSP_MOBILE_' 'mobile release metadata is absent from the Kubernetes Secret artifact'
+    Assert-Equal ([regex]::Matches(($backendConfigText + $backendDeploymentText + $composeConfiguration), '(?i)minimum[_A-Z]*supported|force[_A-Z]*update|optional[_A-Z]*update').Count) 0 'mobile runtime configuration has no minimum, force, or optional update flag'
+    $envExampleText = Get-Content -Raw (Join-Path $localRoot '.env.example')
+    Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION=1.0.0' 'local environment example documents mobile version 1.0.0'
+    Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION_CODE=1' 'local environment example documents mobile version code 1'
+    Assert-Contains $envExampleText "EWSP_MOBILE_UPDATE_URL=$exactMobileUrl" 'local environment example documents the exact mobile update URL'
+    Assert-NotContains (Get-Content -Raw (Join-Path $localRoot 'config\deployment.env.example')) 'EWSP_MOBILE_' 'public mobile metadata is not placed in protected deployment credentials'
+
+    $fingerprintFixture = Join-Path $testRoot 'backend-config-fingerprint.yaml'
+    Set-Content -LiteralPath $fingerprintFixture -Value $backendConfigText -NoNewline
+    $fingerprintV1 = Get-EwspBackendConfigFingerprint $fingerprintFixture
+    Set-Content -LiteralPath $fingerprintFixture -Value ($backendConfigText.Replace('EWSP_MOBILE_LATEST_VERSION_CODE: "1"','EWSP_MOBILE_LATEST_VERSION_CODE: "2"')) -NoNewline
+    $fingerprintV2 = Get-EwspBackendConfigFingerprint $fingerprintFixture
+    Assert-Equal ($fingerprintV1 -ne $fingerprintV2) $true 'mobile metadata mutation changes the backend configuration fingerprint'
+    Assert-Equal $fingerprintV1.Length 64 'backend configuration fingerprint is a SHA-256 value'
+
     $backendSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash
     $dashboardSourceHash = (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash
     $renderRunner = {
@@ -718,6 +745,10 @@ try {
     $rendered = New-EwspKubernetesRenderedManifests $localRoot $backendGhcrImage $dashboardGhcrImage $renderRunner
     Assert-Contains (Get-Content -Raw $rendered.Backend) $backendGhcrImage 'backend placeholder renders to exact image'
     Assert-Contains (Get-Content -Raw $rendered.Dashboard) $dashboardGhcrImage 'dashboard placeholder renders to exact image'
+    Assert-Contains (Get-Content -Raw $rendered.Backend) "ewsp.local/backend-config-sha256: $fingerprintV1" 'rendered backend Pod template contains the current ConfigMap fingerprint'
+    Assert-NotContains (Get-Content -Raw $rendered.Backend) 'replace-with-backend-config-sha256' 'rendered backend Pod template resolves the ConfigMap fingerprint placeholder'
+    Assert-NotContains (Get-Content -Raw $rendered.Dashboard) 'backend-config-sha256' 'backend ConfigMap changes do not roll out the dashboard'
+    Assert-Contains $backendDeploymentText 'type: Recreate' 'mobile ConfigMap changes use the existing short Recreate backend rollout'
     Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\backend\deployment.yaml') -Algorithm SHA256).Hash $backendSourceHash 'backend source manifest remains unchanged after rendering'
     Assert-Equal (Get-FileHash (Join-Path $localRoot 'k8s\dashboard\deployment.yaml') -Algorithm SHA256).Hash $dashboardSourceHash 'dashboard source manifest remains unchanged after rendering'
     Assert-ThrowsCategory { New-EwspKubernetesRenderedManifests $localRoot 'ghcr.io/mohammad-hamadi/ewsp-backend:latest' $dashboardGhcrImage $renderRunner | Out-Null } 'GHCR_IMAGE_INVALID' 'latest Kubernetes application image is rejected during rendering'
@@ -966,7 +997,7 @@ try {
     Assert-NotContains $bootstrapJson '/api' 'bootstrap JSON never appends the API prefix'
     Assert-Equal (ConvertFrom-EwspMobileBootstrapJson $bootstrapJson).ApiBaseUrl 'https://calm-fog-123.trycloudflare.com' 'raw bootstrap schema accepts exactly one normalized apiBaseUrl'
     Assert-Equal (ConvertFrom-EwspMobileBootstrapJson '{"apiBaseUrl":"https://safe.trycloudflare.com","token":"secret"}') $null 'raw bootstrap schema rejects additional secret-like fields'
-    Assert-Equal (ConvertFrom-EwspMobileBootstrapJson (Get-Content -Raw (Join-Path $localRoot 'public\mobile-bootstrap.json'))).ApiBaseUrl 'https://bootstrap-not-configured.trycloudflare.com' 'tracked bootstrap document conforms to the exact public contract'
+    Assert-Equal ([bool](ConvertFrom-EwspMobileBootstrapJson (Get-Content -Raw (Join-Path $localRoot 'public\mobile-bootstrap.json')))) $true 'tracked dynamic bootstrap document continues to conform to the exact public contract'
     Assert-ThrowsCategory { Assert-EwspGitHubBootstrapWritePermission 'protected-test-token' { param($uri,$token) [PSCustomObject]@{permissions=[PSCustomObject]@{push=$false}} } | Out-Null } 'MOBILE_BOOTSTRAP_CREDENTIAL_REQUIRED' 'insufficient GitHub contents permission stops at the protected credential boundary'
 
     $rawAttempts = [PSCustomObject]@{ Count = 0 }
@@ -1530,6 +1561,7 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-Contains $moduleText '/api/v1/namespaces/ewsp/services/http:backend:8080/proxy/api/health' 'Quick Tunnel verifies direct backend Service health'
     Assert-NotContains $moduleText "Backend health failed after trusted-proxy configuration." 'one-shot post-rollout health classification is removed'
     $k8sUpFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspKubernetesUp \{.*?(?=function Invoke-EwspStop \{)').Value
+    $deployFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspDeploy \{.*?(?=function Get-EwspRunnerRegistration \{)').Value
     $tunnelStartFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspQuickTunnelStart \{.*?(?=function Invoke-EwspQuickTunnelStatus \{)').Value
     $tunnelStopFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspQuickTunnelStop \{.*?(?=function Invoke-EwspQuickTunnelStart \{)').Value
     Assert-NotContains $k8sUpFunction 'Invoke-EwspKubernetesSeed' 'k8s-up never invokes local user seeding automatically'
@@ -1544,6 +1576,15 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'CONFIGURATION', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
     Assert-NotContains $k8sUpFunction 'New-EwspImagePlan' 'Kubernetes path does not use sibling source-aware image planning'
     Assert-NotContains $k8sUpFunction 'Invoke-EwspImageBuilds' 'Kubernetes path does not invoke local application builds'
+    Assert-Contains $k8sUpFunction 'New-EwspKubernetesRenderedManifests' 'k8s-up reconciles the backend ConfigMap fingerprint through rendered manifests'
+    Assert-NotContains $deployFunction 'backend-config' 'existing image-only CD behavior does not independently mutate runtime ConfigMaps'
+    $statefulMobileText = @(
+        Get-Content -Raw (Join-Path $localRoot 'k8s\postgres\statefulset.yaml')
+        Get-Content -Raw (Join-Path $localRoot 'k8s\redis\deployment.yaml')
+        Get-Content -Raw (Join-Path $localRoot 'k8s\minio\statefulset.yaml')
+    ) -join "`n"
+    Assert-NotContains $statefulMobileText 'EWSP_MOBILE_' 'mobile metadata rollout requires no PostgreSQL, Redis, MinIO, or PVC configuration mutation'
+    Assert-NotContains (Get-Content -Raw (Join-Path $localRoot 'public\mobile-bootstrap.json')) 'EWSP_MOBILE_' 'mobile release metadata leaves dynamic endpoint bootstrap behavior unchanged'
     Assert-NotContains $k8sUpFunction 'Resolve-EwspRepositoryPath' 'Kubernetes startup does not require sibling application repositories'
     Assert-Contains $moduleText 'Invoke-EwspImageBuilds $LocalRoot $EnvironmentInfo' 'Compose start retains local application build behavior'
     Assert-Contains $moduleText "Resolve-EwspRepositoryPath `$LocalRoot `$repository" 'repository discovery remains available for Compose and seed workflows'

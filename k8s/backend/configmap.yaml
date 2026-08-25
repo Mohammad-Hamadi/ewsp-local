@@ -15,5 +15,8 @@ data:
   MINIO_ENDPOINT: http://minio:9000
   MINIO_BUCKET_NAME: ewsp-evidence
   EWSP_CORS_ALLOWED_ORIGINS: http://localhost:3000
+  EWSP_MOBILE_LATEST_VERSION: 1.0.0
+  EWSP_MOBILE_LATEST_VERSION_CODE: "1"
+  EWSP_MOBILE_UPDATE_URL: https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk
   SERVER_SHUTDOWN: graceful
   SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 30s

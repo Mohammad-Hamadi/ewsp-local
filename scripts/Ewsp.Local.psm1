@@ -3095,6 +3095,7 @@ function New-EwspKubernetesRenderedManifests {
         throw (New-EwspKubernetesException 'Resolved application images must be the expected GHCR repositories with full Git SHA tags.' 'GHCR_IMAGE_INVALID' 'Application images' 'Validate immutable GHCR image configuration')
     }
     $paths = Clear-EwspKubernetesRenderedArtifacts $LocalRoot
+    $backendConfigFingerprint = Get-EwspBackendConfigFingerprint (Join-Path $paths.SourceRoot 'backend\configmap.yaml')
     $sources = @(
         @{ Name = 'backend'; Source = Join-Path $paths.SourceRoot 'backend\deployment.yaml'; Destination = $paths.BackendRendered; Image = $BackendImage },
         @{ Name = 'dashboard'; Source = Join-Path $paths.SourceRoot 'dashboard\deployment.yaml'; Destination = $paths.DashboardRendered; Image = $DashboardImage }
@@ -3107,6 +3108,9 @@ function New-EwspKubernetesRenderedManifests {
             throw (New-EwspKubernetesException "Failed to render $($item.Name) Deployment: $reason" 'KUBERNETES_MANIFEST_INVALID' $item.Name 'kubectl set image --local')
         }
         $content = ($result.Output -join [Environment]::NewLine).TrimEnd() + [Environment]::NewLine
+        if ($item.Name -eq 'backend') {
+            $content = $content.Replace('replace-with-backend-config-sha256', $backendConfigFingerprint)
+        }
         if ($content -match 'replace-with-ewsp-local-tag' -or -not $content.Contains($item.Image)) {
             throw (New-EwspKubernetesException "Rendered $($item.Name) Deployment did not contain the exact resolved image." 'KUBERNETES_MANIFEST_INVALID' $item.Name 'kubectl set image --local')
         }
@@ -3115,6 +3119,26 @@ function New-EwspKubernetesRenderedManifests {
         if ($before -ne $after) { throw "Source manifest changed while rendering: $($item.Source)" }
     }
     [PSCustomObject]@{ Backend = $paths.BackendRendered; Dashboard = $paths.DashboardRendered; Root = $paths.RenderedRoot }
+}
+
+function Get-EwspBackendConfigFingerprint {
+    param([Parameter(Mandatory = $true)][string]$ConfigMapPath)
+    if (-not (Test-Path -LiteralPath $ConfigMapPath -PathType Leaf)) {
+        throw (New-EwspKubernetesException 'Backend ConfigMap source is missing.' 'KUBERNETES_MANIFEST_INVALID' 'backend configuration' 'Restore k8s/backend/configmap.yaml')
+    }
+    $data = [ordered]@{}
+    $inData = $false
+    foreach ($line in Get-Content -LiteralPath $ConfigMapPath) {
+        if ($line -match '^data:\s*$') { $inData = $true; continue }
+        if ($inData -and $line -match '^  (?<key>[A-Z][A-Z0-9_]*)\s*:\s*(?<value>.*)$') {
+            $data[$Matches.key] = $Matches.value.Trim()
+        } elseif ($inData -and $line -match '^\S') { break }
+    }
+    if ($data.Count -eq 0) {
+        throw (New-EwspKubernetesException 'Backend ConfigMap contains no fingerprintable data.' 'KUBERNETES_MANIFEST_INVALID' 'backend configuration' 'Validate k8s/backend/configmap.yaml data')
+    }
+    $canonical = @($data.Keys | Sort-Object | ForEach-Object { "$_=$($data[$_])" }) -join "`n"
+    Get-EwspTextSha256 $canonical
 }
 
 function Get-EwspKubernetesApplyPlan {
@@ -3172,8 +3196,8 @@ function Assert-EwspKubernetesManifestSet {
         }
     }
     $combined = ($files | ForEach-Object { [IO.File]::ReadAllText($_) }) -join "`n"
-    if ($combined -match 'replace-with-ewsp-local-tag' -or -not $combined.Contains($BackendImage) -or -not $combined.Contains($DashboardImage)) {
-        throw (New-EwspKubernetesException 'Rendered manifest set contains an unresolved image placeholder or lacks an exact resolved image.' 'KUBERNETES_MANIFEST_INVALID' 'Application manifests' 'Validate rendered images')
+    if ($combined -match 'replace-with-ewsp-local-tag|replace-with-backend-config-sha256' -or -not $combined.Contains($BackendImage) -or -not $combined.Contains($DashboardImage)) {
+        throw (New-EwspKubernetesException 'Rendered manifest set contains an unresolved image/configuration placeholder or lacks an exact resolved image.' 'KUBERNETES_MANIFEST_INVALID' 'Application manifests' 'Validate rendered images and backend configuration fingerprint')
     }
     foreach ($requiredText in @(
         'namespace: ewsp', 'name: ewsp-infrastructure-secrets', 'name: postgres-config', 'name: backend-config',
@@ -5587,6 +5611,7 @@ Export-ModuleMember -Function @(
     'New-EwspCloudflareTunnelSecretArtifact',
     'Remove-EwspCloudflareTunnelSecretArtifact',
     'New-EwspKubernetesRenderedManifests',
+    'Get-EwspBackendConfigFingerprint',
     'Get-EwspKubernetesApplyPlan',
     'Assert-EwspKubernetesManifestSet',
     'Get-EwspKubernetesPodReason',

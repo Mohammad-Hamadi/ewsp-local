@@ -26,6 +26,36 @@ kubectl set image -f k8s/backend/deployment.yaml `
 `imagePullSecret` lets Kubernetes obtain a missing private image. `k8s-up`
 creates that Secret from ignored local credentials and never builds this image.
 
+## Mobile release metadata
+
+`backend-config` supplies the three public runtime properties required by the
+mobile version endpoint through the Deployment's existing `envFrom` reference:
+
+```text
+EWSP_MOBILE_LATEST_VERSION=1.0.0
+EWSP_MOBILE_LATEST_VERSION_CODE=1
+EWSP_MOBILE_UPDATE_URL=https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk
+```
+
+They are release metadata, not credentials, and therefore remain in the
+ConfigMap rather than a Secret. `k8s-up` places a semantic SHA-256 fingerprint
+of all `backend-config` data on the backend Pod template. A ConfigMap data
+change therefore causes the existing `Recreate` Deployment to replace the
+backend Pod so its process receives the new environment. It does not rebuild
+the backend image or mutate PostgreSQL, Redis, MinIO, PVs, or PVCs.
+
+For a future release, update only these three ConfigMap values (for example,
+version `1.0.1`, code `2`, and the matching GitHub Release APK URL), update the
+same Compose defaults and `.env.example`, then run:
+
+```powershell
+.\ewsp.ps1 k8s-up
+```
+
+Commit the declarative metadata change normally. The image-only `deploy` and
+startup reconciliation workflows remain unchanged; they do not build images
+or independently apply runtime ConfigMap revisions.
+
 ## Health and shutdown
 
 All probes use `/api/health`. Per the backend audit contract, this endpoint is a
