@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 $script:EwspResolvedEnvironment = $null
 $script:EwspKubernetesContext = 'docker-desktop'
 $script:EwspKubernetesNamespace = 'ewsp'
+$script:EwspMobileBootstrapRelativePath = 'public/mobile-bootstrap.json'
+$script:EwspMobileBootstrapRawUrl = 'https://raw.githubusercontent.com/Mohammad-Hamadi/ewsp-local/main/public/mobile-bootstrap.json'
+$script:EwspLocalRepositoryUrl = 'https://github.com/Mohammad-Hamadi/ewsp-local.git'
 
 function Invoke-EwspNative {
     [CmdletBinding()]
@@ -2248,6 +2251,171 @@ function ConvertFrom-EwspQuickTunnelUrl {
     if ($match.Success) { $match.Value.ToLowerInvariant() } else { $null }
 }
 
+function ConvertTo-EwspQuickTunnelOrigin {
+    param([Parameter(Mandatory = $true)][string]$PublicUrl)
+    $value = $PublicUrl.Trim()
+    try { $uri = [Uri]$value } catch { $uri = $null }
+    if (-not $uri -or -not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or
+        -not $uri.IsDefaultPort -or -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or -not [string]::IsNullOrEmpty($uri.Fragment) -or
+        $uri.AbsolutePath -notin @('', '/') -or
+        $uri.DnsSafeHost -notmatch '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.trycloudflare\.com$') {
+        throw (New-EwspQuickTunnelException 'Mobile bootstrap requires an absolute HTTPS Quick Tunnel origin with no path, query, fragment, credentials, or custom port.' 'MOBILE_BOOTSTRAP_URL_INVALID' 'MOBILE_BOOTSTRAP_VALIDATION' 'mobile bootstrap')
+    }
+    "https://$($uri.DnsSafeHost.ToLowerInvariant())"
+}
+
+function ConvertTo-EwspMobileBootstrapJson {
+    param([Parameter(Mandatory = $true)][string]$PublicUrl)
+    $origin = ConvertTo-EwspQuickTunnelOrigin $PublicUrl
+    "{`n  `"apiBaseUrl`": `"$origin`"`n}`n"
+}
+
+function ConvertFrom-EwspMobileBootstrapJson {
+    param([AllowNull()][string]$Content)
+    if ([string]::IsNullOrWhiteSpace($Content) -or $Content.Length -gt 4096) { return $null }
+    try { $document = $Content | ConvertFrom-Json } catch { return $null }
+    $properties = @($document.PSObject.Properties)
+    if ($properties.Count -ne 1 -or $properties[0].Name -cne 'apiBaseUrl' -or
+        $properties[0].Value -isnot [string]) { return $null }
+    try { $origin = ConvertTo-EwspQuickTunnelOrigin ([string]$properties[0].Value) } catch { return $null }
+    [PSCustomObject]@{ ApiBaseUrl = $origin }
+}
+
+function Get-EwspMobileBootstrap {
+    param(
+        [string]$ExpectedOrigin,
+        [int]$Attempts = 1,
+        [scriptblock]$RequestInvoker,
+        [scriptblock]$SleepAction
+    )
+    if ($Attempts -lt 1) { $Attempts = 1 }
+    if (-not $SleepAction) { $SleepAction = { param($milliseconds) Start-Sleep -Milliseconds $milliseconds } }
+    $normalizedExpected = $null
+    if ($ExpectedOrigin) { $normalizedExpected = ConvertTo-EwspQuickTunnelOrigin $ExpectedOrigin }
+    $lastStatus = 0
+    $bootstrap = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $uri = "$script:EwspMobileBootstrapRawUrl`?ewsp_verify=$cacheBuster"
+            $response = if ($RequestInvoker) { & $RequestInvoker $uri } else {
+                Invoke-WebRequest -UseBasicParsing -Uri $uri -TimeoutSec 15 -Headers @{ 'Cache-Control' = 'no-cache' }
+            }
+            $lastStatus = if ($response.PSObject.Properties['StatusCode']) { [int]$response.StatusCode } else { 200 }
+            $content = if ($response -is [string]) { [string]$response } else { [string]$response.Content }
+            $bootstrap = if ($lastStatus -eq 200) { ConvertFrom-EwspMobileBootstrapJson $content } else { $null }
+            if ($bootstrap -and (-not $normalizedExpected -or $bootstrap.ApiBaseUrl -ceq $normalizedExpected)) {
+                return [PSCustomObject]@{ Available=$true; Matches=[bool]$normalizedExpected; ApiBaseUrl=$bootstrap.ApiBaseUrl; StatusCode=$lastStatus; Url=$script:EwspMobileBootstrapRawUrl }
+            }
+        } catch { $lastStatus = 0 }
+        if ($attempt -lt $Attempts) { & $SleepAction ([Math]::Min(5000, 400 * [Math]::Pow(2, $attempt - 1))) }
+    }
+    [PSCustomObject]@{ Available=[bool]$bootstrap; Matches=$false; ApiBaseUrl=if ($bootstrap) { $bootstrap.ApiBaseUrl } else { $null }; StatusCode=$lastStatus; Url=$script:EwspMobileBootstrapRawUrl }
+}
+
+function Assert-EwspGitHubBootstrapWritePermission {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitHubToken,
+        [scriptblock]$RequestInvoker
+    )
+    try {
+        $uri = 'https://api.github.com/repos/Mohammad-Hamadi/ewsp-local'
+        $repository = if ($RequestInvoker) { & $RequestInvoker $uri $GitHubToken } else {
+            Invoke-RestMethod -Method Get -Uri $uri -TimeoutSec 20 -Headers @{
+                Authorization="Bearer $GitHubToken"; Accept='application/vnd.github+json'
+                'X-GitHub-Api-Version'='2022-11-28'; 'User-Agent'='EWSP-Mobile-Bootstrap'
+            }
+        }
+        if (-not $repository.permissions -or -not [bool]$repository.permissions.push) { throw 'permission denied' }
+    } catch {
+        throw (New-EwspQuickTunnelException 'The protected GitHub credential cannot confirm write access to ewsp-local. Token values and response content were withheld.' 'MOBILE_BOOTSTRAP_CREDENTIAL_REQUIRED' 'MOBILE_BOOTSTRAP_PERMISSION' 'GitHub credential' 'Provide a fine-grained token restricted to ewsp-local with Contents: read/write in the ACL-protected machine deployment.env.')
+    }
+    $true
+}
+
+function Publish-EwspMobileBootstrap {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [Parameter(Mandatory = $true)][string]$PublicUrl,
+        [string]$GitHubToken,
+        [scriptblock]$GitRunner,
+        [scriptblock]$PermissionInvoker,
+        [scriptblock]$BootstrapRequestInvoker,
+        [scriptblock]$SleepAction,
+        [string]$TemporaryRoot,
+        [switch]$LockHeld
+    )
+    $origin = ConvertTo-EwspQuickTunnelOrigin $PublicUrl
+    $json = ConvertTo-EwspMobileBootstrapJson $origin
+    if (-not $GitHubToken) { $GitHubToken = (Get-EwspDeploymentConfiguration).GitHubToken }
+    Assert-EwspGitHubBootstrapWritePermission $GitHubToken $PermissionInvoker | Out-Null
+    $lock = $null
+    if (-not $LockHeld) { $lock = Enter-EwspDeploymentLock }
+    $createdTemporaryRoot = $false
+    if (-not $GitRunner) {
+        $GitRunner = { param($workingDirectory, $arguments) Invoke-EwspNative -FilePath 'git' -ArgumentList $arguments -WorkingDirectory $workingDirectory }
+    }
+    try {
+        if (-not $TemporaryRoot) {
+            $TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("ewsp-mobile-bootstrap-" + [Guid]::NewGuid().ToString('N'))
+            $createdTemporaryRoot = $true
+        }
+        New-Item -ItemType Directory -Path $TemporaryRoot -Force | Out-Null
+        $checkout = Join-Path $TemporaryRoot 'ewsp-local'
+        $clone = & $GitRunner $TemporaryRoot @('clone','--quiet','--single-branch','--branch','main',$script:EwspLocalRepositoryUrl,$checkout)
+        if ($clone.ExitCode -ne 0) { throw 'unable to create isolated publication checkout' }
+        $status = & $GitRunner $checkout @('status','--porcelain=v1','--untracked-files=all')
+        if ($status.ExitCode -ne 0 -or @($status.Output | Where-Object { $_ }).Count -ne 0) { throw 'isolated publication checkout was unexpectedly dirty' }
+        $target = Join-Path $checkout ($script:EwspMobileBootstrapRelativePath -replace '/', [IO.Path]::DirectorySeparatorChar)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        [IO.File]::WriteAllText($target, $json, [Text.UTF8Encoding]::new($false))
+        $add = & $GitRunner $checkout @('add','--',$script:EwspMobileBootstrapRelativePath)
+        if ($add.ExitCode -ne 0) { throw 'unable to stage the bootstrap document' }
+        $staged = & $GitRunner $checkout @('diff','--cached','--name-only','--')
+        $stagedPaths = @($staged.Output | Where-Object { $_ })
+        if ($staged.ExitCode -ne 0 -or $stagedPaths.Count -gt 1 -or ($stagedPaths.Count -eq 1 -and $stagedPaths[0] -cne $script:EwspMobileBootstrapRelativePath)) {
+            throw 'publication safety check found a staged path other than public/mobile-bootstrap.json'
+        }
+        $publishedCommit = $false
+        if ($stagedPaths.Count -eq 1) {
+            $commit = & $GitRunner $checkout @('-c','user.name=EWSP Bootstrap Publisher','-c','user.email=ewsp-bootstrap@users.noreply.github.com','commit','--quiet','-m','Update mobile bootstrap endpoint','--',$script:EwspMobileBootstrapRelativePath)
+            if ($commit.ExitCode -ne 0) { throw 'unable to create the bootstrap-only commit' }
+            $oldCount=$env:GIT_CONFIG_COUNT; $oldKey=$env:GIT_CONFIG_KEY_0; $oldValue=$env:GIT_CONFIG_VALUE_0; $oldPrompt=$env:GIT_TERMINAL_PROMPT
+            try {
+                $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("x-access-token:$GitHubToken"))
+                $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='http.https://github.com/.extraheader'; $env:GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"; $env:GIT_TERMINAL_PROMPT='0'
+                $push = & $GitRunner $checkout @('push','--quiet','origin','HEAD:refs/heads/main')
+            } finally {
+                $basic=$null
+                $env:GIT_CONFIG_COUNT=$oldCount; $env:GIT_CONFIG_KEY_0=$oldKey; $env:GIT_CONFIG_VALUE_0=$oldValue; $env:GIT_TERMINAL_PROMPT=$oldPrompt
+            }
+            if ($push.ExitCode -ne 0) { throw 'GitHub rejected the bootstrap-only push' }
+            $publishedCommit = $true
+        }
+        $verified = Get-EwspMobileBootstrap $origin 7 $BootstrapRequestInvoker $SleepAction
+        if (-not $verified.Available -or -not $verified.Matches) { throw 'the stable raw bootstrap URL did not return the newly published endpoint within bounded retries' }
+        [PSCustomObject]@{ Published=$publishedCommit; ApiBaseUrl=$origin; Path=$script:EwspMobileBootstrapRelativePath; RawUrl=$script:EwspMobileBootstrapRawUrl; Verified=$true }
+    } catch {
+        $reason = Protect-EwspDiagnosticText $_.Exception.Message @{ GITHUB_TOKEN = $GitHubToken }
+        throw (New-EwspQuickTunnelException "Mobile bootstrap publication failed after the Quick Tunnel became healthy. The tunnel was left running, but mobile discovery is not ready. Reason: $reason" 'MOBILE_BOOTSTRAP_PUBLICATION_FAILED' 'MOBILE_BOOTSTRAP_PUBLICATION' 'mobile bootstrap' 'Run .\ewsp.ps1 tunnel-quick again to reconcile the healthy tunnel, after correcting GitHub permission/connectivity. Minimal permission: ewsp-local Contents read/write.')
+    } finally {
+        if ($createdTemporaryRoot -and $TemporaryRoot -and (Test-Path -LiteralPath $TemporaryRoot)) { Remove-Item -LiteralPath $TemporaryRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($lock) { Exit-EwspDeploymentLock $lock }
+    }
+}
+
+function Get-EwspMobileDiscoveryStatus {
+    param([string]$QuickTunnelUrl, [scriptblock]$RequestInvoker)
+    $bootstrap = Get-EwspMobileBootstrap -RequestInvoker $RequestInvoker
+    $expected = $null
+    if ($QuickTunnelUrl) { try { $expected = ConvertTo-EwspQuickTunnelOrigin $QuickTunnelUrl } catch { } }
+    $state = if (-not $bootstrap.Available) { 'UNAVAILABLE' }
+        elseif ($expected -and $bootstrap.ApiBaseUrl -ceq $expected) { 'READY' }
+        else { 'STALE' }
+    [PSCustomObject]@{ State=$state; ExpectedApiBaseUrl=$expected; PublishedApiBaseUrl=$bootstrap.ApiBaseUrl; BootstrapUrl=$script:EwspMobileBootstrapRawUrl }
+}
+
 function Assert-EwspKubernetesSeedContext {
     param([AllowNull()][string]$Context)
     if ($Context -ne $script:EwspKubernetesContext) {
@@ -4026,8 +4194,12 @@ function Assert-EwspQuickTunnelKubernetesPreflight {
 function Invoke-EwspQuickTunnelStop {
     param(
         [Parameter(Mandatory = $true)][string]$LocalRoot,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [switch]$LockHeld
     )
+    $operationLock = $null
+    if (-not $LockHeld) { $operationLock = Enter-EwspDeploymentLock }
+    try {
     $paths = Get-EwspKubernetesPaths $LocalRoot
     $managed = Get-EwspManagedQuickTunnel $LocalRoot
     $state = $managed.State
@@ -4045,10 +4217,13 @@ function Invoke-EwspQuickTunnelStop {
         if (Test-Path -LiteralPath $safe) { Remove-Item -LiteralPath $safe -Force }
     }
     if (-not $Quiet) { Write-Host 'Quick Tunnel state removed; backend configuration restored; Kubernetes workloads and dashboard forward remain running.' -ForegroundColor Green }
+    } finally { if ($operationLock) { Exit-EwspDeploymentLock $operationLock } }
 }
 
 function Invoke-EwspQuickTunnelStart {
     param([Parameter(Mandatory = $true)][string]$LocalRoot)
+    $operationLock = Enter-EwspDeploymentLock
+    try {
     $cloudflared = Assert-EwspCloudflaredAvailable (Get-EwspCloudflaredInfo)
     $existing = Get-EwspManagedQuickTunnel $LocalRoot
     $preflight = Assert-EwspQuickTunnelKubernetesPreflight $LocalRoot
@@ -4066,12 +4241,23 @@ function Invoke-EwspQuickTunnelStart {
         if (-not $safeReuse) {
             throw (New-EwspQuickTunnelException 'An EWSP-managed Quick Tunnel is alive, but its Pod boundary, backend runtime configuration, or public endpoint is stale.' 'TUNNEL_START_FAILED' 'DUPLICATE_CHECK' 'Quick Tunnel' 'Run .\ewsp.ps1 tunnel-stop, then start a new Quick Tunnel for the current dashboard Pod.')
         }
+        $smoke = Assert-EwspQuickTunnelPublicSmoke $existing.PublicUrl
+        try { $publication = Publish-EwspMobileBootstrap $LocalRoot $existing.PublicUrl -LockHeld }
+        catch {
+            Write-Warning "Healthy Quick Tunnel remains available at $($existing.PublicUrl)."
+            Write-Warning 'MOBILE_DISCOVERY=UNAVAILABLE (bootstrap reconciliation failed).'
+            throw
+        }
         Write-Host "Reused healthy EWSP Quick Tunnel: $($existing.PublicUrl)" -ForegroundColor Green
+        Write-Host "Mobile bootstrap: $($publication.RawUrl) -> $($publication.ApiBaseUrl)"
+        Write-Host 'MOBILE_DISCOVERY=READY' -ForegroundColor Green
         return
     }
     $previous = [ordered]@{}
     foreach ($name in $runtime.Settings.Keys) { $previous[$name] = $runtime.Settings[$name] }
     $stateCreated = $false
+    $publicVerified = $false
+    $publicUrl = $null
     try {
         Set-EwspBackendEnvironmentOverrides @{
             SERVER_FORWARD_HEADERS_STRATEGY = 'NATIVE'
@@ -4088,6 +4274,8 @@ function Invoke-EwspQuickTunnelStart {
         }
         Wait-EwspBackendReady | Out-Null
         $smoke = Assert-EwspQuickTunnelPublicSmoke $publicUrl
+        $publicVerified = $true
+        $publication = Publish-EwspMobileBootstrap $LocalRoot $publicUrl -LockHeld
         Write-Host ''
         Write-Host 'EWSP temporary Quick Tunnel is ready.' -ForegroundColor Green
         Write-Host "cloudflared: $($cloudflared.Version) [$($cloudflared.Path)]"
@@ -4095,16 +4283,22 @@ function Invoke-EwspQuickTunnelStart {
         Write-Host "Dashboard Pod: $($pod.Name) ($($pod.Ip))"
         Write-Host "Trusted proxy regex: $trustRegex"
         Write-Host "Public checks: /=HTTP $($smoke.Root), /complaints=HTTP $($smoke.Complaints), /api/health=HTTP $($smoke.Health), /ws=upgraded, >1 MiB=HTTP $($smoke.LargeRequestStatus) (not 413)"
+        Write-Host "Mobile bootstrap: $($publication.RawUrl) -> $($publication.ApiBaseUrl)"
+        Write-Host 'MOBILE_DISCOVERY=READY' -ForegroundColor Green
         Write-Warning 'Exact backend getRemoteAddr/scheme/isSecure and forged-XFF normalization cannot be observed with the current application/logging without adding temporary application instrumentation. No public diagnostic endpoint was added.'
         Write-Host 'Stop with: .\ewsp.ps1 tunnel-stop'
     } catch {
-        if ($stateCreated -or (Get-EwspManagedQuickTunnel $LocalRoot).State) {
-            try { Invoke-EwspQuickTunnelStop $LocalRoot -Quiet } catch { Write-Warning "Quick Tunnel rollback needs attention: $($_.Exception.Message)" }
+        if ($publicVerified) {
+            Write-Warning "Healthy Quick Tunnel remains available at $publicUrl."
+            Write-Warning 'MOBILE_DISCOVERY=UNAVAILABLE (bootstrap publication failed).'
+        } elseif ($stateCreated -or (Get-EwspManagedQuickTunnel $LocalRoot).State) {
+            try { Invoke-EwspQuickTunnelStop $LocalRoot -Quiet -LockHeld } catch { Write-Warning "Quick Tunnel rollback needs attention: $($_.Exception.Message)" }
         } else {
             try { Restore-EwspBackendEnvironmentOverrides ([PSCustomObject]$previous); Wait-EwspBackendReady | Out-Null } catch { Write-Warning "Backend rollback needs attention: $($_.Exception.Message)" }
         }
         throw
     }
+    } finally { Exit-EwspDeploymentLock $operationLock }
 }
 
 function Invoke-EwspQuickTunnelStatus {
@@ -4115,10 +4309,15 @@ function Invoke-EwspQuickTunnelStatus {
     $snapshots = @()
     $runtime = $null
     try { $snapshots = @(Get-EwspKubernetesWorkloadSnapshot); $runtime = Get-EwspBackendProxyRuntime } catch { }
+    $discovery = Get-EwspMobileDiscoveryStatus $managed.PublicUrl
     Write-Host 'EWSP Quick Tunnel status'
     Write-Host "cloudflared: $(if ($cloudflared.Available) { "$($cloudflared.Version) [$($cloudflared.Path)]" } else { 'unavailable' })"
     Write-Host "Quick Tunnel: $(if ($managed.Active) { 'active' } else { 'inactive' })"
     Write-Host "Public URL: $(if ($managed.PublicUrl) { $managed.PublicUrl } else { '<none>' })"
+    Write-Host "Bootstrap URL: $($discovery.BootstrapUrl)"
+    Write-Host "Bootstrap apiBaseUrl: $(if ($discovery.PublishedApiBaseUrl) { $discovery.PublishedApiBaseUrl } else { '<unavailable>' })"
+    Write-Host "Bootstrap matches tunnel: $(if ($discovery.State -eq 'READY') { 'yes' } elseif ($discovery.State -eq 'UNAVAILABLE') { 'unavailable' } else { 'no' })"
+    Write-Host "MOBILE_DISCOVERY=$($discovery.State)"
     Write-Host "Dashboard forward: $(if ($forward.Active -and $forward.Healthy) { "active $($forward.Url) (PID $($forward.Process.Id), ownership=machine-global)" } elseif ($forward.Active) { "active but unhealthy (PID $($forward.Process.Id), ownership=machine-global)" } else { 'inactive (ownership=machine-global)' })"
     if ($runtime) {
         Write-Host "Forwarded headers: $(if ($runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value) { $runtime.Settings.SERVER_FORWARD_HEADERS_STRATEGY.Value } else { 'NONE (application default)' })"
@@ -5105,8 +5304,8 @@ function Get-EwspCommandRegistry {
         [PSCustomObject]@{ Name='k8s-stop'; Category='kubernetes'; Handler='Invoke-EwspKubernetesStop'; Aliases=@(); ShortDescription='Stop Kubernetes workloads while preserving state'; Usage='.\ewsp.ps1 k8s-stop'; LongDescription='Stops managed access and scales EWSP application/infrastructure controllers down safely.'; Prerequisites=@('kubectl and Docker Desktop Kubernetes'); Examples=@('.\ewsp.ps1 k8s-stop'); SideEffects=@('Stops workloads and managed port-forward/tunnel processes'); SafetyNotes=@('PostgreSQL and MinIO PVCs, data, and Kubernetes resources are preserved'); RelatedCommands=@('k8s-up','k8s-status'); Keywords=@('k8s','kubernetes','shutdown','pvc','storage') }
         [PSCustomObject]@{ Name='k8s-seed'; Category='data'; Handler='Invoke-EwspKubernetesSeed'; Aliases=@(); ShortDescription='Create missing local dashboard users'; Usage='.\ewsp.ps1 k8s-seed'; LongDescription='Streams the ignored backend local seed into Ready Docker Desktop Kubernetes PostgreSQL.'; Prerequisites=@('Context exactly docker-desktop and namespace ewsp','Ready postgres-0 with Bound PVC','Untracked and ignored ewsp-backend local seed file'); Examples=@('.\ewsp.ps1 k8s-seed'); SideEffects=@('Creates seed-defined users that are missing'); SafetyNotes=@('Uses ON CONFLICT DO NOTHING and never overwrites existing users','Local/demo use only'); RelatedCommands=@('k8s-reset-admin','k8s-status','k8s-up'); Keywords=@('seed','database','postgres','users','password') }
         [PSCustomObject]@{ Name='k8s-reset-admin'; Category='data'; Handler='Invoke-EwspKubernetesResetAdmin'; Aliases=@(); ShortDescription='Reconcile the local Kubernetes admin credential'; Usage='.\ewsp.ps1 k8s-reset-admin'; LongDescription='Explicitly updates the existing seeded admin password_hash to the current ignored local seed definition and proves real login.'; Prerequisites=@('Context exactly docker-desktop and namespace ewsp','Ready postgres-0 with Bound PVC','Untracked and ignored ewsp-backend local seed file','Existing active verified ADMIN employee with expected local counts'); Examples=@('.\ewsp.ps1 k8s-reset-admin'); SideEffects=@('Intentionally changes only admin@ewsp.local password_hash','Performs real logins, which create normal backend login audit/session records; returned tokens are discarded'); SafetyNotes=@('Local/demo recovery only; not production password management','No force bypass and no PVC or user deletion'); RelatedCommands=@('k8s-seed','k8s-status','k8s-up'); Keywords=@('password','credential','admin','reset','reconcile','database','seed') }
-        [PSCustomObject]@{ Name='tunnel-quick'; Category='public'; Handler='Invoke-EwspQuickTunnelStart'; Aliases=@(); ShortDescription='Start a temporary Cloudflare Quick Tunnel'; Usage='.\ewsp.ps1 tunnel-quick'; LongDescription='Starts or reuses a managed public proof using a random trycloudflare.com URL; no domain is required.'; Prerequisites=@('Healthy Docker Desktop Kubernetes deployment','cloudflared installed'); Examples=@('.\ewsp.ps1 tunnel-quick','.\ewsp.ps1 tunnel-status'); SideEffects=@('Temporarily adjusts backend proxy trust and starts cloudflared','Publicly exposes the dashboard until tunnel-stop'); SafetyNotes=@('Temporary random URL; public exposure ends with tunnel-stop'); RelatedCommands=@('tunnel-status','tunnel-stop','k8s-up'); Keywords=@('tunnel','cloudflare','public','demo','trycloudflare') }
-        [PSCustomObject]@{ Name='tunnel-status'; Category='public'; Handler='Invoke-EwspQuickTunnelStatus'; Aliases=@(); ShortDescription='Show managed Quick Tunnel state'; Usage='.\ewsp.ps1 tunnel-status'; LongDescription='Reports the managed tunnel, proxy boundary, backend readiness, and access state.'; Prerequisites=@('kubectl; cloudflared only when a tunnel is active'); Examples=@('.\ewsp.ps1 tunnel-status'); SideEffects=@('Read-only inspection'); SafetyNotes=@('Does not display tokens or other credentials'); RelatedCommands=@('tunnel-quick','tunnel-stop','k8s-status'); Keywords=@('tunnel','cloudflare','public','diagnostics') }
+        [PSCustomObject]@{ Name='tunnel-quick'; Category='public'; Handler='Invoke-EwspQuickTunnelStart'; Aliases=@(); ShortDescription='Start a temporary Cloudflare Quick Tunnel'; Usage='.\ewsp.ps1 tunnel-quick'; LongDescription='Starts or reuses a managed public proof, verifies it, and publishes its random trycloudflare.com origin for mobile discovery.'; Prerequisites=@('Healthy Docker Desktop Kubernetes deployment','cloudflared installed','Protected ewsp-local Contents read/write credential'); Examples=@('.\ewsp.ps1 tunnel-quick','.\ewsp.ps1 tunnel-status'); SideEffects=@('Temporarily adjusts backend proxy trust and starts cloudflared','Publishes a bootstrap-only ewsp-local commit after public verification','Publicly exposes the dashboard until tunnel-stop'); SafetyNotes=@('Fails closed for mobile readiness if publication fails','A verified tunnel remains running after bootstrap publication failure'); RelatedCommands=@('tunnel-status','tunnel-stop','k8s-up'); Keywords=@('tunnel','cloudflare','public','demo','trycloudflare','mobile','bootstrap') }
+        [PSCustomObject]@{ Name='tunnel-status'; Category='public'; Handler='Invoke-EwspQuickTunnelStatus'; Aliases=@(); ShortDescription='Show managed Quick Tunnel state'; Usage='.\ewsp.ps1 tunnel-status'; LongDescription='Reports the managed tunnel, public bootstrap match, mobile discovery state, proxy boundary, backend readiness, and access state.'; Prerequisites=@('kubectl; cloudflared only when a tunnel is active'); Examples=@('.\ewsp.ps1 tunnel-status'); SideEffects=@('Read-only local and public bootstrap inspection'); SafetyNotes=@('Does not display tokens or other credentials'); RelatedCommands=@('tunnel-quick','tunnel-stop','k8s-status'); Keywords=@('tunnel','cloudflare','public','diagnostics','mobile','bootstrap') }
         [PSCustomObject]@{ Name='tunnel-stop'; Category='public'; Handler='Invoke-EwspQuickTunnelStop'; Aliases=@(); ShortDescription='Stop the managed Quick Tunnel'; Usage='.\ewsp.ps1 tunnel-stop'; LongDescription='Stops only the EWSP-managed cloudflared process and restores the prior backend proxy configuration.'; Prerequisites=@('kubectl for backend configuration restoration'); Examples=@('.\ewsp.ps1 tunnel-stop'); SideEffects=@('Ends public exposure and reconciles backend proxy settings'); SafetyNotes=@('Does not stop unrelated cloudflared processes or delete PVCs'); RelatedCommands=@('tunnel-quick','tunnel-status'); Keywords=@('tunnel','cloudflare','public','stop') }
         [PSCustomObject]@{ Name='help'; Category='diagnostics'; Handler=$null; Aliases=@('-h','--help'); ShortDescription='Discover commands, categories, search, and workflows'; Usage='.\ewsp.ps1 help [commands|<command>|<category>|find <term>|workflow <topic>]'; LongDescription='Displays CLI guidance without loading runtime configuration or probing external tools.'; Prerequisites=@('None'); Examples=@('.\ewsp.ps1 help','.\ewsp.ps1 help commands','.\ewsp.ps1 help find database'); SideEffects=@('None'); SafetyNotes=@('Never executes orchestration commands'); RelatedCommands=@(); Keywords=@('commands','discover','usage','workflow') }
     )
@@ -5437,6 +5636,13 @@ Export-ModuleMember -Function @(
     'New-EwspQuickTunnelTrustRegex',
     'Get-EwspReadyDashboardPod',
     'ConvertFrom-EwspQuickTunnelUrl',
+    'ConvertTo-EwspQuickTunnelOrigin',
+    'ConvertTo-EwspMobileBootstrapJson',
+    'ConvertFrom-EwspMobileBootstrapJson',
+    'Get-EwspMobileBootstrap',
+    'Assert-EwspGitHubBootstrapWritePermission',
+    'Publish-EwspMobileBootstrap',
+    'Get-EwspMobileDiscoveryStatus',
     'Get-EwspManagedQuickTunnel',
     'Get-EwspBackendProxyRuntime',
     'Get-EwspBackendServiceReadinessState',

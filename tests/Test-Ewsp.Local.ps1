@@ -956,6 +956,85 @@ try {
     Assert-Equal (ConvertFrom-EwspQuickTunnelUrl 'INF Requesting new quick Tunnel on https://Calm-Fog-123.trycloudflare.com') 'https://calm-fog-123.trycloudflare.com' 'Quick Tunnel URL is parsed robustly from log text'
     Assert-Equal (ConvertFrom-EwspQuickTunnelUrl 'https://*.trycloudflare.com') $null 'wildcard trycloudflare origin is never accepted as a generated URL'
 
+    Assert-Equal (ConvertTo-EwspQuickTunnelOrigin ' HTTPS://Calm-Fog-123.trycloudflare.com/ ') 'https://calm-fog-123.trycloudflare.com' 'mobile bootstrap safely normalizes a trailing slash and host case'
+    Assert-ThrowsCategory { ConvertTo-EwspQuickTunnelOrigin 'http://calm-fog-123.trycloudflare.com' | Out-Null } 'MOBILE_BOOTSTRAP_URL_INVALID' 'mobile bootstrap rejects non-HTTPS origins'
+    Assert-ThrowsCategory { ConvertTo-EwspQuickTunnelOrigin 'https://example.com' | Out-Null } 'MOBILE_BOOTSTRAP_URL_INVALID' 'mobile bootstrap rejects non-Quick-Tunnel hosts'
+    Assert-ThrowsCategory { ConvertTo-EwspQuickTunnelOrigin 'https://calm-fog-123.trycloudflare.com/api' | Out-Null } 'MOBILE_BOOTSTRAP_URL_INVALID' 'mobile bootstrap rejects an appended API path'
+    $bootstrapJson = ConvertTo-EwspMobileBootstrapJson 'https://calm-fog-123.trycloudflare.com/'
+    $bootstrapObject = $bootstrapJson | ConvertFrom-Json
+    Assert-Equal $bootstrapObject.apiBaseUrl 'https://calm-fog-123.trycloudflare.com' 'valid Quick Tunnel URL produces the exact bootstrap JSON origin'
+    Assert-NotContains $bootstrapJson '/api' 'bootstrap JSON never appends the API prefix'
+    Assert-Equal (ConvertFrom-EwspMobileBootstrapJson $bootstrapJson).ApiBaseUrl 'https://calm-fog-123.trycloudflare.com' 'raw bootstrap schema accepts exactly one normalized apiBaseUrl'
+    Assert-Equal (ConvertFrom-EwspMobileBootstrapJson '{"apiBaseUrl":"https://safe.trycloudflare.com","token":"secret"}') $null 'raw bootstrap schema rejects additional secret-like fields'
+    Assert-Equal (ConvertFrom-EwspMobileBootstrapJson (Get-Content -Raw (Join-Path $localRoot 'public\mobile-bootstrap.json'))).ApiBaseUrl 'https://bootstrap-not-configured.trycloudflare.com' 'tracked bootstrap document conforms to the exact public contract'
+    Assert-ThrowsCategory { Assert-EwspGitHubBootstrapWritePermission 'protected-test-token' { param($uri,$token) [PSCustomObject]@{permissions=[PSCustomObject]@{push=$false}} } | Out-Null } 'MOBILE_BOOTSTRAP_CREDENTIAL_REQUIRED' 'insufficient GitHub contents permission stops at the protected credential boundary'
+
+    $rawAttempts = [PSCustomObject]@{ Count = 0 }
+    $rawRetryInvoker = {
+        param($uri)
+        $rawAttempts.Count++
+        if ($rawAttempts.Count -eq 1) { [PSCustomObject]@{ StatusCode=200; Content='{"apiBaseUrl":"https://old.trycloudflare.com"}' } }
+        else { [PSCustomObject]@{ StatusCode=200; Content='{"apiBaseUrl":"https://safe.trycloudflare.com"}' } }
+    }.GetNewClosure()
+    $rawVerified = Get-EwspMobileBootstrap 'https://safe.trycloudflare.com' 2 $rawRetryInvoker { param($milliseconds) }
+    Assert-Equal $rawVerified.Matches $true 'raw bootstrap verification retries until the exact expected endpoint is published'
+    Assert-Equal $rawAttempts.Count 2 'raw bootstrap verification uses bounded retry attempts'
+    $readyDiscovery = Get-EwspMobileDiscoveryStatus 'https://safe.trycloudflare.com' { param($uri) [PSCustomObject]@{StatusCode=200;Content='{"apiBaseUrl":"https://safe.trycloudflare.com"}'} }
+    Assert-Equal $readyDiscovery.State 'READY' 'tunnel status classifies matching tunnel and bootstrap as READY'
+    $staleDiscovery = Get-EwspMobileDiscoveryStatus 'https://new.trycloudflare.com' { param($uri) [PSCustomObject]@{StatusCode=200;Content='{"apiBaseUrl":"https://old.trycloudflare.com"}'} }
+    Assert-Equal $staleDiscovery.State 'STALE' 'tunnel status classifies a mismatched bootstrap as STALE'
+    $unavailableDiscovery = Get-EwspMobileDiscoveryStatus 'https://safe.trycloudflare.com' { param($uri) throw 'offline' }
+    Assert-Equal $unavailableDiscovery.State 'UNAVAILABLE' 'tunnel status classifies an unreadable bootstrap as UNAVAILABLE'
+
+    $publishRoot = Join-Path $testRoot 'bootstrap-publication'
+    New-Item -ItemType Directory -Path $publishRoot -Force | Out-Null
+    $publishCalls = New-Object Collections.Generic.List[string]
+    $publishGit = {
+        param($workingDirectory, $arguments)
+        $publishCalls.Add((@($arguments) -join ' ')) | Out-Null
+        if ($arguments[0] -eq 'clone') { New-Item -ItemType Directory -Path $arguments[-1] -Force | Out-Null }
+        if ($arguments[0] -eq 'diff') { return [PSCustomObject]@{ExitCode=0;Output=@('public/mobile-bootstrap.json')} }
+        [PSCustomObject]@{ExitCode=0;Output=@()}
+    }.GetNewClosure()
+    $permission = { param($uri,$token) [PSCustomObject]@{permissions=[PSCustomObject]@{push=$true}} }
+    $rawCurrent = { param($uri) [PSCustomObject]@{StatusCode=200;Content='{"apiBaseUrl":"https://safe.trycloudflare.com"}'} }
+    $published = Publish-EwspMobileBootstrap $localRoot 'https://safe.trycloudflare.com/' 'protected-test-token' $publishGit $permission $rawCurrent { param($milliseconds) } $publishRoot -LockHeld
+    Assert-Equal $published.ApiBaseUrl 'https://safe.trycloudflare.com' 'bootstrap publication retains a public origin without API suffix'
+    Assert-Equal @($publishCalls | Where-Object { $_ -eq 'add -- public/mobile-bootstrap.json' }).Count 1 'bootstrap publication stages only the intended file'
+    Assert-Equal @($publishCalls | Where-Object { $_ -match 'clone .*https://github.com/Mohammad-Hamadi/ewsp-local.git' }).Count 1 'bootstrap publication uses an isolated canonical checkout instead of checkout-relative state'
+    Assert-Equal @($publishCalls | Where-Object { $_ -match '^push .*HEAD:refs/heads/main$' }).Count 1 'bootstrap publication pushes only its isolated bootstrap commit'
+    Assert-NotContains ($publishCalls -join "`n") 'protected-test-token' 'Git publication never emits or places the protected token on a command line'
+
+    $dirtyCalls = New-Object Collections.Generic.List[string]
+    $dirtyGit = {
+        param($workingDirectory, $arguments)
+        $dirtyCalls.Add((@($arguments) -join ' ')) | Out-Null
+        if ($arguments[0] -eq 'clone') { New-Item -ItemType Directory -Path $arguments[-1] -Force | Out-Null }
+        if ($arguments[0] -eq 'status') { return [PSCustomObject]@{ExitCode=0;Output=@(' M README.md')} }
+        [PSCustomObject]@{ExitCode=0;Output=@()}
+    }.GetNewClosure()
+    $dirtyPublicationRoot = Join-Path $testRoot 'bootstrap-dirty'
+    Assert-ThrowsCategory { Publish-EwspMobileBootstrap $localRoot 'https://safe.trycloudflare.com' 'protected-test-token' $dirtyGit $permission $rawCurrent { } $dirtyPublicationRoot -LockHeld | Out-Null } 'MOBILE_BOOTSTRAP_PUBLICATION_FAILED' 'unexpected unrelated worktree changes fail bootstrap publication safely'
+    Assert-Equal @($dirtyCalls | Where-Object { $_ -match '^add ' }).Count 0 'dirty publication checkout is rejected before staging anything'
+
+    $failedPushGit = {
+        param($workingDirectory, $arguments)
+        if ($arguments[0] -eq 'clone') { New-Item -ItemType Directory -Path $arguments[-1] -Force | Out-Null }
+        if ($arguments[0] -eq 'diff') { return [PSCustomObject]@{ExitCode=0;Output=@('public/mobile-bootstrap.json')} }
+        if ($arguments[0] -eq 'push') { return [PSCustomObject]@{ExitCode=1;Output=@('remote rejected protected-test-token')} }
+        [PSCustomObject]@{ExitCode=0;Output=@()}
+    }
+    $pushFailureRoot = Join-Path $testRoot 'bootstrap-push-failure'
+    $pushFailureMessage = $null
+    try { Publish-EwspMobileBootstrap $localRoot 'https://safe.trycloudflare.com' 'protected-test-token' $failedPushGit $permission $rawCurrent { } $pushFailureRoot -LockHeld | Out-Null } catch { $pushFailureMessage=$_.Exception.Message }
+    Assert-Contains $pushFailureMessage 'MOBILE_BOOTSTRAP_PUBLICATION_FAILED' 'Git publication failure is classified without claiming mobile readiness'
+    Assert-NotContains $pushFailureMessage 'protected-test-token' 'Git publication failure does not emit secret values'
+
+    $publicationLock = Enter-EwspDeploymentLock
+    try {
+        Assert-ThrowsCategory { Publish-EwspMobileBootstrap $localRoot 'https://safe.trycloudflare.com' 'protected-test-token' $publishGit $permission $rawCurrent { } (Join-Path $testRoot 'bootstrap-locked') | Out-Null } 'DEPLOYMENT_LOCKED' 'concurrent bootstrap publication is rejected by the shared machine lock'
+    } finally { Exit-EwspDeploymentLock $publicationLock }
+
     $managedRoot = Join-Path $testRoot 'managed-tunnel'
     New-Item -ItemType Directory -Path (Join-Path $managedRoot '.tmp\k8s') -Force | Out-Null
     $managedStatePath = Join-Path $managedRoot '.tmp\k8s\quick-tunnel.json'
@@ -1452,8 +1531,16 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-NotContains $moduleText "Backend health failed after trusted-proxy configuration." 'one-shot post-rollout health classification is removed'
     $k8sUpFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspKubernetesUp \{.*?(?=function Invoke-EwspStop \{)').Value
     $tunnelStartFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspQuickTunnelStart \{.*?(?=function Invoke-EwspQuickTunnelStatus \{)').Value
+    $tunnelStopFunction = [regex]::Match($moduleText, '(?s)function Invoke-EwspQuickTunnelStop \{.*?(?=function Invoke-EwspQuickTunnelStart \{)').Value
     Assert-NotContains $k8sUpFunction 'Invoke-EwspKubernetesSeed' 'k8s-up never invokes local user seeding automatically'
     Assert-NotContains $tunnelStartFunction 'Invoke-EwspKubernetesSeed' 'tunnel-quick never invokes local user seeding automatically'
+    Assert-Contains $tunnelStartFunction 'Publish-EwspMobileBootstrap' 'tunnel-quick publishes bootstrap only within the verified tunnel lifecycle'
+    Assert-Contains $tunnelStartFunction 'if ($publicVerified)' 'bootstrap publication failure preserves an already verified healthy tunnel'
+    Assert-Contains $tunnelStartFunction 'Enter-EwspDeploymentLock' 'concurrent tunnel starts coordinate with deployment and publication operations'
+    Assert-NotContains $tunnelStopFunction 'Publish-EwspMobileBootstrap' 'tunnel-stop never publishes a blank, localhost, or invalid fallback'
+    Assert-Contains $tunnelStopFunction 'Enter-EwspDeploymentLock' 'tunnel-stop coordinates with deployment and tunnel activation operations'
+    Assert-Contains $moduleText 'MOBILE_DISCOVERY=$($discovery.State)' 'tunnel-status reports the mobile discovery state'
+    Assert-Contains (Get-Content -Raw (Join-Path $localRoot '.github\workflows\deploy.yml')) 'schedule:' 'bootstrap-only commits do not trigger application deployment reconciliation'
     Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'CONFIGURATION', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
     Assert-NotContains $k8sUpFunction 'New-EwspImagePlan' 'Kubernetes path does not use sibling source-aware image planning'
     Assert-NotContains $k8sUpFunction 'Invoke-EwspImageBuilds' 'Kubernetes path does not invoke local application builds'

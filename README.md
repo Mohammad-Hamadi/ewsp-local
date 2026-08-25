@@ -232,7 +232,7 @@ Run the explicit host setup in the stable `ewsp-local` checkout:
 `deploy-configure` preserves the repository's ignored `.env` and copies only
 approved static setting names into `%USERPROFILE%\.ewsp\deployment.env`.
 That user/SYSTEM-only file is outside Git and every Actions checkout. It holds
-the private Actions-read token, GHCR pull credential, local admin smoke-test
+the fine-grained GitHub token, GHCR pull credential, local admin smoke-test
 credential, dashboard port, and optional Cloudflare settings. Values are never
 printed or uploaded. The non-secret, recoverable
 `%USERPROFILE%\.ewsp\deployment-state.json` records the last desired/deployed
@@ -308,11 +308,31 @@ credentials or tokens.
 
 `tunnel-quick` requires the verified `docker-desktop` context, namespace `ewsp`, one Ready backend replica, exactly one Ready dashboard Pod, and the managed dashboard forward on `localhost:3000` (which it safely starts or reuses). It derives a literal trusted-proxy regex from the current dashboard Pod IPv4 address, temporarily sets backend forwarded-header handling to `NATIVE`, and allows only `http://localhost:3000` plus the exact generated Quick Tunnel origin. The random hostname and pre-run backend settings are recorded only under ignored `.tmp/` runtime state; no Pod IP or public hostname is written to tracked manifests.
 
-Startup verifies public `/`, `/complaints`, `/api/health`, WebSocket `/ws`, and a safe unauthenticated request larger than 1 MiB that must not receive the former Nginx `413` response. `tunnel-status` reports the installed `cloudflared` version/path, managed process and URL, dashboard forward, backend proxy mode/boundary, and backend/dashboard readiness without printing secrets.
+Startup verifies public `/`, `/complaints`, `/api/health`, WebSocket `/ws`, and a safe unauthenticated request larger than 1 MiB that must not receive the former Nginx `413` response. Only after all checks pass, it publishes `public/mobile-bootstrap.json` to GitHub in an isolated temporary checkout under the shared machine deployment lock. The stable, unauthenticated mobile URL is:
+
+```text
+https://raw.githubusercontent.com/Mohammad-Hamadi/ewsp-local/main/public/mobile-bootstrap.json
+```
+
+The exact Phase 1 contract is:
+
+```json
+{
+  "apiBaseUrl": "https://example.trycloudflare.com"
+}
+```
+
+`apiBaseUrl` is the normalized HTTPS public EWSP origin, without a trailing slash and without `/api`. Mobile requests therefore use `<apiBaseUrl>/api/mobile/version`, other `<apiBaseUrl>/api/...` routes, and the same-origin WebSocket path. The document is public and contains no authentication material. Native mobile code may fetch it directly.
+
+Bootstrap publication reuses `EWSP_GITHUB_READ_TOKEN` from the ACL-protected machine configuration. Despite the legacy setting name, it must be a fine-grained token whose grants include `ewsp-local` with **Contents: read/write**; retain only the existing read grants needed for private backend/dashboard Actions discovery. The token is never written to Git configuration or passed on a command line. Publication clones only `ewsp-local/main`, stages only `public/mobile-bootstrap.json`, creates the concise bootstrap commit, pushes it, then verifies the stable raw response with bounded retries. The isolated checkout means dirty stable and Actions checkouts are neither staged nor overwritten. The ewsp-local deploy workflow has no push trigger, so a bootstrap-only commit does not rebuild or redeploy application images.
+
+If a healthy Quick Tunnel already exists, rerunning `tunnel-quick` performs the complete public verification and reconciles the bootstrap without restarting the tunnel. If GitHub permission, push, or raw verification fails after public verification, `tunnel-quick` fails closed for mobile readiness and leaves the healthy tunnel running; it reports the tunnel URL and `MOBILE_DISCOVERY=UNAVAILABLE` without claiming discovery is ready.
+
+`tunnel-status` reports the installed `cloudflared` version/path, managed process and URL, stable bootstrap URL, published `apiBaseUrl`, whether it matches the active tunnel, `MOBILE_DISCOVERY=READY|STALE|UNAVAILABLE`, dashboard forward, backend proxy mode/boundary, and backend/dashboard readiness without printing secrets.
 
 The current production application exposes no safe request diagnostic for backend `getRemoteAddr`, resolved scheme, or `isSecure`, and its ordinary logs do not contain those fields. The workflow therefore reports that empirical limitation instead of adding a public diagnostic endpoint or claiming forged `X-Forwarded-For` normalization was observed. Dashboard access logs can establish the local cloudflared-to-Nginx TCP peer (`127.0.0.1`); exact Cloudflare header and visitor IPv4/IPv6 observations require bounded test instrumentation in the application repository and are deliberately not implemented here.
 
-`tunnel-stop` validates the recorded process identity before stopping it, so unrelated `cloudflared` processes are never killed. It restores the exact pre-run backend environment overrides (therefore returning to the normal ConfigMap/application defaults such as forwarded-header strategy `NONE` and local CORS origin), waits for backend readiness, removes Quick Tunnel runtime files, and leaves all Kubernetes workloads, PVCs, Services, and the dashboard port-forward running.
+`tunnel-stop` validates the recorded process identity before stopping it, so unrelated `cloudflared` processes are never killed. It restores the exact pre-run backend environment overrides (therefore returning to the normal ConfigMap/application defaults such as forwarded-header strategy `NONE` and local CORS origin), waits for backend readiness, removes Quick Tunnel runtime files, and leaves all Kubernetes workloads, PVCs, Services, and the dashboard port-forward running. It never publishes an empty URL, localhost, or another fallback. The last valid bootstrap remains advertised: bootstrap discovery provides the last/current public endpoint, not a guarantee that the PC or tunnel is currently online.
 
 If `cloudflared` is unavailable, install it explicitly (on Windows, `winget install --id Cloudflare.cloudflared`), open a new PowerShell, and verify `cloudflared --version`; the orchestration never installs it silently. Quick Tunnel process logs are bounded in diagnostics and remain under ignored `.tmp/k8s/` only while needed for the managed lifecycle.
 
