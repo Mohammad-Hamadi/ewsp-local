@@ -1390,6 +1390,36 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     $stateObject = [PSCustomObject]@{Status='ALREADY_CURRENT';DesiredBackendSha=$backendApprovedSha;DesiredDashboardSha=$dashboardApprovedSha;Trigger='test'}
     Write-EwspDeploymentState $stateObject $machineProfile | Out-Null
     Assert-Equal (Read-EwspDeploymentState $machineProfile).Status 'ALREADY_CURRENT' 'non-secret deployment state survives process restart'
+    $imageConfigurationRoot = Join-Path $testRoot 'image-configuration'
+    New-Item -ItemType Directory -Path $imageConfigurationRoot -Force | Out-Null
+    $staleBackendSha = '1' * 40
+    $staleDashboardSha = '2' * 40
+    Set-Content -LiteralPath (Join-Path $imageConfigurationRoot '.env') -Value @(
+        "EWSP_BACKEND_IMAGE=ghcr.io/mohammad-hamadi/ewsp-backend:$staleBackendSha",
+        "EWSP_DASHBOARD_IMAGE=ghcr.io/mohammad-hamadi/ewsp-dashboard:$staleDashboardSha",
+        'GHCR_USERNAME=test-user',
+        'GHCR_TOKEN=opaque-test-token'
+    )
+    $successfulState = [PSCustomObject]@{
+        Status='RECONCILIATION_SUCCEEDED'
+        DesiredBackendSha=$backendApprovedSha; DeployedBackendSha=$backendApprovedSha
+        DesiredDashboardSha=$dashboardApprovedSha; DeployedDashboardSha=$dashboardApprovedSha
+    }
+    Write-EwspDeploymentState $successfulState $machineProfile | Out-Null
+    $resolvedImages = Resolve-EwspKubernetesImageConfiguration $imageConfigurationRoot $machineProfile
+    Assert-Equal $resolvedImages.ImageSource 'last successful automatic deployment' 'successful automatic deployment state is the Kubernetes image authority'
+    Assert-Equal $resolvedImages.EnvironmentValues.EWSP_BACKEND_IMAGE "ghcr.io/mohammad-hamadi/ewsp-backend:$backendApprovedSha" 'stale checkout backend ref cannot downgrade an automatically deployed image'
+    Assert-Equal $resolvedImages.EnvironmentValues.EWSP_DASHBOARD_IMAGE "ghcr.io/mohammad-hamadi/ewsp-dashboard:$dashboardApprovedSha" 'successful deployment state resolves both application images atomically'
+    Assert-Equal $resolvedImages.EnvironmentValues.GHCR_TOKEN 'opaque-test-token' 'image authority change preserves protected local credential sourcing'
+    $incompleteState = [PSCustomObject]@{
+        Status='RECONCILIATION_SUCCEEDED'
+        DesiredBackendSha=$backendApprovedSha; DeployedBackendSha=$staleBackendSha
+        DesiredDashboardSha=$dashboardApprovedSha; DeployedDashboardSha=$dashboardApprovedSha
+    }
+    Write-EwspDeploymentState $incompleteState $machineProfile | Out-Null
+    $fallbackImages = Resolve-EwspKubernetesImageConfiguration $imageConfigurationRoot $machineProfile
+    Assert-Equal $fallbackImages.ImageSource 'local environment' 'incomplete or divergent deployment state is never trusted as image authority'
+    Assert-Equal $fallbackImages.EnvironmentValues.EWSP_BACKEND_IMAGE "ghcr.io/mohammad-hamadi/ewsp-backend:$staleBackendSha" 'invalid deployment state falls back to validated local immutable refs'
     Set-Content -LiteralPath $machinePaths.State -Value '{broken'
     $malformedStateOutput = (& { $script:malformedState = Read-EwspDeploymentState $machineProfile } 3>&1 | Out-String)
     Assert-Equal $script:malformedState $null 'malformed deployment state is ignored because it is not authoritative'
@@ -1574,6 +1604,8 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-Contains $moduleText 'MOBILE_DISCOVERY=$($discovery.State)' 'tunnel-status reports the mobile discovery state'
     Assert-Contains (Get-Content -Raw (Join-Path $localRoot '.github\workflows\deploy.yml')) 'schedule:' 'bootstrap-only commits do not trigger application deployment reconciliation'
     Assert-Contains $moduleText "'K8S_ENVIRONMENT', 'CONFIGURATION', 'IMAGE_RESOLUTION', 'SECRET_PREPARATION'" 'k8s-up declares structured phases'
+    Assert-Contains $k8sUpFunction 'Resolve-EwspKubernetesImageConfiguration' 'k8s-up prevents stale checkout image refs from overriding successful automatic deployment state'
+    Assert-Contains $moduleText 'Configured image source:' 'k8s-status identifies the authority used for configured application images'
     Assert-NotContains $k8sUpFunction 'New-EwspImagePlan' 'Kubernetes path does not use sibling source-aware image planning'
     Assert-NotContains $k8sUpFunction 'Invoke-EwspImageBuilds' 'Kubernetes path does not invoke local application builds'
     Assert-Contains $k8sUpFunction 'New-EwspKubernetesRenderedManifests' 'k8s-up reconciles the backend ConfigMap fingerprint through rendered manifests'

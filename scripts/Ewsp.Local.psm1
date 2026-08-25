@@ -4402,9 +4402,11 @@ function Show-EwspKubernetesStatusSnapshot {
     $snapshots = @(Get-EwspKubernetesWorkloadSnapshot $CommandRunner)
     $configuredImages = @{}
     try {
-        $configuredGhcr = Get-EwspGhcrConfiguration (Get-EwspEffectiveEnvironmentValues $LocalRoot)
+        $imageConfiguration = Resolve-EwspKubernetesImageConfiguration $LocalRoot
+        $configuredGhcr = Get-EwspGhcrConfiguration $imageConfiguration.EnvironmentValues
         $configuredImages['backend'] = $configuredGhcr.BackendImage
         $configuredImages['dashboard'] = $configuredGhcr.DashboardImage
+        Write-Host "Configured image source: $($imageConfiguration.ImageSource)"
     } catch {
         Write-Host "Configured GHCR images: invalid or missing ($($_.Exception.Data['Category']))" -ForegroundColor Yellow
     }
@@ -4525,7 +4527,7 @@ function Invoke-EwspKubernetesUp {
     )
     $completed = New-Object System.Collections.Generic.List[string]
     $context = @{
-        Environment = $null; Configuration = $null; EnvironmentValues = $null; Ports = $null
+        Environment = $null; Configuration = $null; EnvironmentValues = $null; ImageConfiguration = $null; Ports = $null
         Ghcr = $null; ImagePlan = $null; SecretPath = $null; GhcrSecretPath = $null; CloudflareSecretPath = $null; Rendered = $null
         ApplyPlan = $null; States = $null; PortForward = $null; DashboardPort = $null
         OldBackendImage = $null; OldDashboardImage = $null; PermanentTunnel = $null; PodCidrBoundary = $null
@@ -4543,11 +4545,12 @@ function Invoke-EwspKubernetesUp {
         if (-not (Test-Path -LiteralPath (Join-Path $LocalRoot '.env') -PathType Leaf)) {
             throw '.env is missing. Run .\ewsp.ps1 setup first; no Kubernetes resources were changed.'
         }
-        $context.EnvironmentValues = Get-EwspEffectiveEnvironmentValues $LocalRoot
+        $context.ImageConfiguration = Resolve-EwspKubernetesImageConfiguration $LocalRoot
+        $context.EnvironmentValues = $context.ImageConfiguration.EnvironmentValues
         $context.PermanentTunnel = Get-EwspPermanentTunnelConfiguration $context.EnvironmentValues
         $context.Ports = @(Assert-EwspEnvironmentConfiguration $context.EnvironmentValues)
         $context.Ghcr = Get-EwspGhcrConfiguration $context.EnvironmentValues -RequireCredentials
-        Write-Host '      immutable GHCR image refs and local pull credential setting names validated; credential values hidden'
+        Write-Host "      immutable GHCR image refs sourced from $($context.ImageConfiguration.ImageSource); local pull credential setting names validated; credential values hidden"
     } $completed $phaseNames[2..($total - 1)] $context.Environment 'Validate .env, immutable GHCR refs, and credential setting names' 'GHCR deployment configuration' -WorkflowName 'k8s-up' | Out-Null
 
     Invoke-EwspUpPhase 3 $total $phaseNames[2] 'Resolving immutable application images' {
@@ -4844,6 +4847,41 @@ function Read-EwspDeploymentState {
         Write-Warning 'Machine-local deployment-state.json is malformed and will be ignored; GitHub and Kubernetes remain authoritative.'
         $null
     }
+}
+
+function Resolve-EwspKubernetesImageConfiguration {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [string]$UserProfile = $env:USERPROFILE
+    )
+    $values = Get-EwspEffectiveEnvironmentValues $LocalRoot
+    $source = 'local environment'
+    $state = Read-EwspDeploymentState $UserProfile
+    $successfulStatuses = @('ALREADY_CURRENT', 'RECONCILIATION_SUCCEEDED')
+    $definitions = @(
+        @{ Setting='EWSP_BACKEND_IMAGE'; Repository='ghcr.io/mohammad-hamadi/ewsp-backend'; Desired='DesiredBackendSha'; Deployed='DeployedBackendSha' },
+        @{ Setting='EWSP_DASHBOARD_IMAGE'; Repository='ghcr.io/mohammad-hamadi/ewsp-dashboard'; Desired='DesiredDashboardSha'; Deployed='DeployedDashboardSha' }
+    )
+    $stateImages = @{}
+    $stateIsComplete = $null -ne $state -and $state.Status -in $successfulStatuses
+    if ($stateIsComplete) {
+        foreach ($definition in $definitions) {
+            $desiredProperty = $state.PSObject.Properties[$definition.Desired]
+            $deployedProperty = $state.PSObject.Properties[$definition.Deployed]
+            $desired = if ($desiredProperty) { ([string]$desiredProperty.Value).Trim().ToLowerInvariant() } else { '' }
+            $deployed = if ($deployedProperty) { ([string]$deployedProperty.Value).Trim().ToLowerInvariant() } else { '' }
+            if ($desired -notmatch '^[0-9a-f]{40}$' -or $deployed -cne $desired) {
+                $stateIsComplete = $false
+                break
+            }
+            $stateImages[$definition.Setting] = "$($definition.Repository):$desired"
+        }
+    }
+    if ($stateIsComplete) {
+        foreach ($setting in $stateImages.Keys) { $values[$setting] = $stateImages[$setting] }
+        $source = 'last successful automatic deployment'
+    }
+    [PSCustomObject]@{ EnvironmentValues=$values; ImageSource=$source; DeploymentState=$state }
 }
 
 function Write-EwspDeploymentState {
@@ -5601,6 +5639,7 @@ Export-ModuleMember -Function @(
     'Get-EwspKubernetesEnvironment',
     'Assert-EwspKubernetesEnvironment',
     'Get-EwspGhcrConfiguration',
+    'Resolve-EwspKubernetesImageConfiguration',
     'New-EwspKubernetesSecretArtifact',
     'Remove-EwspKubernetesSecretArtifact',
     'New-EwspGhcrPullSecretArtifact',

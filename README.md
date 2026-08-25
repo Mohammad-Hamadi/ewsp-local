@@ -241,8 +241,15 @@ credential, dashboard port, and optional Cloudflare settings. Values are never
 printed or uploaded. The non-secret, recoverable
 `%USERPROFILE%\.ewsp\deployment-state.json` records the last desired/deployed
 SHAs, digests, timestamps, result, trigger, changed components, and PVC UIDs.
-GitHub and Kubernetes remain authoritative if this state file is deleted or
-malformed.
+After a successful automatic deployment, `k8s-up` and `k8s-status` use its
+matching desired/deployed application SHAs instead of older image refs in the
+ignored checkout `.env`. This prevents a later local reconciliation from
+downgrading an automatically deployed immutable artifact. Credentials and all
+other local settings still come from `.env`. If the state file is absent,
+malformed, incomplete, failed, or does not record matching desired/deployed
+SHAs for both applications, Kubernetes startup falls back to the validated
+immutable refs in `.env`; GitHub and Kubernetes remain the recoverable sources
+of desired and running truth.
 
 The same protected directory contains non-secret machine ownership metadata
 for the long-lived dashboard forward plus a narrow process/state lock. This
