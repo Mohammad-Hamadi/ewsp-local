@@ -156,7 +156,7 @@ Dashboard port-forward ownership is machine-global at `%USERPROFILE%\.ewsp\dashb
 
 Kubernetes never builds the backend or dashboard locally. It requires `EWSP_BACKEND_IMAGE` and `EWSP_DASHBOARD_IMAGE` in ignored `.env`; each must use its expected `ghcr.io/mohammad-hamadi/...` repository and a full 40-character Git SHA tag. `main`, `latest`, malformed refs, and wrong repositories are refused rather than rewritten. Checked-in placeholders remain environment-independent while the exact refs are rendered under ignored `.tmp/k8s/rendered/` files with `imagePullPolicy: IfNotPresent`.
 
-Public mobile release metadata lives declaratively in `k8s/backend/configmap.yaml` and reaches the backend through its existing `backend-config` `envFrom` reference. The current values are version `1.0.1`, version code `2`, and `https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.1/ewsp-1.0.1.apk`. These values are deliberately not stored in a Secret or protected `deployment.env`.
+Public mobile release metadata lives declaratively in `k8s/backend/configmap.yaml` and reaches the backend through its existing `backend-config` `envFrom` reference. The current values are version `1.0.2`, version code `3`, and `https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.2/ewsp-1.0.2.apk`. These values are deliberately not stored in a Secret or protected `deployment.env`.
 
 The rendered backend Pod template carries a semantic fingerprint of all backend ConfigMap data. Changing the three values and running `.\ewsp.ps1 k8s-up` therefore performs a short `Recreate` backend rollout that loads the new process environment without rebuilding an application image or changing PostgreSQL, Redis, MinIO, PVs, or PVCs. For a later release, update the three ConfigMap values, matching Compose defaults, and `.env.example`; run `.\ewsp.ps1 k8s-up`; verify the public version endpoint; then commit the declarative change. The image-only `deploy` and startup reconciliation paths remain unchanged.
 
@@ -438,7 +438,7 @@ The current mobile repository targets modern Android versions, which may block c
 
 The PowerShell entry point is the normal workflow because it resolves application image tags and the supported Compose invocation safely. `up` prints whether it selected `docker compose` or `docker-compose`. Direct commands remain useful for logs and troubleshooting; pass `-f compose.yml` explicitly for portability between implementations. A direct build/start uses the fallback `ewsp-backend:local` and `ewsp-dashboard:local` tags rather than the source-aware tags selected by `ewsp.ps1`.
 
-Compose passes the same three mobile release values to the backend. Each has the current v1.0.1 default, so ordinary local development does not depend on an ignored `.env` update. Operators may override the values in ignored `.env` when testing later metadata; rebuilding the backend image is unnecessary, but the backend container must be recreated through `.\ewsp.ps1 start` or `.\ewsp.ps1 up` to receive changed environment values.
+Compose passes the same three mobile release values to the backend. Each has the current v1.0.2 default, so ordinary local development does not depend on an ignored `.env` update. Operators may override the values in ignored `.env` when testing later metadata; rebuilding the backend image is unnecessary, but the backend container must be recreated through `.\ewsp.ps1 start` or `.\ewsp.ps1 up` to receive changed environment values.
 
 Common failures:
 

@@ -32,9 +32,9 @@ creates that Secret from ignored local credentials and never builds this image.
 mobile version endpoint through the Deployment's existing `envFrom` reference:
 
 ```text
-EWSP_MOBILE_LATEST_VERSION=1.0.1
-EWSP_MOBILE_LATEST_VERSION_CODE=2
-EWSP_MOBILE_UPDATE_URL=https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.1/ewsp-1.0.1.apk
+EWSP_MOBILE_LATEST_VERSION=1.0.2
+EWSP_MOBILE_LATEST_VERSION_CODE=3
+EWSP_MOBILE_UPDATE_URL=https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.2/ewsp-1.0.2.apk
 ```
 
 They are release metadata, not credentials, and therefore remain in the
