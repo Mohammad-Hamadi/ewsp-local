@@ -428,9 +428,9 @@ try {
     Assert-NotContains $composeConfiguration 'network_mode:' 'dashboard and backend remain on the shared Compose default network'
     Assert-Contains $composeConfiguration 'command: ["redis-server", "--save", "", "--appendonly", "no"]' 'Redis persistence is explicitly disabled'
     Assert-Contains $composeConfiguration 'type: tmpfs' 'Redis image data path is replaced with tmpfs'
-    Assert-Contains $composeConfiguration 'EWSP_MOBILE_LATEST_VERSION: ${EWSP_MOBILE_LATEST_VERSION:-1.0.0}' 'Compose backend receives the current mobile version with a development-safe default'
-    Assert-Contains $composeConfiguration 'EWSP_MOBILE_LATEST_VERSION_CODE: ${EWSP_MOBILE_LATEST_VERSION_CODE:-1}' 'Compose backend receives mobile version code 1'
-    Assert-Contains $composeConfiguration 'EWSP_MOBILE_UPDATE_URL: ${EWSP_MOBILE_UPDATE_URL:-https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk}' 'Compose backend receives the exact HTTPS mobile update URL'
+    Assert-Contains $composeConfiguration 'EWSP_MOBILE_LATEST_VERSION: ${EWSP_MOBILE_LATEST_VERSION:-1.0.1}' 'Compose backend receives the current mobile version with a development-safe default'
+    Assert-Contains $composeConfiguration 'EWSP_MOBILE_LATEST_VERSION_CODE: ${EWSP_MOBILE_LATEST_VERSION_CODE:-2}' 'Compose backend receives mobile version code 2'
+    Assert-Contains $composeConfiguration 'EWSP_MOBILE_UPDATE_URL: ${EWSP_MOBILE_UPDATE_URL:-https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.1/ewsp-1.0.1.apk}' 'Compose backend receives the exact HTTPS mobile update URL'
     $environmentExample = Get-Content -Raw -LiteralPath (Join-Path $localRoot '.env.example')
     Assert-NotContains $environmentExample 'VITE_API_BASE_URL' 'environment example removes obsolete dashboard API build configuration'
     Assert-NotContains $environmentExample 'VITE_WS_URL' 'environment example removes obsolete dashboard WebSocket build configuration'
@@ -718,9 +718,9 @@ try {
 
     $backendConfigText = Get-Content -Raw (Join-Path $localRoot 'k8s\backend\configmap.yaml')
     $backendDeploymentText = Get-Content -Raw (Join-Path $localRoot 'k8s\backend\deployment.yaml')
-    $exactMobileUrl = 'https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk'
-    Assert-Contains $backendConfigText 'EWSP_MOBILE_LATEST_VERSION: 1.0.0' 'backend ConfigMap contains exact mobile version 1.0.0'
-    Assert-Contains $backendConfigText 'EWSP_MOBILE_LATEST_VERSION_CODE: "1"' 'backend ConfigMap contains exact mobile version code 1'
+    $exactMobileUrl = 'https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.1/ewsp-1.0.1.apk'
+    Assert-Contains $backendConfigText 'EWSP_MOBILE_LATEST_VERSION: 1.0.1' 'backend ConfigMap contains exact mobile version 1.0.1'
+    Assert-Contains $backendConfigText 'EWSP_MOBILE_LATEST_VERSION_CODE: "2"' 'backend ConfigMap contains exact mobile version code 2'
     Assert-Contains $backendConfigText "EWSP_MOBILE_UPDATE_URL: $exactMobileUrl" 'backend ConfigMap contains exact mobile update URL'
     Assert-Equal ([Uri]$exactMobileUrl).Scheme 'https' 'mobile update URL uses HTTPS'
     Assert-Contains $backendDeploymentText 'name: backend-config' 'backend Pod consumes non-secret mobile metadata through the existing ConfigMap envFrom'
@@ -730,8 +730,8 @@ try {
     Assert-NotContains $secretText 'EWSP_MOBILE_' 'mobile release metadata is absent from the Kubernetes Secret artifact'
     Assert-Equal ([regex]::Matches(($backendConfigText + $backendDeploymentText + $composeConfiguration), '(?i)minimum[_A-Z]*supported|force[_A-Z]*update|optional[_A-Z]*update').Count) 0 'mobile runtime configuration has no minimum, force, or optional update flag'
     $envExampleText = Get-Content -Raw (Join-Path $localRoot '.env.example')
-    Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION=1.0.0' 'local environment example documents mobile version 1.0.0'
-    Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION_CODE=1' 'local environment example documents mobile version code 1'
+    Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION=1.0.1' 'local environment example documents mobile version 1.0.1'
+    Assert-Contains $envExampleText 'EWSP_MOBILE_LATEST_VERSION_CODE=2' 'local environment example documents mobile version code 2'
     Assert-Contains $envExampleText "EWSP_MOBILE_UPDATE_URL=$exactMobileUrl" 'local environment example documents the exact mobile update URL'
     Assert-NotContains (Get-Content -Raw (Join-Path $localRoot 'config\deployment.env.example')) 'EWSP_MOBILE_' 'public mobile metadata is not placed in protected deployment credentials'
     $deploymentExampleText = Get-Content -Raw (Join-Path $localRoot 'config\deployment.env.example')
@@ -741,7 +741,7 @@ try {
     $fingerprintFixture = Join-Path $testRoot 'backend-config-fingerprint.yaml'
     Set-Content -LiteralPath $fingerprintFixture -Value $backendConfigText -NoNewline
     $fingerprintV1 = Get-EwspBackendConfigFingerprint $fingerprintFixture
-    Set-Content -LiteralPath $fingerprintFixture -Value ($backendConfigText.Replace('EWSP_MOBILE_LATEST_VERSION_CODE: "1"','EWSP_MOBILE_LATEST_VERSION_CODE: "2"')) -NoNewline
+    Set-Content -LiteralPath $fingerprintFixture -Value ($backendConfigText.Replace('EWSP_MOBILE_LATEST_VERSION_CODE: "2"','EWSP_MOBILE_LATEST_VERSION_CODE: "3"')) -NoNewline
     $fingerprintV2 = Get-EwspBackendConfigFingerprint $fingerprintFixture
     Assert-Equal ($fingerprintV1 -ne $fingerprintV2) $true 'mobile metadata mutation changes the backend configuration fingerprint'
     Assert-Equal $fingerprintV1.Length 64 'backend configuration fingerprint is a SHA-256 value'

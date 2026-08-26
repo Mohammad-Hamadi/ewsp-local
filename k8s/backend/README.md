@@ -32,9 +32,9 @@ creates that Secret from ignored local credentials and never builds this image.
 mobile version endpoint through the Deployment's existing `envFrom` reference:
 
 ```text
-EWSP_MOBILE_LATEST_VERSION=1.0.0
-EWSP_MOBILE_LATEST_VERSION_CODE=1
-EWSP_MOBILE_UPDATE_URL=https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.0/ewsp-1.0.0.apk
+EWSP_MOBILE_LATEST_VERSION=1.0.1
+EWSP_MOBILE_LATEST_VERSION_CODE=2
+EWSP_MOBILE_UPDATE_URL=https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.1/ewsp-1.0.1.apk
 ```
 
 They are release metadata, not credentials, and therefore remain in the
@@ -44,9 +44,8 @@ change therefore causes the existing `Recreate` Deployment to replace the
 backend Pod so its process receives the new environment. It does not rebuild
 the backend image or mutate PostgreSQL, Redis, MinIO, PVs, or PVCs.
 
-For a future release, update only these three ConfigMap values (for example,
-version `1.0.1`, code `2`, and the matching GitHub Release APK URL), update the
-same Compose defaults and `.env.example`, then run:
+For a future release, update only these three ConfigMap values, update the same
+Compose defaults and `.env.example`, then run:
 
 ```powershell
 .\ewsp.ps1 k8s-up
