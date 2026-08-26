@@ -4959,7 +4959,9 @@ function Invoke-EwspGitHubApi {
             'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'EWSP-CD-Reconciler'
         }
     } catch {
-        throw (New-EwspKubernetesException 'GitHub Actions artifact discovery is unavailable or unauthorized. Credentials and response content were withheld.' 'GITHUB_API_UNAVAILABLE' 'Desired artifact discovery' 'Query GitHub Actions workflow runs')
+        $status = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+        $category = if ($status -in @(401,403)) { 'GITHUB_AUTH_FAILED' } else { 'GITHUB_API_UNAVAILABLE' }
+        throw (New-EwspKubernetesException 'GitHub Actions artifact discovery failed. Credentials and response content were withheld.' $category 'Desired artifact discovery' 'Query GitHub Actions workflow runs')
     }
 }
 
@@ -5166,6 +5168,54 @@ function Get-EwspDeploymentTriggerSource {
     'manual'
 }
 
+function Invoke-EwspBoundedDeploymentReconciliation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRoot,
+        [int[]]$Delays = @(0, 15, 30, 60, 120, 180),
+        [scriptblock]$CommandRunner,
+        [scriptblock]$SleepAction
+    )
+
+    $resolvedRoot = [IO.Path]::GetFullPath($LocalRoot)
+    $entryPoint = Join-Path $resolvedRoot 'ewsp.ps1'
+    if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
+        return [PSCustomObject]@{ Result='REAL_DEPLOYMENT_FAILURE'; ExitCode=2; Category='ENTRY_POINT_MISSING'; Attempts=0 }
+    }
+    if ($Delays.Count -eq 0 -or $Delays.Count -gt 10 -or @($Delays | Where-Object { $_ -lt 0 -or $_ -gt 300 }).Count -gt 0 -or ($Delays | Measure-Object -Sum).Sum -gt 900) {
+        throw 'Bounded deployment reconciliation delays must contain 1-10 non-negative values, each at most 300 seconds and totaling at most 900 seconds.'
+    }
+    if (-not $CommandRunner) {
+        $CommandRunner = {
+            param($filePath, $arguments, $workingDirectory)
+            Invoke-EwspNative $filePath $arguments $workingDirectory
+        }
+    }
+    if (-not $SleepAction) { $SleepAction = { param($seconds) Start-Sleep -Seconds $seconds } }
+
+    $lastCategory = 'TEMPORARY_HOST_NOT_READY'
+    for ($attempt = 1; $attempt -le $Delays.Count; $attempt++) {
+        $delay = $Delays[$attempt - 1]
+        if ($delay -gt 0) { & $SleepAction $delay }
+        Write-Host "EWSP bounded reconciliation attempt $attempt/$($Delays.Count)"
+        $child = & $CommandRunner 'powershell.exe' @('-NoProfile', '-File', $entryPoint, 'deploy') $resolvedRoot
+        $safeOutput = @($child.Output | ForEach-Object { [string]$_ })
+        foreach ($line in $safeOutput) { Write-Host $line }
+        if ([int]$child.ExitCode -eq 0) {
+            return [PSCustomObject]@{ Result='RECONCILIATION_SUCCEEDED'; ExitCode=0; Category=$null; Attempts=$attempt }
+        }
+
+        $deferred = @($safeOutput | Select-String -Pattern 'EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED(?:\s+category=(?<category>[A-Z0-9_]+))?' | Select-Object -Last 1)
+        if ($deferred.Count -eq 0) {
+            return [PSCustomObject]@{ Result='REAL_DEPLOYMENT_FAILURE'; ExitCode=[int]$child.ExitCode; Category='REAL_DEPLOYMENT_FAILURE'; Attempts=$attempt }
+        }
+        if ($deferred[0].Matches[0].Groups['category'].Success) { $lastCategory = $deferred[0].Matches[0].Groups['category'].Value }
+        Write-Host "TEMPORARY_HOST_NOT_READY category=$lastCategory; bounded retry remains." -ForegroundColor Yellow
+    }
+
+    [PSCustomObject]@{ Result='TEMPORARY_HOST_NOT_READY'; ExitCode=75; Category=$lastCategory; Attempts=$Delays.Count }
+}
+
 function Invoke-EwspDeploy {
     param([Parameter(Mandatory = $true)][string]$LocalRoot)
     $lock = $null
@@ -5190,7 +5240,7 @@ function Invoke-EwspDeploy {
             if (-not $environment.Kubernetes.NamespaceExists) { throw (New-EwspKubernetesException 'The ewsp namespace is unavailable.' 'KUBERNETES_API_UNREACHABLE' 'Kubernetes namespace' 'kubectl get namespace ewsp') }
         } catch {
             $category = if ($_.Exception.Data.Contains('Category')) { [string]$_.Exception.Data['Category'] } else { 'KUBERNETES_API_UNREACHABLE' }
-            if ($category -in @('KUBECTL_MISSING','KUBERNETES_API_UNREACHABLE','KUBERNETES_NODE_NOT_READY','KUBERNETES_STORAGE_UNAVAILABLE','DOCKER_ENGINE_UNREACHABLE')) {
+            if ($category -in @('KUBERNETES_API_UNREACHABLE','KUBERNETES_NODE_NOT_READY','DOCKER_ENGINE_UNREACHABLE')) {
                 $state.Status='DEPLOYMENT_DEFERRED'; $state.FailureCategory=$category; Write-EwspDeploymentState ([PSCustomObject]$state) | Out-Null
                 Write-Host "EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=$category" -ForegroundColor Yellow
             }
@@ -5328,7 +5378,10 @@ function Invoke-EwspRunnerSetup {
     $registration = Get-EwspRunnerRegistration
     $paths = Get-EwspDeploymentMachinePaths
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $runnerAction = New-ScheduledTaskAction -Execute 'C:\Windows\System32\cmd.exe' -Argument '/d /c ""C:\actions-runner\run.cmd""' -WorkingDirectory $registration.Root
+    $runnerBootstrap = Join-Path $LocalRoot 'scripts\Invoke-EwspRunner.ps1'
+    if (-not (Test-Path -LiteralPath $runnerBootstrap -PathType Leaf)) { throw "Runner bootstrap script is missing: $runnerBootstrap" }
+    $quotedRunnerBootstrap = '"' + $runnerBootstrap.Replace('"','""') + '"'
+    $runnerAction = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File $quotedRunnerBootstrap" -WorkingDirectory $registration.Root
     $runnerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3) -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
@@ -5660,6 +5713,7 @@ Export-ModuleMember -Function @(
     'Assert-EwspArtifactRunning',
     'Get-EwspDeploymentChangePlan',
     'Resolve-EwspRollbackAction',
+    'Invoke-EwspBoundedDeploymentReconciliation',
     'Invoke-EwspDeploy',
     'Get-EwspRunnerRegistration',
     'Invoke-EwspRunnerSetup',

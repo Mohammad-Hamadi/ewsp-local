@@ -270,8 +270,9 @@ validated `kubectl` process without trusting a PID alone or starting duplicates.
 service. It creates two passwordless, current-user, run-only-when-logged-on
 Scheduled Tasks:
 
-- `EWSP GitHub Actions Runner` starts `C:\actions-runner\run.cmd` at logon,
-  uses `C:\actions-runner` as its working directory, ignores duplicate task
+- `EWSP GitHub Actions Runner` starts Docker Desktop when it is not already
+  running, then starts `C:\actions-runner\run.cmd` at logon. It uses
+  `C:\actions-runner` as its working directory, ignores duplicate task
   instances, and has bounded restart settings.
 - `EWSP Startup Reconciliation` starts two minutes after logon and runs the
   stable checkout's bounded reconciliation script. It retries Docker Desktop,
@@ -284,17 +285,24 @@ router or Kubernetes API port and does not require Cloudflare.
 
 `.github/workflows/deploy.yml` runs on `[self-hosted, Windows, X64]` for manual,
 application-signal, and twice-hourly catch-up events. A GitHub concurrency
-group prevents overlapping workflow mutations. The workflow always calls
-`.\ewsp.ps1 deploy` and resolves desired state at execution time, so stale
-events converge to the newest approved artifacts. A machine-local exclusive
-lock also prevents overlap with logon reconciliation.
+group permits at most one running and one pending reconciliation, replaces an
+older pending run with the newest event, and never cancels an active deployment
+mid-mutation. Every accepted job uses the same bounded readiness reconciliation
+as the logon task, and each attempt calls `.\ewsp.ps1 deploy` to resolve desired
+state at execution time. Stale events therefore converge to the newest approved
+artifacts. A machine-local exclusive lock also prevents overlap with logon
+reconciliation.
 
 If the PC is offline briefly, GitHub may retain the queued job. Jobs queued for
 a self-hosted runner expire after GitHub's queue limit, so long-outage recovery
 does not depend on that event: the logon task and recurring workflow rediscover
-current approved artifacts. Temporary startup unavailability is reported as
-`DEPLOYMENT_DEFERRED`; a current cluster reports `ALREADY_CURRENT`; successful
-replacement reports `RECONCILIATION_SUCCEEDED`.
+current approved artifacts. Temporary Docker Engine, Kubernetes API, or node
+startup unavailability receives finite backoff and is reported as
+`TEMPORARY_HOST_NOT_READY` if the deadline expires without becoming a noisy
+GitHub hard failure. Missing tools, unsafe context/storage, invalid
+configuration, authentication failure, and deployment failure stop immediately.
+A current cluster reports `ALREADY_CURRENT`; successful replacement reports
+`RECONCILIATION_SUCCEEDED`.
 
 Backend and dashboard remain single-replica `Recreate` Deployments. Short
 application downtime is accepted. Only changed application Deployments are

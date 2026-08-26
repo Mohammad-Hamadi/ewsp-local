@@ -26,4 +26,4 @@ jobs:
 
       - name: Reconcile desired deployment state
         shell: powershell
-        run: .\ewsp.ps1 deploy
+        run: .\scripts\Invoke-EwspStartupReconciliation.ps1 -LocalRoot $PWD.Path -DeferredExitCode 0

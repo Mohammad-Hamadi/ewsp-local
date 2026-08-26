@@ -1348,6 +1348,13 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-ThrowsCategory { Get-EwspDesiredArtifacts 'read-token-test' $badShaInvoker | Out-Null } 'NO_APPROVED_ARTIFACT' 'successful run with invalid SHA is rejected'
     $githubUnavailableInvoker = { param($uri,$token) throw 'simulated private GitHub API outage' }
     Assert-ThrowsCategory { Get-EwspDesiredArtifacts 'read-token-test' $githubUnavailableInvoker | Out-Null } 'GITHUB_API_UNAVAILABLE' 'private GitHub API outage is classified without exposing its response'
+    $githubUnauthorizedInvoker = {
+        param($uri,$token)
+        $failure = [Exception]::new('simulated private GitHub response content')
+        $failure | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{StatusCode=401})
+        throw $failure
+    }
+    Assert-ThrowsCategory { Get-EwspDesiredArtifacts 'read-token-test' $githubUnauthorizedInvoker | Out-Null } 'GITHUB_AUTH_FAILED' 'GitHub authentication failure remains a real failure rather than startup unavailability'
 
     $ghcrUnauthorizedInvoker = {
         param($mode,$uri,$username,$token,$accept)
@@ -1466,14 +1473,62 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-Contains $deployWorkflow 'runs-on: [self-hosted, Windows, X64]' 'CD workflow mutates Kubernetes only on the proven Windows runner'
     Assert-Contains $deployWorkflow 'group: ewsp-docker-desktop-kubernetes' 'CD workflow declares one environment concurrency group'
     Assert-Contains $deployWorkflow 'cancel-in-progress: false' 'active deployment is never cancelled mid-mutation'
-    Assert-Contains $deployWorkflow '.\ewsp.ps1 deploy' 'every CD event performs current desired-state reconciliation'
+    Assert-Contains $deployWorkflow '.\scripts\Invoke-EwspStartupReconciliation.ps1' 'every CD event uses bounded host-readiness reconciliation'
+    Assert-Contains $deployWorkflow '-DeferredExitCode 0' 'temporary host unavailability does not become a noisy GitHub hard failure'
     Assert-Contains $deployWorkflow 'persist-credentials: false' 'CD checkout does not persist GitHub credentials'
     Assert-NotContains $deployWorkflow 'EWSP_BACKEND_IMAGE' 'stale triggering SHA is not passed as deployment source of truth'
+    $cdModuleText = Get-Content -Raw -LiteralPath (Join-Path $localRoot 'scripts\Ewsp.Local.psm1')
     $startupScriptText = Get-Content -Raw (Join-Path $localRoot 'scripts\Invoke-EwspStartupReconciliation.ps1')
-    Assert-Contains $startupScriptText '$delays = @(0, 15, 30, 60, 120, 180)' 'startup reconciliation uses bounded backoff'
+    Assert-Contains $cdModuleText '$Delays = @(0, 15, 30, 60, 120, 180)' 'startup reconciliation uses bounded backoff'
     Assert-NotContains $startupScriptText 'while ($true)' 'startup reconciliation has no infinite busy loop'
-    Assert-Contains $startupScriptText 'EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED' 'startup reconciliation distinguishes transient host unavailability'
-    Assert-Contains $startupScriptText '& powershell.exe -NoProfile -File $entryPoint deploy' 'startup reconciliation invokes authoritative desired-state discovery instead of replaying an event SHA'
+    Assert-Contains $startupScriptText 'TEMPORARY_HOST_NOT_READY' 'startup reconciliation distinguishes transient host unavailability'
+    Assert-Contains $startupScriptText 'Invoke-EwspBoundedDeploymentReconciliation' 'startup reconciliation invokes bounded authoritative desired-state discovery'
+
+    $reconciliationCalls = New-Object Collections.Generic.List[string]
+    $sleepCalls = New-Object Collections.Generic.List[int]
+    $temporaryThenSuccess = New-Object Collections.Queue
+    $temporaryThenSuccess.Enqueue([PSCustomObject]@{ExitCode=1;Output=@('EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=DOCKER_ENGINE_UNREACHABLE','EWSP: Docker Engine is not reachable.')})
+    $temporaryThenSuccess.Enqueue([PSCustomObject]@{ExitCode=1;Output=@('EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=KUBERNETES_NODE_NOT_READY','EWSP: desktop-control-plane is NotReady.')})
+    $temporaryThenSuccess.Enqueue([PSCustomObject]@{ExitCode=0;Output=@('EWSP_DEPLOY_RESULT=ALREADY_CURRENT')})
+    $boundedRunner = {
+        param($file,$arguments,$workingDirectory)
+        $reconciliationCalls.Add("$file|$($arguments -join ' ')|$workingDirectory")
+        $temporaryThenSuccess.Dequeue()
+    }.GetNewClosure()
+    $boundedSleep = { param($seconds) $sleepCalls.Add([int]$seconds) }.GetNewClosure()
+    $boundedSuccess = Invoke-EwspBoundedDeploymentReconciliation $localRoot @(0,15,30) $boundedRunner $boundedSleep
+    Assert-Equal $boundedSuccess.Result 'RECONCILIATION_SUCCEEDED' 'job arriving before Docker and Kubernetes readiness retries then succeeds'
+    Assert-Equal $boundedSuccess.Attempts 3 'bounded readiness success records its exact attempt count'
+    Assert-Equal ($sleepCalls -join ',') '15,30' 'bounded readiness uses only configured backoff delays'
+    Assert-Equal $reconciliationCalls.Count 3 'temporary Docker and Kubernetes readiness each cause one bounded retry'
+    Assert-Contains $reconciliationCalls[0] 'ewsp.ps1 deploy' 'each retry resolves current desired state instead of replaying a queued event SHA'
+
+    $alwaysUnavailable = { param($file,$arguments,$workingDirectory) [PSCustomObject]@{ExitCode=1;Output=@('EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=KUBERNETES_API_UNREACHABLE')} }
+    $boundedExhausted = Invoke-EwspBoundedDeploymentReconciliation $localRoot @(0,1,2) $alwaysUnavailable { param($seconds) }
+    Assert-Equal $boundedExhausted.Result 'TEMPORARY_HOST_NOT_READY' 'bounded readiness exhaustion is explicitly deferred'
+    Assert-Equal $boundedExhausted.ExitCode 75 'bounded readiness exhaustion retains a distinct deferred exit code for callers'
+    Assert-Equal $boundedExhausted.Attempts 3 'bounded readiness exhaustion stops after the configured attempt count'
+
+    $nativeDeferredRoot = Join-Path $testRoot 'native-deferred-reconciliation'
+    New-Item -ItemType Directory -Path $nativeDeferredRoot -Force | Out-Null
+    @'
+Write-Output 'EWSP_DEPLOY_RESULT=DEPLOYMENT_DEFERRED category=KUBERNETES_API_UNREACHABLE'
+[Console]::Error.WriteLine("EWSP: Kubernetes API is not reachable.")
+exit 1
+'@ | Set-Content -LiteralPath (Join-Path $nativeDeferredRoot 'ewsp.ps1')
+    $nativeDeferred = Invoke-EwspBoundedDeploymentReconciliation $nativeDeferredRoot @(0,0) $null { param($seconds) }
+    Assert-Equal $nativeDeferred.Result 'TEMPORARY_HOST_NOT_READY' 'native stderr from a deferred child cannot bypass bounded retry handling'
+    Assert-Equal $nativeDeferred.Attempts 2 'native deferred child with stderr reaches the configured retry bound'
+
+    $realConfigurationFailure = { param($file,$arguments,$workingDirectory) [PSCustomObject]@{ExitCode=1;Output=@('EWSP: Machine-local deployment configuration is missing.')} }
+    $realFailure = Invoke-EwspBoundedDeploymentReconciliation $localRoot @(0,1,2) $realConfigurationFailure { param($seconds) }
+    Assert-Equal $realFailure.Result 'REAL_DEPLOYMENT_FAILURE' 'real configuration failure is not hidden as startup delay'
+    Assert-Equal $realFailure.Attempts 1 'real configuration failure stops retries immediately'
+    Assert-ThrowsContains { Invoke-EwspBoundedDeploymentReconciliation $localRoot @(0,301) $alwaysUnavailable { param($seconds) } | Out-Null } 'at most 300 seconds' 'readiness retry rejects arbitrary long sleeps'
+
+    $firstQueued = Invoke-EwspBoundedDeploymentReconciliation $localRoot @(0) { param($file,$arguments,$workingDirectory) [PSCustomObject]@{ExitCode=0;Output=@('EWSP_DEPLOY_RESULT=RECONCILIATION_SUCCEEDED')} } { param($seconds) }
+    $secondQueued = Invoke-EwspBoundedDeploymentReconciliation $localRoot @(0) { param($file,$arguments,$workingDirectory) [PSCustomObject]@{ExitCode=0;Output=@('EWSP_DEPLOY_RESULT=ALREADY_CURRENT')} } { param($seconds) }
+    Assert-Equal "$($firstQueued.Result),$($secondQueued.Result)" 'RECONCILIATION_SUCCEEDED,RECONCILIATION_SUCCEEDED' 'serialized queued reconciliations remain idempotent when the second observes current state'
     $missedEventPlan = @(Get-EwspDeploymentChangePlan $desiredArtifacts $bothOld @(
         [PSCustomObject]@{Name='backend';Image=$bothOld.backend;Ready=$true},
         [PSCustomObject]@{Name='dashboard';Image=$bothOld.dashboard;Ready=$true}
@@ -1488,6 +1543,9 @@ FROM employee_users JOIN roles ON roles.name=employee_users.role_name ON CONFLIC
     Assert-Contains $cdModuleText "-RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)" 'runner task restarts a failed runner with bounded Task Scheduler policy'
     Assert-Contains $cdModuleText "-RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5)" 'startup reconciliation has bounded Task Scheduler retries'
     Assert-Contains $cdModuleText "Join-Path `$RunnerRoot '.service'" 'stale runner service metadata is detected without recreating the deleted service wrapper'
+    $runnerBootstrapText = Get-Content -Raw (Join-Path $localRoot 'scripts\Invoke-EwspRunner.ps1')
+    Assert-Contains $runnerBootstrapText "Start-Process -FilePath `$DockerDesktopPath -WindowStyle Hidden" 'runner logon bootstrap explicitly initiates Docker Desktop before listening for jobs'
+    Assert-NotContains $runnerBootstrapText 'while ($true)' 'runner bootstrap has no readiness or process loop'
     Assert-NotContains $cdModuleText 'Register-ScheduledTask.*-Password' 'runner setup never persists a Windows password'
     Assert-Contains $cdModuleText 'RESTORED_PREVIOUS_IMAGE_AND_VERIFIED' 'automatic code rollback is not reported restored until application verification passes'
     Assert-Contains $cdModuleText "Test-EwspKubernetesAdminLogin `$configuration.AdminPassword" 'automatic rollback verification includes authenticated admin login'
