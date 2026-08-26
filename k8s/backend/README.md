@@ -1,35 +1,29 @@
-# EWSP backend Kubernetes contract
+# Backend Kubernetes Contract
 
-The backend runs as one pod behind the internal `backend` ClusterIP Service.
-REST traffic and `/ws` WebSocket traffic share port 8080. The `Recreate`
-strategy avoids transiently running multiple backend instances during a local
-update; multi-replica STOMP distribution is intentionally out of scope.
+This document describes backend-specific manifest behavior. Cluster lifecycle, image-source precedence, Secret generation, persistence, CD, and tunnel operations are authoritative in the [Kubernetes operations guide](../README.md).
 
-## Image tag
+## Workload and service
 
-The checked-in image `ewsp-backend:replace-with-ewsp-local-tag` is an explicit
-environment-independent placeholder. `k8s-up` replaces it only in ignored
-rendered output with `EWSP_BACKEND_IMAGE`, which must be the private
-`ghcr.io/mohammad-hamadi/ewsp-backend` image tagged by a full Git SHA.
+`deployment.yaml` defines a one-replica `Recreate` Deployment. `service.yaml` exposes an internal `ClusterIP` Service named `backend` on port `8080`. REST under `/api` and native STOMP WebSocket traffic at `/ws` share that port.
 
-Render the Deployment with the actual tag without editing the checked-in
-manifest, then apply the rendered output when deployment is intended:
+The single replica and in-process STOMP simple broker are a deliberate local/deployment baseline. Multi-replica message distribution is not implemented.
 
-```powershell
-$backendImage = 'ghcr.io/mohammad-hamadi/ewsp-backend:<full-git-sha>'
-kubectl set image -f k8s/backend/deployment.yaml `
-  backend=$backendImage --local -o yaml |
-  kubectl apply -f -
-```
+The checked-in image is a placeholder. Orchestration renders an exact private `ghcr.io/mohammad-hamadi/ewsp-backend:<full-git-sha>` ref into ignored output and uses `ghcr-pull` with `imagePullPolicy: IfNotPresent`. Do not edit the placeholder to select a deployment image; see [application image resolution](../README.md#application-image-resolution).
 
-`imagePullPolicy: IfNotPresent` permits cache reuse, while the `ghcr-pull`
-`imagePullSecret` lets Kubernetes obtain a missing private image. `k8s-up`
-creates that Secret from ignored local credentials and never builds this image.
+## Runtime configuration
+
+The Pod loads non-secret settings from `backend-config` and references individual keys in `ewsp-infrastructure-secrets` for:
+
+- PostgreSQL credentials;
+- MinIO credentials;
+- the JWT signing secret;
+- SMTP/OTP delivery settings.
+
+Pod-template fingerprints cover the complete ConfigMap data and protected mail configuration. A relevant configuration change followed by `k8s-up` replaces only the backend Pod so the new process environment is loaded.
 
 ## Mobile release metadata
 
-`backend-config` supplies the three public runtime properties required by the
-mobile version endpoint through the Deployment's existing `envFrom` reference:
+`configmap.yaml` is the Kubernetes authority for the release advertised by `GET /api/mobile/version`:
 
 ```text
 EWSP_MOBILE_LATEST_VERSION=1.0.2
@@ -37,46 +31,17 @@ EWSP_MOBILE_LATEST_VERSION_CODE=3
 EWSP_MOBILE_UPDATE_URL=https://github.com/Mohammad-Hamadi/ewsp-mobile/releases/download/v1.0.2/ewsp-1.0.2.apk
 ```
 
-They are release metadata, not credentials, and therefore remain in the
-ConfigMap rather than a Secret. `k8s-up` places a semantic SHA-256 fingerprint
-of all `backend-config` data on the backend Pod template. A ConfigMap data
-change therefore causes the existing `Recreate` Deployment to replace the
-backend Pod so its process receives the new environment. It does not rebuild
-the backend image or mutate PostgreSQL, Redis, MinIO, PVs, or PVCs.
+These public values belong in the ConfigMap, not a Secret. For a new release:
 
-For a future release, update only these three ConfigMap values, update the same
-Compose defaults and `.env.example`, then run:
+1. Publish and verify the signed APK from `ewsp-mobile`.
+2. Update all three values in `k8s/backend/configmap.yaml`.
+3. Update the matching Compose defaults in `compose.yml` and `.env.example`.
+4. Run `.\ewsp.ps1 k8s-up` and verify `/api/mobile/version`.
 
-```powershell
-.\ewsp.ps1 k8s-up
-```
+This is a runtime metadata rollout. It does not rebuild an application image or modify PostgreSQL, Redis, MinIO, PVs, or PVCs. The image-only `deploy` workflow does not independently apply ConfigMap revisions.
 
-Commit the declarative metadata change normally. The image-only `deploy` and
-startup reconciliation workflows remain unchanged; they do not build images
-or independently apply runtime ConfigMap revisions.
+## Probes and shutdown
 
-## SMTP OTP delivery
+Startup, readiness, and liveness probes call `/api/health`. The endpoint is a shallow process check and does not prove PostgreSQL, Redis, or MinIO availability. Startup permits approximately 120 seconds for JVM and Flyway initialization.
 
-The backend's SMTP settings come from Secret key references in
-`ewsp-infrastructure-secrets`. Real values live only in the ACL-protected
-`%USERPROFILE%\.ewsp\deployment.env`; `k8s-up` validates that mail, SMTP
-authentication, and STARTTLS are enabled before generating and applying its
-ignored temporary Secret artifact. The tracked example contains placeholders
-only, and the SMTP password is never placed in `backend-config`.
-
-The rendered Pod template carries a SHA-256 fingerprint of the protected mail
-configuration. Changing any SMTP setting and rerunning `k8s-up` therefore
-replaces only the backend Pod so Spring receives the new process environment;
-PostgreSQL, Redis, MinIO, dashboard, PVs, and PVCs remain unchanged.
-
-## Health and shutdown
-
-All probes use `/api/health`. Per the backend audit contract, this endpoint is a
-shallow, dependency-independent process check: readiness does not prove that
-PostgreSQL, Redis, or MinIO are usable, and liveness must remain independent of
-those services. The startup probe allows approximately 120 seconds for JVM and
-Flyway initialization.
-
-Spring graceful shutdown has a 30-second shutdown-phase timeout. Kubernetes
-allows 45 seconds before terminating the container, leaving time for Spring to
-stop accepting requests and finish in-flight HTTP and WebSocket work.
+Spring graceful shutdown has a 30-second phase timeout. Kubernetes allows 45 seconds before termination so in-flight HTTP and WebSocket work can finish.

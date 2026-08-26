@@ -1,42 +1,24 @@
-# EWSP dashboard Kubernetes contract
+# Dashboard Kubernetes Contract
 
-The dashboard runs as one Nginx pod behind the internal `dashboard` ClusterIP
-Service. The image is immutable application output: the manifests provide no
-runtime API or WebSocket environment variables.
+This document describes dashboard-specific manifest behavior. Cluster lifecycle, image-source precedence, Secret generation, CD, and public access are authoritative in the [Kubernetes operations guide](../README.md).
 
-The image's Nginx configuration preserves the same-origin contract:
+## Workload and service
 
-- `/api` proxies to `http://backend:8080`.
-- `/ws` proxies to `http://backend:8080/ws` with WebSocket upgrades.
+`deployment.yaml` defines a one-replica `Recreate` Deployment. `service.yaml` exposes the Nginx container through an internal `ClusterIP` Service named `dashboard` on port `80`.
 
-This requires the same-namespace `backend` Service on port 8080, which is
-defined by `k8s/backend/service.yaml`. No environment-specific domain is part of
-the dashboard Deployment.
+The checked-in image is a placeholder. Orchestration renders an exact private `ghcr.io/mohammad-hamadi/ewsp-dashboard:<full-git-sha>` ref into ignored output and uses `ghcr-pull` with `imagePullPolicy: IfNotPresent`. Do not edit the placeholder to select a deployment image; see [application image resolution](../README.md#application-image-resolution).
 
-## Image tag
+## Image and routing contract
 
-The checked-in image `ewsp-dashboard:replace-with-ewsp-local-tag` is an explicit
-environment-independent placeholder. `k8s-up` replaces it only in ignored
-rendered output with `EWSP_DASHBOARD_IMAGE`, which must be the private
-`ghcr.io/mohammad-hamadi/ewsp-dashboard` image tagged by a full Git SHA.
+The dashboard image is immutable static application output and accepts no runtime API or WebSocket environment variables. Its repository-owned Nginx configuration provides:
 
-Render the Deployment with the selected immutable local tag without editing the
-checked-in manifest:
-
-```powershell
-$dashboardImage = 'ghcr.io/mohammad-hamadi/ewsp-dashboard:<full-git-sha>'
-kubectl set image -f k8s/dashboard/deployment.yaml `
-  dashboard=$dashboardImage --local -o yaml |
-  kubectl apply -f -
+```text
+/api/ -> http://backend:8080
+/ws   -> http://backend:8080/ws  (WebSocket upgrade)
 ```
 
-`imagePullPolicy: IfNotPresent` permits cache reuse, while the `ghcr-pull`
-`imagePullSecret` lets Kubernetes obtain a missing private image. `k8s-up`
-creates that Secret from ignored local credentials and never builds this image.
+The Deployment therefore depends on the same-namespace `backend` Service but contains no environment-specific backend or public hostname. Browser traffic remains on the dashboard origin for the SPA, REST, and STOMP connection.
 
-## Health checks
+## Probes
 
-Readiness and liveness request `/index.html` from Nginx. They check only the
-dashboard process and static bundle, so backend availability cannot make the
-dashboard pod unready or trigger a restart. Nginx startup is sufficiently fast
-that a separate startup probe is unnecessary.
+Readiness and liveness request `/index.html`. They verify Nginx and the static bundle only; backend unavailability does not make the dashboard Pod unready or restart it. Full-stack orchestration separately verifies proxied API and WebSocket behavior.

@@ -1,13 +1,42 @@
-# EWSP Kubernetes infrastructure
+# EWSP Kubernetes Operations
 
-These plain manifests define the local EWSP stack in the `ewsp` namespace. They
-use internal `ClusterIP` Services only. PostgreSQL and MinIO request dynamically
-provisioned storage from the cluster's default StorageClass; Redis is
-intentionally non-persistent.
+This document is the authoritative operational reference for the EWSP Kubernetes baseline, its local lifecycle, application image reconciliation, secrets, persistence, deployment automation, and public-access paths. The [repository README](../README.md) remains the entry point for sibling-workspace and Compose operations.
+
+The manifests target the single-node Docker Desktop Kubernetes cluster in context `docker-desktop`. They provide a durable local/demo deployment, not a highly available or cloud-neutral production design.
+
+## Architecture
+
+```text
+temporary Quick Tunnel or optional named Tunnel
+                       |
+                       v
+dashboard Service :80 (ClusterIP) / managed localhost:3000 port-forward
+  |-- React SPA
+  |-- /api --------------------------------+
+  `-- /ws ---------------------------------+--> backend Service :8080
+                                                   |-- PostgreSQL Service :5432
+                                                   |-- Redis Service :6379
+                                                   `-- MinIO Service :9000
+```
+
+All resources use namespace `ewsp`. No application or infrastructure Service is a `NodePort` or `LoadBalancer`.
+
+### Resource topology
+
+| Component | Controller | Replicas | Storage | Probe contract |
+| --- | --- | ---: | --- | --- |
+| PostgreSQL 16 | StatefulSet | 1 | 5 Gi `ReadWriteOnce` PVC | `pg_isready` startup/readiness |
+| Redis 7 | Deployment | 1 | 128 MiB memory-backed `emptyDir`; persistence disabled | `redis-cli ping` startup/readiness/liveness |
+| MinIO | StatefulSet | 1 | 10 Gi `ReadWriteOnce` PVC | MinIO live/ready HTTP endpoints |
+| Backend | `Recreate` Deployment | 1 | None | `/api/health` startup/readiness/liveness |
+| Dashboard | `Recreate` Deployment | 1 | None | `/index.html` readiness/liveness |
+| Optional `cloudflared` | `Recreate` Deployment | 0 or 1 | None | private port `2000` `/ready` |
+
+PostgreSQL and MinIO use the cluster's default StorageClass. Redis is deliberately ephemeral. The backend creates the MinIO bucket lazily; no bucket-initialization workload exists.
+
+Component-specific manifest behavior is documented in the [backend contract](backend/README.md) and [dashboard contract](dashboard/README.md).
 
 ## Local lifecycle
-
-The supported Docker Desktop Kubernetes workflow is:
 
 ```powershell
 .\ewsp.ps1 k8s-up
@@ -15,179 +44,206 @@ The supported Docker Desktop Kubernetes workflow is:
 .\ewsp.ps1 k8s-stop
 ```
 
-`k8s-up` requires the current context to be exactly `docker-desktop` and verifies
-the reachable single-node Docker Desktop kind cluster, Ready node/container runtime,
-and default `standard` local-path StorageClass. It does not require Docker Engine for application builds, switch context, or
-reset the cluster. Resources are reconciled in dependency order and readiness is
-observed rather than delayed with fixed sleeps.
+`k8s-up`:
 
-## Current $0 public demo path
+1. Requires the current context to be exactly `docker-desktop`.
+2. Verifies the reachable single-node Docker Desktop kind cluster, Ready node/runtime, and default `standard` local-path StorageClass.
+3. Resolves immutable application images using the precedence below.
+4. Validates local infrastructure, SMTP, GHCR, and optional tunnel configuration without printing secret values.
+5. Generates ACL-restricted ignored Secret artifacts, renders application manifests under ignored `.tmp/k8s/rendered/`, and validates the complete manifest set.
+6. Applies namespace/configuration, storage services, applications, proxy settings, NetworkPolicies, and optional `cloudflared` in dependency order.
+7. Waits on probes and controller state rather than fixed sleeps.
+8. Verifies internal DNS/services and same-origin application routes.
+9. Starts or reuses the managed dashboard port-forward at `http://localhost:3000`.
 
-The current public demo/testing mechanism is `./ewsp.ps1 tunnel-quick`. It uses
-a random `*.trycloudflare.com` hostname, requires no domain, and costs nothing.
-The hostname changes between runs, so it is intentionally temporary rather than
-a stable deployment. See the repository README for `tunnel-status` and
-`tunnel-stop` behavior.
+The command does not switch Kubernetes context, reset the cluster, build application images, or clone application source.
 
-## Optional future permanent Cloudflare Tunnel
+`k8s-status` reports controllers, desired/ready replicas, Pod status/restarts/images/image IDs, image-source agreement, Services, PVC UIDs, dashboard access, proxy mode, tunnel state, and NetworkPolicy presence without reading Secret values.
 
-The permanent public path is an explicitly enabled, remotely managed named
-Cloudflare Tunnel running as one `cloudflared` Pod:
+### Managed dashboard port-forward
+
+The dashboard port-forward is shared across the stable checkout, Actions workspaces, startup reconciliation, status, stop, and tunnel commands. Non-secret ownership state lives at:
 
 ```text
-Cloudflare HTTPS/WSS -> cloudflared -> dashboard.ewsp.svc.cluster.local:80
-                                      -> /api and /ws -> backend:8080
+%USERPROFILE%\.ewsp\dashboard-port-forward.json
 ```
 
-This future path requires a domain and hostname controlled through Cloudflare.
-No permanent tunnel, token, or hostname is configured for the current project.
-The default remains disabled, and ordinary `k8s-up` cannot expose EWSP publicly
-when the explicit requirements below are absent.
+Reuse or stop requires the recorded PID and process start time, resolved `kubectl.exe`, exact namespace/service and `3000:80` command, listener ownership, and a healthy endpoint. A matching healthy EWSP forward may be adopted when state is missing; unrelated listeners are reported and are never adopted or stopped.
 
-Set all three values in the ignored `.env` file (never in a tracked manifest):
+## Application image resolution
 
-```dotenv
-CLOUDFLARE_TUNNEL_ENABLED=true
-CLOUDFLARE_TUNNEL_TOKEN=<named-tunnel connector token>
-CLOUDFLARE_PUBLIC_HOSTNAME=ewsp.example.com
+Both application refs must be private GHCR images in the expected repository and tagged by a complete lowercase 40-character Git SHA:
+
+```text
+ghcr.io/mohammad-hamadi/ewsp-backend:<full-sha>
+ghcr.io/mohammad-hamadi/ewsp-dashboard:<full-sha>
 ```
 
-The enable flag is deliberately required. A token by itself does not deploy or
-start the connector. When enabled, `k8s-up` derives the single schedulable
-node's assigned Pod CIDR from `.spec.podCIDRs`/`.spec.podCIDR`, rejects missing,
-multiple, non-IPv4, non-canonical, or host-bit-bearing values, and converts the
-CIDR to a fully anchored Tomcat regex. It reconciles the backend to
-`SERVER_FORWARD_HEADERS_STRATEGY=NATIVE` with that runtime-only regex. No Pod
-IP, Service CIDR, node IP, loopback address, cluster-wide kindnet subnet, or
-RFC1918 fallback is trusted. With the feature disabled, the ordinary source
-manifest restores the backend's default `NONE` behavior, any existing connector
-is scaled to zero, and the permanent policies are removed.
+Moving tags such as `main` and `latest`, wrong repositories, wrong registries, and malformed refs are rejected. Checked-in manifests retain environment-independent placeholders. `k8s-up` renders exact Deployments under `.tmp/k8s/rendered/` and applies them with `imagePullPolicy: IfNotPresent` and `ghcr-pull`; it never edits the source manifests.
 
-`k8s-up` creates/updates `cloudflared-tunnel-token` from `.env`, applies it from
-an ACL-restricted ignored temporary artifact, and removes that artifact. The
-token is never printed. The Deployment uses the pinned
-`cloudflare/cloudflared:2026.8.2` image, a non-root user, a read-only root
-filesystem, no service-account token, and no Linux capabilities. Kubernetes
-checks cloudflared's private port 2000 `/ready` endpoint; there is no Service for
-that endpoint.
+Image source precedence is intentionally anti-downgrade:
 
-Before enabling it, create a remotely managed tunnel in Cloudflare:
+1. Read validated local values from ignored `.env`.
+2. Read `%USERPROFILE%\.ewsp\deployment-state.json` when it exists.
+3. Use state-file images only when the record status is `ALREADY_CURRENT` or `RECONCILIATION_SUCCEEDED`, both desired and deployed SHAs are valid for both applications, and each deployed SHA exactly equals its desired SHA.
+4. When every condition holds, both state-file SHA refs replace the corresponding `.env` refs for `k8s-up` and `k8s-status`.
+5. If the record is absent, malformed, incomplete, unsuccessful, or mismatched, use the validated `.env` refs for both applications.
 
-1. In Cloudflare, open **Networking > Tunnels**, create a Cloudflared tunnel,
-   and copy the connector token from **Add a replica**.
-2. Add a public hostname for the intended DNS name. Set its service/origin URL
-   exactly to `http://dashboard.ewsp.svc.cluster.local:80`.
-3. Put the token and hostname only in ignored `.env`, set the explicit enable
-   flag, and run `./ewsp.ps1 k8s-up`.
+This prevents a successful CD rollout from being downgraded by a later local reconciliation whose ignored `.env` still names older images. The state file contains recoverable, non-secret operational history; it is not CI approval evidence. CD discovers approved artifacts from GitHub, and Kubernetes Pod state remains authoritative for what is actually running.
 
-The token-only remotely managed model does not use `cert.pem`, an account API
-key/token, or a tunnel credentials JSON file at runtime. The Cloudflare-side
-public-hostname rule supplies the origin route. `k8s-stop` scales cloudflared
-with the other workloads but preserves its Kubernetes Secret and never deletes
-the remote tunnel or DNS route. `k8s-status` reports desired/ready replicas,
-Pod status/restarts/image, backend proxy mode, node-Pod-CIDR boundary source,
-policy-object presence, and the safe configured hostname; it never reads or
-prints the Secret value.
+## Secrets and configuration
 
-Two ingress NetworkPolicies enforce the application path: only dashboard Pods
-may reach backend TCP 8080, and only cloudflared Pods may reach dashboard TCP
-80. Kubernetes node-origin probe and port-forward behavior must be confirmed
-empirically on the installed CNI after policy changes; policy-object presence
-alone is not reported as proof of enforcement.
+### Local sources
 
-Backend and dashboard images come only from explicit `EWSP_BACKEND_IMAGE` and
-`EWSP_DASHBOARD_IMAGE` values in ignored `.env`. Each ref must name its expected
-private GHCR repository with a full 40-character Git SHA tag. `main`, `latest`,
-wrong repositories, and malformed refs fail before apply. The checked-in image
-placeholders are never rewritten. Exact Deployments are rendered under ignored
-`.tmp/k8s/rendered/`, validated, and applied with `imagePullPolicy:
-IfNotPresent`. Kubernetes pulls a missing artifact from GHCR; `k8s-up` does not
-inspect sibling source or invoke a local application build.
+| Source | Purpose |
+| --- | --- |
+| Ignored `.env` | Local infrastructure credentials, JWT secret, GHCR pull credentials, host port, application fallback refs, and optional permanent-tunnel settings |
+| `%USERPROFILE%\.ewsp\deployment.env` | ACL-protected deployment-host GitHub/GHCR/admin credentials and SMTP delivery settings |
+| `k8s/config/secrets.example.yaml` | Tracked key/Secret-name reference containing placeholders only |
 
-On success, an EWSP-managed `kubectl port-forward` exposes only the dashboard at
-`http://localhost:3000`. Its non-secret ownership state is machine-global at
-`%USERPROFILE%\.ewsp\dashboard-port-forward.json`, so stable, Actions, startup,
-status, stop, and Quick Tunnel commands share one process. Reuse or stop requires
-the recorded PID and start time, resolved `kubectl.exe`, exact namespace/service
-and `3000:80` command, listener PID, and a healthy endpoint. A validated legacy
-`.tmp/k8s/port-forward.json` record migrates once without restarting the process;
-an exact healthy unmanaged EWSP forward may be adopted when state is missing.
-Stale state is cleaned, while an unrelated listener is reported and never killed.
-The dashboard keeps `/api` and `/ws` same-origin and proxies them to the internal
-`backend:8080` Service.
+`k8s-up` reads infrastructure values with the repository's constrained `.env` parser and deployment SMTP values from the protected machine file. It creates `ewsp-infrastructure-secrets` from an ACL-restricted ignored temporary artifact, applies it, and removes the artifact. The backend references individual Secret keys for PostgreSQL, MinIO, JWT, and SMTP configuration.
 
-`k8s-stop` scales the three Deployments and two StatefulSets to zero and stops
-the managed dashboard port-forward. It preserves Services, ConfigMaps, the real
-Secret, PVCs, PVs, Docker images, and Compose resources. The next `k8s-up`
-reapplies the one-replica manifests. There is intentionally no destructive
-Kubernetes clean command.
+Deployment SMTP requires mail enabled, authentication enabled, and STARTTLS enabled. A semantic fingerprint of protected mail settings on the backend Pod template causes a backend-only restart after changes.
 
-## Local secrets
+Private image pulls use `GHCR_USERNAME` and a `GHCR_TOKEN` with package-read access. `k8s-up` creates the separate `kubernetes.io/dockerconfigjson` Secret `ghcr-pull` and removes its temporary artifact. The credential is not placed in a ConfigMap, Pod environment, image, tracked YAML, or logs.
 
-`config/secrets.example.yaml` documents the required Secret name and keys. It
-contains placeholders only and is safe to validate, but must not be used as the
-real Secret.
+### Non-secret backend configuration
 
-`k8s-up` reads infrastructure values through ewsp-local's safe `.env` parser
-and SMTP delivery values through the ACL-protected
-`%USERPROFILE%\.ewsp\deployment.env`, creates a restrictive ignored temporary
-Secret artifact, applies `ewsp-infrastructure-secrets`, and removes the
-temporary secret material after application. Values are not printed. Alongside
-`POSTGRES_USER`, `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`,
-`MINIO_ROOT_PASSWORD`, and `JWT_SECRET`, deployed email delivery requires
-`EWSP_MAIL_ENABLED`, `EWSP_MAIL_HOST`, `EWSP_MAIL_PORT`,
-`EWSP_MAIL_USERNAME`, `EWSP_MAIL_PASSWORD`, `EWSP_MAIL_FROM`,
-`EWSP_MAIL_SMTP_AUTH`, and `EWSP_MAIL_STARTTLS_ENABLE`. Enabled deployment mail
-must use authentication and STARTTLS. The backend Pod references these keys
-individually; no SMTP credential is stored in a ConfigMap.
+`k8s/backend/configmap.yaml` owns database/service endpoints, local CORS, shutdown behavior, and public mobile release metadata. The [backend manifest contract](backend/README.md#mobile-release-metadata) records the currently advertised version and rollout procedure.
 
-Private application pulls use `GHCR_USERNAME` plus a local `GHCR_TOKEN` with
-package-read permission only. `k8s-up` generates a separate ACL-restricted,
-ignored `kubernetes.io/dockerconfigjson` artifact, reconciles Secret `ghcr-pull`,
-and removes the artifact after apply. The credential is never stored in tracked
-YAML, a ConfigMap, application environment, container image, or logs. Do not use
-the Actions `GITHUB_TOKEN` locally.
+The backend Pod template contains a semantic fingerprint of all ConfigMap data. Updating the ConfigMap and running `k8s-up` causes a short backend `Recreate` rollout without rebuilding an image or modifying infrastructure data. Compose defaults and `.env.example` mirror the release values for local consistency; this ConfigMap is authoritative for the Kubernetes deployment.
 
-Bucket initialization is deliberately omitted: the application retains its
-existing lazy bucket-creation behavior.
+## Persistence and stop behavior
 
-## Explicit local user seed
+`k8s-stop` stops the managed dashboard port-forward and scales backend, dashboard, Redis, PostgreSQL, and MinIO controllers to zero. If the optional permanent tunnel exists, it is also scaled to zero. The command preserves:
 
-`./ewsp.ps1 k8s-seed` is an explicit local-development command restricted to
-the exact `docker-desktop` context and `ewsp` namespace. Neither `k8s-up` nor
-the tunnel workflows invoke it automatically. The ignored sibling backend seed
-is idempotent and uses `ON CONFLICT DO NOTHING`: it adds missing local users but
-does not reset passwords or overwrite any other existing user row in a
-preserved PostgreSQL PVC. Existing persisted users may therefore retain
-credentials or other values that differ from the current ignored seed file.
+- namespace, Services, ConfigMaps, and Secrets;
+- PostgreSQL and MinIO PVCs/PVs;
+- container images;
+- remote Cloudflare tunnel/DNS configuration;
+- all Compose containers and volumes.
+
+The next `k8s-up` reapplies one-replica source manifests and reconciles current configuration. There is no destructive Kubernetes clean command. Deleting PVCs or resetting Docker Desktop Kubernetes can destroy Kubernetes data; those PVCs are independent of Compose named volumes.
+
+Compose and Kubernetes may coexist at the data layer, but their dashboard access paths both default to host port `3000`. Neither workflow stops the other or terminates an unrelated listener.
+
+## Health and readiness
+
+Controller probes establish process-level readiness:
+
+- backend `/api/health` is deliberately shallow and dependency-independent;
+- dashboard `/index.html` proves Nginx and the static bundle, not backend availability;
+- PostgreSQL, Redis, and MinIO use their service-native checks.
+
+After probes pass, orchestration separately verifies infrastructure, DNS, backend health, dashboard routes, same-origin API routing, and WebSocket upgrade behavior. Public and CD workflows add their own external and authenticated checks. Probe readiness alone is not treated as full-stack readiness.
+
+## Seed and credential recovery
+
+Flyway creates the schema and required lookup data, but Kubernetes startup does not create demo employees.
+
+```powershell
+.\ewsp.ps1 k8s-seed
+```
+
+`k8s-seed` is restricted to context `docker-desktop` and namespace `ewsp`. It streams the ignored sibling file `ewsp-backend/local-dev/seed-dashboard-users.sql` to the Ready PostgreSQL Pod with SQL error stopping enabled. The seed uses `ON CONFLICT DO NOTHING`: it adds missing identities and does not overwrite retained users or passwords. Neither `k8s-up` nor tunnel startup invokes it.
+
+If a retained local admin has an older seed password hash:
+
+```powershell
+.\ewsp.ps1 k8s-reset-admin
+```
+
+The reset command verifies the exact local boundary, Ready database/PVC, expected admin identity and user counts, and the ignored seed source. It updates only the password hash in a transaction, verifies identity/state preservation, then proves the credential through the running backend. It does not delete users, storage, or unrelated fields. This is local/demo recovery, not a production account-provisioning mechanism.
 
 ## Continuous deployment reconciliation
 
-`.\ewsp.ps1 deploy` is the CD-specific application path. Unlike `k8s-up`, it
-does not take desired refs from repository `.env`. It reads protected static
-machine settings from `%USERPROFILE%\.ewsp\deployment.env`, discovers the
-newest successful `push/main` `ci.yml` run for each private application,
-verifies the exact full-SHA GHCR manifest and Linux/AMD64 runtime digest, and
-updates only an outdated or unhealthy application Deployment.
+```text
+backend/dashboard main push
+  -> application CI verification
+  -> private GHCR full-SHA image
+  -> best-effort ewsp-local workflow dispatch
+  -> EWSP-PC self-hosted runner
+  -> .\ewsp.ps1 deploy
+  -> Docker Desktop Kubernetes
+```
 
-The command retains the exact `docker-desktop` boundary and uses one
-machine-local exclusive lock shared by GitHub Actions and Windows logon
-reconciliation. Infrastructure controllers and PVCs are never reapplied or
-deleted by an ordinary application update. Both application Deployments remain
-one-replica `Recreate`; brief downtime is intentional. Success requires Ready
-Pods, exact refs and imageID digests, route/API/WebSocket checks, authenticated
-admin login, and unchanged PVC UIDs.
+`deploy` does not use `.env` as approval state. For each application it:
 
-`%USERPROFILE%\.ewsp\deployment-state.json` contains only recoverable,
-non-secret operational history and is never an approval source. See the main
-README and `.\ewsp.ps1 help workflow cd` for runner Scheduled Tasks, offline
-catch-up, concurrency, and rollback behavior.
+1. Queries the private GitHub Actions API for the newest completed successful `push` run of `ci.yml` on `main`.
+2. Uses that run's complete `head_sha`; PRs, failures, other branches, malformed SHAs, and missing images are ineligible.
+3. Verifies the exact private GHCR tag and resolves its registry and Linux/AMD64 runtime digests.
+4. Compares desired artifacts with the configured and running Deployments.
+5. Updates only outdated or unhealthy application Deployments.
+6. Requires Ready Pods, exact refs and image IDs, infrastructure/DNS health, `/`, `/complaints`, missing-asset behavior, `/api/health`, WebSocket upgrade, authenticated admin login, and unchanged PVC UIDs.
 
-## Persistence and coexistence
+Both application Deployments are one-replica `Recreate`; brief downtime is expected. PostgreSQL, Redis, MinIO, Services, Secrets, ConfigMaps, and PVCs are not reapplied by an ordinary image update.
 
-Kubernetes PostgreSQL and MinIO PVCs are independent of the Compose named
-volumes. `k8s-stop` preserves both environments, but deleting PVCs or resetting
-Docker Desktop Kubernetes can destroy Kubernetes data. Kubernetes infrastructure
-does not consume host ports; only dashboard port-forwarding can conflict with a
-running Compose dashboard on port 3000. Use `.\ewsp.ps1 up`, `status`, and `stop`
-for Compose, and the `k8s-*` commands above for Kubernetes.
+Dashboard readiness failure restores its previous immutable image. Backend failure restores its previous image only when the before/after Flyway history fingerprint is unchanged. If migration history advanced or cannot be verified, code rollback stops; database migrations are never rolled back automatically.
+
+### Host configuration and execution
+
+```powershell
+.\ewsp.ps1 deploy-configure
+# Add EWSP_ADMIN_PASSWORD directly to %USERPROFILE%\.ewsp\deployment.env.
+.\ewsp.ps1 runner-setup
+.\ewsp.ps1 runner-status
+.\ewsp.ps1 deploy
+.\ewsp.ps1 deploy-status
+```
+
+`deploy-configure` copies only approved setting names into the user/SYSTEM ACL-protected machine file. `runner-setup` validates the existing interactive runner under `C:\actions-runner` and creates current-user Scheduled Tasks for the runner at logon and bounded startup reconciliation two minutes later. It does not register the runner or install a Windows service. Interactive logon is required because Docker Desktop belongs to that user session.
+
+`.github/workflows/deploy.yml` accepts manual, application-dispatch, and twice-hourly catch-up events on `[self-hosted, Windows, X64]`. GitHub concurrency allows one active and one newest pending reconciliation without cancelling an active mutation. A machine-local exclusive lock also prevents overlap with startup reconciliation.
+
+Long outages do not depend on a queued dispatch: scheduled GitHub catch-up and logon reconciliation rediscover the newest approved artifacts. Temporary Docker/Kubernetes/GitHub/GHCR startup unavailability uses finite retry; unsafe context/storage, invalid configuration, authentication failure, and deployment failure stop immediately.
+
+`%USERPROFILE%\.ewsp\deployment-state.json` records non-secret desired/deployed SHAs and digests, result, timestamps, trigger, changed components, and PVC UIDs. Successful complete records also drive the `k8s-up` anti-downgrade precedence described above.
+
+## Public access
+
+### Temporary Quick Tunnel
+
+The current $0 demo path uses a locally installed `cloudflared` process and a random `https://<name>.trycloudflare.com` origin:
+
+```powershell
+.\ewsp.ps1 tunnel-quick
+.\ewsp.ps1 tunnel-status
+.\ewsp.ps1 tunnel-stop
+```
+
+It requires a Ready backend/dashboard and the managed `localhost:3000` forward. Startup derives a literal trusted-proxy regular expression from the dashboard Pod address, temporarily enables native forwarded-header handling, and permits only the local dashboard and generated public origin. It verifies public application routes, API health, WebSocket upgrade, and upload-size proxy behavior.
+
+After public checks pass, the command uses an isolated temporary checkout under the deployment lock to publish the current origin to `public/mobile-bootstrap.json` on `ewsp-local/main`, then verifies the stable raw URL. The document is public and contains only:
+
+```json
+{
+  "apiBaseUrl": "https://example.trycloudflare.com"
+}
+```
+
+The value is an HTTPS origin without `/api`; mobile derives `/api` and `/ws`. The configured fine-grained `EWSP_GITHUB_READ_TOKEN` retains its historical setting name but requires `ewsp-local` Contents read/write for this publication step, plus the private Actions read grants used by deployment discovery.
+
+Rerunning `tunnel-quick` re-verifies and republishes a healthy existing tunnel. If publication fails after the public checks, the tunnel remains running but mobile discovery is reported unavailable. `tunnel-stop` validates process identity, stops only the managed process, restores the exact previous backend proxy/CORS settings, and leaves Kubernetes workloads, PVCs, Services, and the dashboard forward running. The last published bootstrap origin is retained and may be offline; it is discovery metadata, not an availability guarantee.
+
+### Optional named Cloudflare Tunnel
+
+The stable-hostname path is implemented but disabled by default. It requires a Cloudflare-managed domain/hostname and explicit ignored `.env` configuration:
+
+```dotenv
+CLOUDFLARE_TUNNEL_ENABLED=true
+CLOUDFLARE_TUNNEL_TOKEN=<connector-token>
+CLOUDFLARE_PUBLIC_HOSTNAME=ewsp.example.com
+```
+
+The token alone does not enable the connector. Configure the remotely managed public hostname origin exactly as `http://dashboard.ewsp.svc.cluster.local:80`.
+
+When enabled, `k8s-up`:
+
+- creates `cloudflared-tunnel-token` from a temporary protected artifact;
+- derives the single node's canonical IPv4 Pod CIDR and converts it to an anchored Tomcat trusted-proxy expression;
+- runs pinned `cloudflare/cloudflared:2026.8.2` as non-root with a read-only filesystem, no capabilities, and no service-account token;
+- applies NetworkPolicies allowing only `cloudflared -> dashboard:80` and `dashboard -> backend:8080`.
+
+No `cloudflared` Service, Ingress, NodePort, or LoadBalancer is created. `k8s-stop` scales the connector down but does not delete its Secret or remote tunnel/DNS route. Disabling the feature and rerunning `k8s-up` restores backend forwarded-header defaults, scales any connector to zero, and removes the permanent-tunnel NetworkPolicies.
+
+NetworkPolicy object presence is not proof of CNI enforcement; node-origin probe and port-forward behavior must be checked against the installed Docker Desktop CNI when policy behavior changes.
